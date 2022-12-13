@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,9 @@ const (
 var IoDeadline, _ = time.ParseDuration("5s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
 
+// outgoing message headers keyed on header hash
+var outgoing map[[32]byte]*FMsgHeader
+
 type FMsgAddress struct {
 	User string
 	Domain string
@@ -29,7 +33,6 @@ type FMsgAddress struct {
 type FMsgAttachmentHeader struct {
 	Filename string
 	Size uint32
-	Data []byte // TODO path instead of in memory
 }
 
 type FMsgHeader struct {
@@ -41,8 +44,7 @@ type FMsgHeader struct {
 	Timestamp float64
 	Topic string
 	Type string
-	Msg []byte // TODO path instead of in memory
-
+	Hash [32]byte
 }
 
 
@@ -80,19 +82,33 @@ func readAddress(r io.Reader) (*FMsgAddress, error) {
 	return parseAddress(slice)
 }
 
-func readHeader(c net.Conn) (FMsgHeader, error) {
-	r := bufio.NewReaderSize(c, ReadBufferSize)
-	var h FMsgHeader
+func handleChallenge(c net.Conn, r *bufio.Reader) error {
+	hashSlice, err := io.ReadAll(io.LimitReader(c, 32))
+	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
+	if err != nil {
+		return err
+	}
+	header, exists := outgoing[hash]
+	if !exists {
+		return fmt.Errorf("challenge for unknown message dropped: %s", hex.EncodeToString(hashSlice))
+	}
+	binary.Write(c, binary.LittleEndian, header.Timestamp)
+	c.Write(header.Hash[:])
+	return nil
+}
 
-	// set read deadline TODO update after reading header
-	c.SetReadDeadline(time.Now().Add(IoDeadline))
+func readHeader(c net.Conn) (*FMsgHeader, error) {
+	r := bufio.NewReaderSize(c, ReadBufferSize)
+	var h = &FMsgHeader{}
 
 	// read version
 	v, err := r.ReadByte()
 	if err != nil {
 		return h, err
 	}
-	// TODO if version == 255 this is a CHALLENGE
+	if v == 255 {
+		return nil, handleChallenge(c, r)
+	}
 	if v != 1 {
 		return h, fmt.Errorf("unsupported version: %d", v)
 	}
@@ -163,6 +179,9 @@ func readHeader(c net.Conn) (FMsgHeader, error) {
 func handleConn(c net.Conn) {
 	log.Printf("Connection from: %s", c.RemoteAddr().String())
 
+	// set read deadline for reading header
+	c.SetReadDeadline(time.Now().Add(IoDeadline))
+
 	// read header
 	header, err := readHeader(c)
 	if err != nil {
@@ -170,13 +189,20 @@ func handleConn(c net.Conn) {
 		return
 	}
 
+	// if no header or error this was a challenge thats been handeled
+	if header == nil {
+		c.Close()
+		return
+	}
+
+	// unset read deadline to download message
+	c.SetReadDeadline(time.UnixMilli(0))
+
 	resp := fmt.Sprintf("Read header from: %s, to: %s", header.From, header.To)
 	resp_bytes := []byte(resp)
 	c.Write(resp_bytes)
 	log.Println("Voila!")
 
-	// CHALLENGE
-	// CHALLENGE RESP
 	// checks
 	// download
 
@@ -187,6 +213,8 @@ func handleConn(c net.Conn) {
 
 
 func main() {
+	outgoing = make(map[[32]byte]*FMsgHeader)
+
 	ln, err := net.Listen("tcp", "localhost:36900")
 	if err != nil {
 		log.Fatal(err)
