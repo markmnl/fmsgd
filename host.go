@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -10,7 +12,7 @@ import (
 	"unicode/utf8"
 )
 
-const ReadBufferSize = 8192 
+const ReadBufferSize = 1600
 const (
 	HasPid uint8 = 1
 	Important uint8 = 1 << 1
@@ -35,7 +37,7 @@ type FMsgHeader struct {
 	Flags uint8
 	Pid [32]byte
 	From FMsgAddress
-	To FMsgAddress
+	To []FMsgAddress
 	Timestamp float64
 	Topic string
 	Type string
@@ -43,8 +45,9 @@ type FMsgHeader struct {
 
 }
 
-func parseAddress(b []byte) (FMsgAddress, error) {
-	var addr = FMsgAddress{}
+
+func parseAddress(b []byte) (*FMsgAddress, error) {
+	var addr = &FMsgAddress{}
 	addrStr := string(b)
 	firstAt := strings.IndexRune(addrStr, AtRune)
 	if firstAt == -1 || firstAt != 0 {
@@ -59,83 +62,115 @@ func parseAddress(b []byte) (FMsgAddress, error) {
 	return addr, nil
 }
 
+// Reads byte slice prefixed with uint8 size from reader supplied
+func ReadUInt8Slice(r io.Reader) ([]byte, error) {
+	var size byte
+	err := binary.Read(r, binary.LittleEndian, &size)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(io.LimitReader(r, int64(size)))
+}
+
+func readAddress(r io.Reader) (*FMsgAddress, error) {
+	slice, err := ReadUInt8Slice(r)
+	if err != nil {
+		return nil, err
+	}
+	return parseAddress(slice)
+}
+
 func readHeader(c net.Conn) (FMsgHeader, error) {
-	b := make([]byte, ReadBufferSize)
+	r := bufio.NewReaderSize(c, ReadBufferSize)
 	var h FMsgHeader
 
 	// set read deadline TODO update after reading header
 	c.SetReadDeadline(time.Now().Add(IoDeadline))
 
-	// read version and flags
-	count, err := io.ReadAtLeast(c, b, 3)
+	// read version
+	v, err := r.ReadByte()
 	if err != nil {
-		log.Printf("Error reading header from %s: %s", c.RemoteAddr().String(), err)
 		return h, err
 	}
-	h.Version = b[0]
-	flags := b[1]
-	i := 2
-
 	// TODO if version == 255 this is a CHALLENGE
+	if v != 1 {
+		return h, fmt.Errorf("unsupported version: %d", v)
+	}
+	h.Version = v
 
+	// read flags
+	flags, err := r.ReadByte()
+	if err != nil {
+		return h, err
+	}
+	h.Flags = flags
+	
 	// read pid if any
 	if flags & HasPid == 1 {  
-		diff := count - i
-		if diff < 32 {
-			n, err := io.ReadAtLeast(c, b[i:], diff)
-			if err != nil {
-				log.Printf("Error reading pid from %s: %s", c.RemoteAddr().String(), err)
-				return h, err
-			} else { 
-				count += n
-			}
+		pid, err := io.ReadAll(io.LimitReader(c, 32))
+		if err != nil {
+			return h, err
 		}
-		copy(h.Pid[:], b[i:i+32])
-		i += 32
-		// TODO verify pid
+		copy(h.Pid[:], pid)
+		// TODO verify pid exists
 	}
 
 	// read from address
-	size := int(b[i])
-	i++
-	diff := count - i
-	if diff < size {
-		n, err := io.ReadAtLeast(c, b[i:], diff)
-		if err != nil {
-			log.Printf("Error reading from address %s: %s", c.RemoteAddr().String(), err)
-			return h, err
-		}
-		count += n
-	}
-	from, err := parseAddress(b[i:(i+size)])
+	from, err := readAddress(r)
 	if err != nil {
-		log.Printf("Error parsing from address %s: %s", c.RemoteAddr().String(), err)
 		return h, err
 	}
-	i += size
+	log.Printf("from: @%s@%s", from.User, from.Domain)
+	h.From = *from
+ 
+	// read to addresses
+	num, err := r.ReadByte()
+	if err != nil {
+		return h, err
+	} 
+	for num > 0 {
+		addr, err := readAddress(r)
+		if err != nil {
+			return h, err
+		}
+		h.To = append(h.To, *addr)
+		num--
+		log.Printf("to: @%s@%s", addr.User, addr.Domain)
+	}
 
-	log.Printf("@%s@%s", from.User, from.Domain)
-	
-	// read to addresse(s)
-	// timestamp
-	// topic
-	// type
-	// challenge
+	// read timestamp
+	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
+		return h, err
+	}
+
+	// read topic
+	topic, err := ReadUInt8Slice(r)
+	if err != nil {
+		return h, err
+	}
+	h.Topic = string(topic)
+
+	// read type
+	mime, err := ReadUInt8Slice(r)
+	if err != nil {
+		return h, err
+	}
+	h.Topic = string(mime)
 
 	return h, nil
 }
 
 func handleConn(c net.Conn) {
 	log.Printf("Connection from: %s", c.RemoteAddr().String())
-	header, err := readHeader(c)
 
+	// read header
+	header, err := readHeader(c)
 	if err != nil {
-		c.Close()
-		log.Printf("Closed: %s", c.RemoteAddr().String())
+		log.Printf("Error reading header from, %s: %s", c.RemoteAddr().String(), err)
 		return
 	}
 
-	resp := fmt.Sprintf("Read header from: %s", header.From)
+	resp := fmt.Sprintf("Read header from: %s, to: %s", header.From, header.To)
 	resp_bytes := []byte(resp)
 	c.Write(resp_bytes)
 	log.Println("Voila!")
@@ -144,7 +179,9 @@ func handleConn(c net.Conn) {
 	// CHALLENGE RESP
 	// checks
 	// download
+
 	// close
+	c.Close()
 
 }
 
