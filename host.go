@@ -2,25 +2,37 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
+const Port = 36900
 const ReadBufferSize = 1600
+const MaxMessageSize = 1024 * 10
 const (
 	HasPid uint8 = 1
 	Important uint8 = 1 << 1
+
+	
+	RejectUndisclosed uint8 = 1
+	RejectCodeTooBig uint8  = 2
+	RejectAccept uint8 = 255
 )
 
 var IoDeadline, _ = time.ParseDuration("5s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
+var DataDir = "/tmp"
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
@@ -33,6 +45,8 @@ type FMsgAddress struct {
 type FMsgAttachmentHeader struct {
 	Filename string
 	Size uint32
+
+	Filepath string
 }
 
 type FMsgHeader struct {
@@ -44,9 +58,71 @@ type FMsgHeader struct {
 	Timestamp float64
 	Topic string
 	Type string
-	Hash [32]byte
+
+	// Size in bytes of entire message
+	Size uint32
+	// Hash up to and including Type
+	HeaderHash []byte
+	// Hash of message from Challenge Response
+	ChallengeHash [32]byte
+	// Actual hash of message data including any attachments data
+	MessageHash []byte
+	// 
+	Filepath string
 }
 
+func (addr *FMsgAddress) ToString() string {
+	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
+}
+
+// Encode the header up to and including type field to a []byte
+func (h *FMsgHeader) Encode() []byte {
+	var b bytes.Buffer
+	b.WriteByte(h.Version)
+	b.WriteByte(h.Flags)
+	if h.Flags & HasPid == 1 {
+		b.Write(h.Pid[:])
+	}
+	b.WriteString(h.From.ToString())
+	b.WriteByte(byte(len(h.To)))
+	for _, addr := range h.To {
+		b.WriteString(addr.ToString())
+	}
+	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
+		panic(err)
+	}
+	b.WriteString(h.Topic)
+	b.WriteString(h.Type)
+	return b.Bytes()
+}
+
+func (h *FMsgHeader) GetHeaderHash() []byte {
+	if h.HeaderHash == nil {
+		b := sha256.Sum256(h.Encode())
+		h.HeaderHash = b[:]
+	}
+	return h.HeaderHash
+}
+
+func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
+	if h.MessageHash == nil {
+		f, err := os.Open(h.Filepath)
+		if err != nil {
+		  return nil, err
+		}
+		defer f.Close()
+	  
+		hash := sha256.New()
+		if _, err := io.Copy(hash, f); err != nil {
+		  return nil, err
+		}
+		
+		// TODO attachments
+
+		h.MessageHash = hash.Sum(nil)
+	}
+	return h.MessageHash, nil
+}
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
 	var addr = &FMsgAddress{}
@@ -84,17 +160,27 @@ func readAddress(r io.Reader) (*FMsgAddress, error) {
 
 func handleChallenge(c net.Conn, r *bufio.Reader) error {
 	hashSlice, err := io.ReadAll(io.LimitReader(c, 32))
-	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
 	if err != nil {
 		return err
 	}
+	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
 	header, exists := outgoing[hash]
 	if !exists {
-		return fmt.Errorf("challenge for unknown message dropped: %s", hex.EncodeToString(hashSlice))
+		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
 	}
-	binary.Write(c, binary.LittleEndian, header.Timestamp)
-	c.Write(header.Hash[:])
+	msgHash, err := header.GetMessageHash()
+	if err != nil {
+		return err
+	}
+	if _, err := c.Write(msgHash); err != nil {
+		return err
+	}
 	return nil
+}
+
+func rejectAccept(c net.Conn, codes []byte) error {
+	_, err := c.Write(codes)
+	return err
 }
 
 func readHeader(c net.Conn) (*FMsgHeader, error) {
@@ -139,7 +225,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	log.Printf("from: @%s@%s", from.User, from.Domain)
 	h.From = *from
  
-	// read to addresses
+	// read to addresses TODO validate unique
 	num, err := r.ReadByte()
 	if err != nil {
 		return h, err
@@ -173,7 +259,107 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	}
 	h.Topic = string(mime)
 
+	// read message size
+	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
+		return h, err
+	}
+	if h.Size > MaxMessageSize {
+		codes := []byte{0, RejectCodeTooBig}
+		if err := rejectAccept(c, codes); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
+	}
+	
+	// TODO attachments
+
 	return h, nil
+}
+
+// Sends CHALLENGE request to sender domain first checking if domain is indeed located
+// at address in connection supplied by doing a host lookup.
+func challenge(conn net.Conn, h *FMsgHeader) error {
+
+	// TODO check if no challenge requested and we allow it
+	addr := strings.Split(conn.RemoteAddr().String(), ":")[0]
+	addrs, err := net.LookupHost(h.From.Domain)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, a := range addrs {
+		if addr == a { // TODO do we need any normalization?
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("remote address: %s not found in lookup for host: %s", addr, h.From.Domain)
+	}
+
+	// okay lets give sender a call and confirm they are sending this message
+	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, Port)) 
+	if err != nil {
+		return err
+	}
+	version := byte(255)
+	if err := binary.Write(conn2, binary.LittleEndian, version); err != nil {
+		return err
+	}
+	hash := h.GetHeaderHash()
+	if _, err := conn2.Write(hash); err != nil {
+		return err
+	}
+
+	// read challenge response
+	msgHash, err := io.ReadAll(io.LimitReader(conn2, 32))
+	if err != nil {
+		return err
+	}
+	copy(h.ChallengeHash[:], msgHash)
+
+	// gracefully close 2nd connection
+	if err := conn2.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func downloadMessage(c net.Conn, h *FMsgHeader) error {
+	
+	// first download to temp file
+	codes := make([]byte, len(h.To), len(h.To))
+	fd, err := os.CreateTemp("", "fmsg-download-*")
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	_, err = io.CopyN(fd, c, int64(h.Size))
+	if err != nil  {
+		return err
+	}
+
+	// TODO attachments
+	// TODO check checksum
+
+	// copy to each recipient's directory
+	for i, to := range h.To {
+		// TODO check disk space and user quota
+		fp := filepath.Join(DataDir, to.User, h.Topic) // TODO better naming
+		fd2, err := os.Create(fp)
+		if err != nil  {
+			return err
+		}
+		defer fd2.Close()
+		_, err = io.Copy(fd2, fd)
+		if err != nil  {
+			codes[i] = RejectUndisclosed // TODO better error ?
+		} else {
+			codes[i] = RejectAccept
+		}
+	}
+	return rejectAccept(c, codes)
 }
 
 func handleConn(c net.Conn) {
@@ -189,26 +375,32 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	// if no header or error this was a challenge thats been handeled
+	// if no header AND no error this was a challenge thats been handeled
 	if header == nil {
 		c.Close()
 		return
 	}
 
-	// unset read deadline to download message
 	c.SetReadDeadline(time.UnixMilli(0))
 
-	resp := fmt.Sprintf("Read header from: %s, to: %s", header.From, header.To)
-	resp_bytes := []byte(resp)
-	c.Write(resp_bytes)
-	log.Println("Voila!")
+	// challenge
+	err = challenge(c, header)
+	if err != nil {
+		log.Printf("Challenge failed from, %s: %s", c.RemoteAddr().String(), err)
+		return
+	}
 
-	// checks
-	// download
+	// download message
+	err = downloadMessage(c, header)
+	if err != nil {
+		log.Printf("Download failed form, %s: %s", c.RemoteAddr().String(), err)
+		return
+	}
 
-	// close
+	// TODO add details to index
+
+	// gracefully close 1st connection
 	c.Close()
-
 }
 
 
