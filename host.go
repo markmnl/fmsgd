@@ -33,6 +33,7 @@ const (
 var IoDeadline, _ = time.ParseDuration("5s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var DataDir = "/tmp"
+var Domain = "localhost"
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
@@ -75,7 +76,8 @@ func (addr *FMsgAddress) ToString() string {
 	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
 }
 
-// Encode the header up to and including type field to a []byte
+// Encode the header up to and including type field to a []byte. This function will panic on error
+// instead of returning one.
 func (h *FMsgHeader) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
@@ -329,11 +331,18 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	
 	// first download to temp file
-	codes := make([]byte, len(h.To), len(h.To))
+	addrs := []FMsgAddress{}
+	for _, addr := range(h.To) {
+		if addr.Domain == Domain {
+			addrs = append(addrs, addr)
+		}
+	}
+	codes := make([]byte, len(addrs))
 	fd, err := os.CreateTemp("", "fmsg-download-*")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(fd.Name())
 	defer fd.Close()
 	_, err = io.CopyN(fd, c, int64(h.Size))
 	if err != nil  {
@@ -344,9 +353,9 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	// TODO check checksum
 
 	// copy to each recipient's directory
-	for i, to := range h.To {
+	for i, addr := range addrs {
 		// TODO check disk space and user quota
-		fp := filepath.Join(DataDir, to.User, h.Topic) // TODO better naming
+		fp := filepath.Join(DataDir, addr.User, h.Topic) // TODO better naming
 		fd2, err := os.Create(fp)
 		if err != nil  {
 			return err
