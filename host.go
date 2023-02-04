@@ -259,7 +259,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	if err != nil {
 		return h, err
 	}
-	h.Topic = string(mime)
+	h.Type = string(mime)
 
 	// read message size
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
