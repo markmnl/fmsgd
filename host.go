@@ -17,7 +17,8 @@ import (
 	"unicode/utf8"
 )
 
-const Port = 36900
+const Port = 36901
+const RemotePort = 36900
 const ReadBufferSize = 1600
 const MaxMessageSize = 1024 * 10
 const (
@@ -30,7 +31,7 @@ const (
 	RejectAccept uint8 = 255
 )
 
-var IoDeadline, _ = time.ParseDuration("5s")
+var IoDeadline, _ = time.ParseDuration("15s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var DataDir = "/tmp"
 var Domain = "localhost"
@@ -85,15 +86,21 @@ func (h *FMsgHeader) Encode() []byte {
 	if h.Flags & HasPid == 1 {
 		b.Write(h.Pid[:])
 	}
-	b.WriteString(h.From.ToString())
+	str := h.From.ToString()
+	b.WriteByte(byte(len(str)))
+	b.WriteString(str)
 	b.WriteByte(byte(len(h.To)))
 	for _, addr := range h.To {
-		b.WriteString(addr.ToString())
+		str = addr.ToString()
+		b.WriteByte(byte(len(str)))
+		b.WriteString(str)
 	}
 	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
 		panic(err)
 	}
+	b.WriteByte(byte(len(h.Topic)))
 	b.WriteString(h.Topic)
+	b.WriteByte(byte(len(h.Type)))
 	b.WriteString(h.Type)
 	return b.Bytes()
 }
@@ -166,6 +173,7 @@ func handleChallenge(c net.Conn, r *bufio.Reader) error {
 		return err
 	}
 	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
+	fmt.Printf("<-- %s", hex.EncodeToString(hashSlice))
 	header, exists := outgoing[hash]
 	if !exists {
 		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
@@ -192,7 +200,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	// read version
 	v, err := r.ReadByte()
 	if err != nil {
-		return h, err
+		return h, err 
 	}
 	if v == 255 {
 		return nil, handleChallenge(c, r)
@@ -300,7 +308,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
-	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, Port)) 
+	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, RemotePort)) 
 	if err != nil {
 		return err
 	}
@@ -309,6 +317,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	hash := h.GetHeaderHash()
+	fmt.Printf("--> CHALLENGE %s\n", hex.EncodeToString(hash))
 	if _, err := conn2.Write(hash); err != nil {
 		return err
 	}
@@ -372,7 +381,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 }
 
 func handleConn(c net.Conn) {
-	log.Printf("Connection from: %s", c.RemoteAddr().String())
+	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
 
 	// set read deadline for reading header
 	c.SetReadDeadline(time.Now().Add(IoDeadline))
@@ -416,12 +425,13 @@ func handleConn(c net.Conn) {
 func main() {
 	outgoing = make(map[[32]byte]*FMsgHeader)
 
-	ln, err := net.Listen("tcp", "localhost:36900")
+	addr := fmt.Sprintf("localhost:%d", Port)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for {
-		log.Println("Listening on localhost:36900")
+		log.Printf("Listening on %s\n", addr)
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("Error accepting connection from, %s: %s\n", ln.Addr().String(), err)
