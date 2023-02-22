@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"os"
 	"path/filepath"
@@ -31,9 +32,10 @@ const (
 	RejectAccept uint8 = 255
 )
 
-var IoDeadline, _ = time.ParseDuration("15s")
+var ReadHeaderDeadline, _ = time.ParseDuration("15s")
+var DownloadDeadline, _ = time.ParseDuration("15s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
-var DataDir = "/tmp"
+var DataDir = "/tmp/fmsgdata2"
 var Domain = "localhost"
 
 // outgoing message headers keyed on header hash
@@ -312,7 +314,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	if err != nil {
 		return err
 	}
-	version := byte(255)
+	version := uint8(255)
 	if err := binary.Write(conn2, binary.LittleEndian, version); err != nil {
 		return err
 	}
@@ -361,10 +363,23 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	// TODO attachments
 	// TODO check checksum
 
+	exts , _ := mime.ExtensionsByType(h.Type)
+	var ext string
+	if (exts == nil) {
+		ext = ".unknown"
+	} else  {
+		ext = exts[0]
+	}
+
 	// copy to each recipient's directory
 	for i, addr := range addrs {
 		// TODO check disk space and user quota
-		fp := filepath.Join(DataDir, addr.User, h.Topic) // TODO better naming
+		dirpath := filepath.Join(DataDir, addr.Domain, addr.User) 
+		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp)) + ext)
+		err := os.MkdirAll(dirpath, 0750) // TODO review perm
+		if err != nil  {
+			return err
+		}
 		fd2, err := os.Create(fp)
 		if err != nil  {
 			return err
@@ -384,7 +399,7 @@ func handleConn(c net.Conn) {
 	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
 
 	// set read deadline for reading header
-	c.SetReadDeadline(time.Now().Add(IoDeadline))
+	c.SetReadDeadline(time.Now().Add(ReadHeaderDeadline))
 
 	// read header
 	header, err := readHeader(c)
@@ -399,8 +414,6 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	c.SetReadDeadline(time.UnixMilli(0))
-
 	// challenge
 	err = challenge(c, header)
 	if err != nil {
@@ -409,6 +422,7 @@ func handleConn(c net.Conn) {
 	}
 
 	// download message
+	c.SetReadDeadline(time.Now().Add(DownloadDeadline))
 	err = downloadMessage(c, header)
 	if err != nil {
 		log.Printf("Download failed form, %s: %s", c.RemoteAddr().String(), err)
