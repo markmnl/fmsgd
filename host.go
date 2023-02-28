@@ -18,50 +18,50 @@ import (
 	"unicode/utf8"
 )
 
-const Port = 36901
+const ListenAddress = "0.0.0.0"
+const Port = 36900
 const RemotePort = 36900
 const ReadBufferSize = 1600
 const MaxMessageSize = 1024 * 10
 const (
-	HasPid uint8 = 1
+	HasPid    uint8 = 1
 	Important uint8 = 1 << 1
 
-	
 	RejectUndisclosed uint8 = 1
-	RejectCodeTooBig uint8  = 2
-	RejectAccept uint8 = 255
+	RejectCodeTooBig  uint8 = 2
+	RejectAccept      uint8 = 255
 )
 
 var ReadHeaderDeadline, _ = time.ParseDuration("15s")
 var DownloadDeadline, _ = time.ParseDuration("15s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var DataDir = "/tmp/fmsgdata2"
-var Domain = "localhost"
+var Domain = "sturdy"
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
 
 type FMsgAddress struct {
-	User string
+	User   string
 	Domain string
 }
 
 type FMsgAttachmentHeader struct {
 	Filename string
-	Size uint32
+	Size     uint32
 
 	Filepath string
 }
 
 type FMsgHeader struct {
-	Version uint8
-	Flags uint8
-	Pid [32]byte
-	From FMsgAddress
-	To []FMsgAddress
+	Version   uint8
+	Flags     uint8
+	Pid       [32]byte
+	From      FMsgAddress
+	To        []FMsgAddress
 	Timestamp float64
-	Topic string
-	Type string
+	Topic     string
+	Type      string
 
 	// Size in bytes of entire message
 	Size uint32
@@ -71,7 +71,7 @@ type FMsgHeader struct {
 	ChallengeHash [32]byte
 	// Actual hash of message data including any attachments data
 	MessageHash []byte
-	// 
+	//
 	Filepath string
 }
 
@@ -85,7 +85,7 @@ func (h *FMsgHeader) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
 	b.WriteByte(h.Flags)
-	if h.Flags & HasPid == 1 {
+	if h.Flags&HasPid == 1 {
 		b.Write(h.Pid[:])
 	}
 	str := h.From.ToString()
@@ -119,15 +119,15 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 	if h.MessageHash == nil {
 		f, err := os.Open(h.Filepath)
 		if err != nil {
-		  return nil, err
+			return nil, err
 		}
 		defer f.Close()
-	  
+
 		hash := sha256.New()
 		if _, err := io.Copy(hash, f); err != nil {
-		  return nil, err
+			return nil, err
 		}
-		
+
 		// TODO attachments
 
 		h.MessageHash = hash.Sum(nil)
@@ -202,7 +202,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	// read version
 	v, err := r.ReadByte()
 	if err != nil {
-		return h, err 
+		return h, err
 	}
 	if v == 255 {
 		return nil, handleChallenge(c, r)
@@ -218,9 +218,9 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		return h, err
 	}
 	h.Flags = flags
-	
+
 	// read pid if any
-	if flags & HasPid == 1 {  
+	if flags&HasPid == 1 {
 		pid, err := io.ReadAll(io.LimitReader(c, 32))
 		if err != nil {
 			return h, err
@@ -236,12 +236,12 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	}
 	log.Printf("from: @%s@%s", from.User, from.Domain)
 	h.From = *from
- 
+
 	// read to addresses TODO validate unique
 	num, err := r.ReadByte()
 	if err != nil {
 		return h, err
-	} 
+	}
 	for num > 0 {
 		addr, err := readAddress(r)
 		if err != nil {
@@ -282,7 +282,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		}
 		return h, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
 	}
-	
+
 	// TODO attachments
 
 	return h, nil
@@ -310,7 +310,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
-	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, RemotePort)) 
+	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, RemotePort))
 	if err != nil {
 		return err
 	}
@@ -340,13 +340,16 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 }
 
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
-	
+
 	// first download to temp file
 	addrs := []FMsgAddress{}
-	for _, addr := range(h.To) {
+	for _, addr := range h.To {
 		if addr.Domain == Domain {
 			addrs = append(addrs, addr)
 		}
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("our domain: %s, not in recipient list: %s", Domain, h.To)
 	}
 	codes := make([]byte, len(addrs))
 	fd, err := os.CreateTemp("", "fmsg-download-*")
@@ -356,37 +359,37 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	defer os.Remove(fd.Name())
 	defer fd.Close()
 	_, err = io.CopyN(fd, c, int64(h.Size))
-	if err != nil  {
+	if err != nil {
 		return err
 	}
 
 	// TODO attachments
 	// TODO check checksum
 
-	exts , _ := mime.ExtensionsByType(h.Type)
+	exts, _ := mime.ExtensionsByType(h.Type)
 	var ext string
-	if (exts == nil) {
+	if exts == nil {
 		ext = ".unknown"
-	} else  {
+	} else {
 		ext = exts[0]
 	}
 
 	// copy to each recipient's directory
 	for i, addr := range addrs {
 		// TODO check disk space and user quota
-		dirpath := filepath.Join(DataDir, addr.Domain, addr.User) 
-		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp)) + ext)
+		dirpath := filepath.Join(DataDir, addr.Domain, addr.User)
+		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
 		err := os.MkdirAll(dirpath, 0750) // TODO review perm
-		if err != nil  {
+		if err != nil {
 			return err
 		}
 		fd2, err := os.Create(fp)
-		if err != nil  {
+		if err != nil {
 			return err
 		}
 		defer fd2.Close()
 		_, err = io.Copy(fd2, fd)
-		if err != nil  {
+		if err != nil {
 			codes[i] = RejectUndisclosed // TODO better error ?
 		} else {
 			codes[i] = RejectAccept
@@ -435,11 +438,10 @@ func handleConn(c net.Conn) {
 	c.Close()
 }
 
-
 func main() {
 	outgoing = make(map[[32]byte]*FMsgHeader)
 
-	addr := fmt.Sprintf("localhost:%d", Port)
+	addr := fmt.Sprintf("%s:%d", ListenAddress, Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -454,4 +456,3 @@ func main() {
 		}
 	}
 }
-
