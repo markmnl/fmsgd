@@ -1,0 +1,4 @@
+github.com/levenlabs/golib v0.0.0-20180911183212-0f8974794783 h1:ErBsqZpyadTBr2zGsgMau0JdyghyLdwRRHAKJukexrQ=
+github.com/levenlabs/golib v0.0.0-20180911183212-0f8974794783/go.mod h1:zw8z7nRRkGDZHexz1aMbZGtwxli5so0CBVZeIa3G+RE=
+gopkg.in/mgo.v2 v2.0.0-20190816093944-a6b53ec6cb22 h1:VpOs+IwYnYBaFnrNAeB8UUWtL3vEUnzSCL1nVjPhqrw=
+gopkg.in/mgo.v2 v2.0.0-20190816093944-a6b53ec6cb22/go.mod h1:yeKp02qBN3iKW1OzL3MGk2IdtZzaj7SFntXj72NppTA=

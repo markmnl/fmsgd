@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"os"
@@ -16,27 +17,42 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/levenlabs/golib/timeutil"
 )
 
 const ListenAddress = "0.0.0.0"
 const Port = 36900
-const RemotePort = 36900
+const RemotePort = 36901
 const ReadBufferSize = 1600
 const MaxMessageSize = 1024 * 10
+
 const (
 	HasPid    uint8 = 1
 	Important uint8 = 1 << 1
 
 	RejectUndisclosed uint8 = 1
 	RejectCodeTooBig  uint8 = 2
+	RejectCodeInsufficentResources  uint8 = 3
+	RejectCodeParentNotFound  uint8 = 4
+	RejectCodePastTime  uint8 = 5
+	RejectCodeFutureTime  uint8 = 6
+	RejectCodeTimeTravel  uint8 = 7
+	RejectCodeDuplicate  uint8 = 8
+
+	RejectCodeUserUnknown  uint8 = 100
+	RejectCodeUserFull  uint8 = 101
+
 	RejectAccept      uint8 = 255
 )
 
+var LowerTimeDelta float64 = 7 * 24 * 60 * 60 // 7 days
+var UpperTimeDelta float64 = 300 // 5 mins
 var ReadHeaderDeadline, _ = time.ParseDuration("15s")
 var DownloadDeadline, _ = time.ParseDuration("15s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var DataDir = "/tmp/fmsgdata2"
-var Domain = "sturdy"
+var Domain = "localhost"
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
@@ -237,7 +253,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	log.Printf("from: @%s@%s", from.User, from.Domain)
 	h.From = *from
 
-	// read to addresses TODO validate unique
+	// read to addresses TODO validate addresses are unique
 	num, err := r.ReadByte()
 	if err != nil {
 		return h, err
@@ -255,6 +271,24 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	// read timestamp
 	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
 		return h, err
+	}
+	now := timeutil.TimestampNow().Float64()
+	delta := now - h.Timestamp
+	if LowerTimeDelta > 0 && delta < 0 {
+		if math.Abs(delta) > LowerTimeDelta {
+			codes := []byte{ RejectCodePastTime }
+			if err := rejectAccept(c, codes); err != nil {
+				return h, err
+			}
+			return h, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
+		}
+	}
+	if UpperTimeDelta > 0 && delta > UpperTimeDelta {
+		codes := []byte{ RejectCodeFutureTime }
+		if err := rejectAccept(c, codes); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
 	}
 
 	// read topic
@@ -276,7 +310,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		return h, err
 	}
 	if h.Size > MaxMessageSize {
-		codes := []byte{0, RejectCodeTooBig}
+		codes := []byte{ RejectCodeTooBig }
 		if err := rejectAccept(c, codes); err != nil {
 			return h, err
 		}
