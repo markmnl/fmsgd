@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -26,6 +25,7 @@ const Port = 36900
 const RemotePort = 36901
 const ReadBufferSize = 1600
 const MaxMessageSize = 1024 * 10
+const InboxDirName = "in"
 
 const (
 	HasPid    uint8 = 1
@@ -46,6 +46,7 @@ const (
 	RejectAccept      uint8 = 255
 )
 
+// TODO get these from env
 var LowerTimeDelta float64 = 7 * 24 * 60 * 60 // 7 days
 var UpperTimeDelta float64 = 300 // 5 mins
 var ReadHeaderDeadline, _ = time.ParseDuration("15s")
@@ -54,102 +55,9 @@ var AtRune, _ = utf8.DecodeRuneInString("@")
 var DataDir = "/tmp/fmsgdata2"
 var Domain = "localhost"
 
+
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
-
-type FMsgAddress struct {
-	User   string
-	Domain string
-}
-
-type FMsgAttachmentHeader struct {
-	Filename string
-	Size     uint32
-
-	Filepath string
-}
-
-type FMsgHeader struct {
-	Version   uint8
-	Flags     uint8
-	Pid       [32]byte
-	From      FMsgAddress
-	To        []FMsgAddress
-	Timestamp float64
-	Topic     string
-	Type      string
-
-	// Size in bytes of entire message
-	Size uint32
-	// Hash up to and including Type
-	HeaderHash []byte
-	// Hash of message from Challenge Response
-	ChallengeHash [32]byte
-	// Actual hash of message data including any attachments data
-	MessageHash []byte
-	//
-	Filepath string
-}
-
-func (addr *FMsgAddress) ToString() string {
-	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
-}
-
-// Encode the header up to and including type field to a []byte. This function will panic on error
-// instead of returning one.
-func (h *FMsgHeader) Encode() []byte {
-	var b bytes.Buffer
-	b.WriteByte(h.Version)
-	b.WriteByte(h.Flags)
-	if h.Flags&HasPid == 1 {
-		b.Write(h.Pid[:])
-	}
-	str := h.From.ToString()
-	b.WriteByte(byte(len(str)))
-	b.WriteString(str)
-	b.WriteByte(byte(len(h.To)))
-	for _, addr := range h.To {
-		str = addr.ToString()
-		b.WriteByte(byte(len(str)))
-		b.WriteString(str)
-	}
-	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
-		panic(err)
-	}
-	b.WriteByte(byte(len(h.Topic)))
-	b.WriteString(h.Topic)
-	b.WriteByte(byte(len(h.Type)))
-	b.WriteString(h.Type)
-	return b.Bytes()
-}
-
-func (h *FMsgHeader) GetHeaderHash() []byte {
-	if h.HeaderHash == nil {
-		b := sha256.Sum256(h.Encode())
-		h.HeaderHash = b[:]
-	}
-	return h.HeaderHash
-}
-
-func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
-	if h.MessageHash == nil {
-		f, err := os.Open(h.Filepath)
-		if err != nil {
-			return nil, err
-		}
-		defer f.Close()
-
-		hash := sha256.New()
-		if _, err := io.Copy(hash, f); err != nil {
-			return nil, err
-		}
-
-		// TODO attachments
-
-		h.MessageHash = hash.Sum(nil)
-	}
-	return h.MessageHash, nil
-}
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
 	var addr = &FMsgAddress{}
@@ -241,7 +149,8 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		if err != nil {
 			return h, err
 		}
-		copy(h.Pid[:], pid)
+		h.Pid = make([]byte, 32)
+		copy(h.Pid, pid)
 		// TODO verify pid exists
 	}
 
@@ -359,11 +268,11 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	}
 
 	// read challenge response
-	msgHash, err := io.ReadAll(io.LimitReader(conn2, 32))
+	resp, err := io.ReadAll(io.LimitReader(conn2, 32))
 	if err != nil {
 		return err
 	}
-	copy(h.ChallengeHash[:], msgHash)
+	copy(h.ChallengeHash[:], resp)
 
 	// gracefully close 2nd connection
 	if err := conn2.Close(); err != nil {
@@ -392,14 +301,25 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	}
 	defer os.Remove(fd.Name())
 	defer fd.Close()
+
 	_, err = io.CopyN(fd, c, int64(h.Size))
 	if err != nil {
 		return err
 	}
 
 	// TODO attachments
-	// TODO check checksum
 
+	// check checksum of downloaded message matches challenge resp.
+	h.Filepath = fd.Name()
+	msgHash, err := h.GetMessageHash()
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(h.ChallengeHash[:], msgHash) {
+		return fmt.Errorf("actual hash doesn't match challenge response: %s %s", msgHash, h.ChallengeHash)
+	}
+
+	// calc file extenstion from mime type
 	exts, _ := mime.ExtensionsByType(h.Type)
 	var ext string
 	if exts == nil {
@@ -411,7 +331,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	// copy to each recipient's directory
 	for i, addr := range addrs {
 		// TODO check disk space and user quota
-		dirpath := filepath.Join(DataDir, addr.Domain, addr.User)
+		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
 		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
 		err := os.MkdirAll(dirpath, 0750) // TODO review perm
 		if err != nil {
@@ -424,15 +344,30 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		defer fd2.Close()
 		_, err = io.Copy(fd2, fd)
 		if err != nil {
+			log.Printf("Error copying downloaded message from: %s, to: %s\n", fd.Name(), fd2.Name())
 			codes[i] = RejectUndisclosed // TODO better error ?
 		} else {
-			codes[i] = RejectAccept
+			h.Filepath = fp
+			err = storeMsgDetail(h)
+			if err != nil {
+				log.Printf("Error storing message: %s\n", err)
+				codes[i] = RejectUndisclosed // TODO better error ?
+			} else {
+				codes[i] = RejectAccept
+			}
 		}
 	}
+
 	return rejectAccept(c, codes)
 }
 
 func handleConn(c net.Conn) {
+	defer func() {
+        if r := recover(); r != nil {
+            log.Println("Recovered in handleConn", r)
+        }
+    }()
+
 	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
 
 	// set read deadline for reading header
@@ -458,15 +393,13 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	// download message
-	c.SetReadDeadline(time.Now().Add(DownloadDeadline))
+	// store message
+	c.SetReadDeadline(time.Now().Add(DownloadDeadline)) // TODO MIN_DOWNLOAD RATE
 	err = downloadMessage(c, header)
 	if err != nil {
 		log.Printf("Download failed form, %s: %s", c.RemoteAddr().String(), err)
 		return
 	}
-
-	// TODO add details to index
 
 	// gracefully close 1st connection
 	c.Close()
@@ -474,6 +407,14 @@ func handleConn(c net.Conn) {
 
 func main() {
 	outgoing = make(map[[32]byte]*FMsgHeader)
+
+	log.SetPrefix("fmsg-host: ")
+
+	err := initDb()
+	if err != nil {
+		log.Fatalf("Error initalizing database: %s\n", err)
+	}
+	log.Println("Initalized database")
 
 	addr := fmt.Sprintf("%s:%d", ListenAddress, Port)
 	ln, err := net.Listen("tcp", addr)
