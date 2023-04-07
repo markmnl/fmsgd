@@ -21,13 +21,14 @@ var sqlTables = `create table if not exists msg (
     type          	varchar(255)    	not null,
     sha256        	bytea           	unique not null,
     psha256       	bytea,
+	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
     filepath      	text            	not null
 );
  
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
     filename      	varchar(255)    not null,
-    filesize      	int             not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
+    filesize      	int             not null, 
     filepath      	text			not null,
     primary key (msg_id, filename)
 );`

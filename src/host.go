@@ -17,17 +17,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	env "github.com/caitlinelfring/go-env-default"
 	"github.com/levenlabs/golib/timeutil"
 )
 
-const ListenAddress = "0.0.0.0"
-const Port = 36900
-const RemotePort = 36901
-const ReadBufferSize = 1600
-const MaxMessageSize = 1024 * 10
-const InboxDirName = "in"
-
 const (
+	InboxDirName = "in"
+	OutboxDirName = "out"
+
 	HasPid    uint8 = 1
 	Important uint8 = 1 << 1
 
@@ -46,18 +43,51 @@ const (
 	RejectAccept      uint8 = 255
 )
 
-// TODO get these from env
-var LowerTimeDelta float64 = 7 * 24 * 60 * 60 // 7 days
-var UpperTimeDelta float64 = 300 // 5 mins
-var ReadHeaderDeadline, _ = time.ParseDuration("15s")
-var DownloadDeadline, _ = time.ParseDuration("15s")
 var AtRune, _ = utf8.DecodeRuneInString("@")
-var DataDir = "/tmp/fmsgdata2"
-var Domain = "localhost"
-
+var Port = env.GetIntDefault("FMSG_PORT", 36900)
+var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36901)
+var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MIN_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
+var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
+var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
+var MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
+var ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
+var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024 * 10))
+var DataDir = "got on startup"
+var Domain = "got on startup"
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
+
+// Updates DataDir from environment, panics if not a valid directory
+func setDataDir() {
+    value, hasValue := os.LookupEnv("FMSG_DATA_DIR")
+	if !hasValue {
+        log.Panic("ERROR: FMSG_DATA_DIR not set")
+    }
+	_, err := os.Stat(value)
+	if err != nil {
+		log.Panicf("ERROR: FMSG_DATA_DIR, %s: %s", value, err)
+	}
+    DataDir = value
+}
+
+// Updates Domain from environment, panics if not a valid domain
+func setDomain() {
+    domain, hasValue := os.LookupEnv("FMSG_DOMAIN")
+	if !hasValue {
+        log.Panic("ERROR: FMSG_DOMAIN not set")
+    }
+    _, err := net.LookupHost(domain)
+    if err != nil {
+        log.Panicf("ERROR: FMSG_DOMAIN, %s: %s", domain, err)
+    }
+	Domain = domain
+}
+
+func calcDuration(sizeInBytes int, bytesPerSecond float64) (time.Duration) {
+	rate := float64(sizeInBytes) / bytesPerSecond
+	return time.Duration(rate * float64(time.Second))
+}
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
 	var addr = &FMsgAddress{}
@@ -122,6 +152,9 @@ func rejectAccept(c net.Conn, codes []byte) error {
 func readHeader(c net.Conn) (*FMsgHeader, error) {
 	r := bufio.NewReaderSize(c, ReadBufferSize)
 	var h = &FMsgHeader{}
+	
+	d := time.Duration(20 * time.Second) // TODO calc?
+	c.SetReadDeadline(time.Now().Add(d))
 
 	// read version
 	v, err := r.ReadByte()
@@ -183,8 +216,8 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	}
 	now := timeutil.TimestampNow().Float64()
 	delta := now - h.Timestamp
-	if LowerTimeDelta > 0 && delta < 0 {
-		if math.Abs(delta) > LowerTimeDelta {
+	if PastTimeDelta > 0 && delta < 0 {
+		if math.Abs(delta) > PastTimeDelta {
 			codes := []byte{ RejectCodePastTime }
 			if err := rejectAccept(c, codes); err != nil {
 				return h, err
@@ -192,7 +225,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 			return h, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
 		}
 	}
-	if UpperTimeDelta > 0 && delta > UpperTimeDelta {
+	if FutureTimeDelta > 0 && delta > FutureTimeDelta {
 		codes := []byte{ RejectCodeFutureTime }
 		if err := rejectAccept(c, codes); err != nil {
 			return h, err
@@ -370,9 +403,6 @@ func handleConn(c net.Conn) {
 
 	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
 
-	// set read deadline for reading header
-	c.SetReadDeadline(time.Now().Add(ReadHeaderDeadline))
-
 	// read header
 	header, err := readHeader(c)
 	if err != nil {
@@ -394,7 +424,8 @@ func handleConn(c net.Conn) {
 	}
 
 	// store message
-	c.SetReadDeadline(time.Now().Add(DownloadDeadline)) // TODO MIN_DOWNLOAD RATE
+	d := calcDuration(int(header.Size), MinDownloadRate)
+	c.SetReadDeadline(time.Now().Add(d))
 	err = downloadMessage(c, header)
 	if err != nil {
 		log.Printf("Download failed form, %s: %s", c.RemoteAddr().String(), err)
@@ -406,17 +437,30 @@ func handleConn(c net.Conn) {
 }
 
 func main() {
+
 	outgoing = make(map[[32]byte]*FMsgHeader)
 
 	log.SetPrefix("fmsg-host: ")
 
+	// get listen address from args
+	if len(os.Args) < 2 {
+		log.Fatalf("ERROR: Listen address is required as an argument, e.g.: \"0.0.0.0\"\n")
+	}
+	listenAddress := os.Args[1]
+
+	// initalize database
 	err := initDb()
 	if err != nil {
-		log.Fatalf("Error initalizing database: %s\n", err)
+		log.Fatalf("ERROR: initalizing database: %s\n", err)
 	}
-	log.Println("Initalized database")
+	log.Println("INFO: Initalized database")
 
-	addr := fmt.Sprintf("%s:%d", ListenAddress, Port)
+	// set data dir and domain from env
+	setDataDir()
+	setDomain()
+
+	// start listening TODO start sending
+	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -425,7 +469,7 @@ func main() {
 		log.Printf("Listening on %s\n", addr)
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection from, %s: %s\n", ln.Addr().String(), err)
+			log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
 		} else {
 			go handleConn(conn)
 		}
