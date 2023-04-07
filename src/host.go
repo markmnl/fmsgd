@@ -46,7 +46,7 @@ const (
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
 var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36901)
-var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MIN_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
+var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
 var MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
