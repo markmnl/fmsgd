@@ -38,5 +38,35 @@ IP address to bind to and listen on must be supplied as the first argument, e.g.
 
 ### systemd
 
+An example systemd service to run fmsgd as a daemon.
+
+ASSUMES: 
+    * Directory `/opt/fmsgd` has been created and contains built executable: `fmsgd`
+    * Text file `/opt/fmsgd/env` exists containing environment variables
+    * User `fmsg` has been created and has
+        - read and execute permissions to `/opt/fmsgd/`, e.g. with `chown -R fmsg:fmsg /opt/fmsgd` after `mkdir /opt/fmsgd`
+        - write permissions to FMSG_DATA_DIR
+    * 
+
+`/etc/systemd/system/fmsgd.service`
+
 ```
+[Unit]
+Description=fmsg Host
+After=network.target
+
+[Service]
+EnvironmentFile=/opt/fmsgd/env
+ExecStart=/opt/fmsgd/fmsgd "0.0.0.0"
+User=fmsg
+Group=fmsg
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable fmsgd
+sudo systemctl start fmsgd
 ```
