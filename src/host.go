@@ -43,7 +43,6 @@ const (
 	RejectAccept      uint8 = 255
 )
 
-var AtRune, _ = utf8.DecodeRuneInString("@")
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
 var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36901)
 var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
@@ -54,6 +53,8 @@ var ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024 * 10))
 var DataDir = "got on startup"
 var Domain = "got on startup"
+var AtRune, _ = utf8.DecodeRuneInString("@")
+var MinNetIODeadline = 6 * time.Second
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
@@ -84,9 +85,13 @@ func setDomain() {
 	Domain = domain
 }
 
-func calcDuration(sizeInBytes int, bytesPerSecond float64) (time.Duration) {
+func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) (time.Duration) {
 	rate := float64(sizeInBytes) / bytesPerSecond
-	return time.Duration(rate * float64(time.Second))
+	d := time.Duration(rate * float64(time.Second))
+	if d < MinNetIODeadline {
+		return MinNetIODeadline
+	}
+	return d
 }
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
@@ -424,11 +429,11 @@ func handleConn(c net.Conn) {
 	}
 
 	// store message
-	d := calcDuration(int(header.Size), MinDownloadRate)
+	d := calcNetIODuration(int(header.Size), MinDownloadRate)
 	c.SetReadDeadline(time.Now().Add(d))
 	err = downloadMessage(c, header)
 	if err != nil {
-		log.Printf("Download failed form, %s: %s", c.RemoteAddr().String(), err)
+		log.Printf("Download failed from, %s: %s", c.RemoteAddr().String(), err)
 		return
 	}
 
@@ -465,8 +470,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("INFO: Listening on %s\n", addr)
 	for {
-		log.Printf("Listening on %s\n", addr)
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
