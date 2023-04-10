@@ -1,4 +1,4 @@
-module github.com/markmnl/fmsg-host
+module github.com/markmnl/fmsgd
 
 go 1.18
 

@@ -1,4 +1,4 @@
-# fmsg-host
+# fmsgd
 
 Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in go! Uses local filesystem and PostgreSQL database to store messages per the [fmsg-store-postgres standard](https://github.com/markmnl/fmsg/blob/main/STANDARDS.md).
 
@@ -13,7 +13,7 @@ Tested with go 1.18, 1.19 and 1.20 on Linux (AMD64, ARM64) and Windows AMD64
 
 ## Environment
 
-fmsg-host uses environment variables as a control surface. `FMSG_DATA_DIR` and `FMSG_DOMAIN` are required to be set; otherwise the host will fail to start. In addition to these `FMSG_` varibles `PG` variables also need to be set for the PostgreSQL database used, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
+fmsgd uses environment variables as a control surface. `FMSG_DATA_DIR` and `FMSG_DOMAIN` are required to be set; otherwise the host will fail to start. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
 
 | Variable                   | Default | Description                                                                                                                                             |
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -33,5 +33,10 @@ fmsg-host uses environment variables as a control surface. `FMSG_DATA_DIR` and `
 IP address to bind to and listen on must be supplied as the first argument, e.g.:
 
 ```
-./fmsg-host "0.0.0.0"
+./fmsgd "0.0.0.0"
+```
+
+### systemd
+
+```
 ```

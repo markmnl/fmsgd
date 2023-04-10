@@ -440,7 +440,7 @@ func main() {
 
 	outgoing = make(map[[32]byte]*FMsgHeader)
 
-	log.SetPrefix("fmsg-host: ")
+	log.SetPrefix("fmsgd: ")
 
 	// get listen address from args
 	if len(os.Args) < 2 {
