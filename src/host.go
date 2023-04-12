@@ -22,35 +22,35 @@ import (
 )
 
 const (
-	InboxDirName = "in"
+	InboxDirName  = "in"
 	OutboxDirName = "out"
 
 	HasPid    uint8 = 1
 	Important uint8 = 1 << 1
 
-	RejectUndisclosed uint8 = 1
-	RejectCodeTooBig  uint8 = 2
-	RejectCodeInsufficentResources  uint8 = 3
-	RejectCodeParentNotFound  uint8 = 4
-	RejectCodePastTime  uint8 = 5
-	RejectCodeFutureTime  uint8 = 6
-	RejectCodeTimeTravel  uint8 = 7
-	RejectCodeDuplicate  uint8 = 8
+	RejectUndisclosed              uint8 = 1
+	RejectCodeTooBig               uint8 = 2
+	RejectCodeInsufficentResources uint8 = 3
+	RejectCodeParentNotFound       uint8 = 4
+	RejectCodePastTime             uint8 = 5
+	RejectCodeFutureTime           uint8 = 6
+	RejectCodeTimeTravel           uint8 = 7
+	RejectCodeDuplicate            uint8 = 8
 
-	RejectCodeUserUnknown  uint8 = 100
-	RejectCodeUserFull  uint8 = 101
+	RejectCodeUserUnknown uint8 = 100
+	RejectCodeUserFull    uint8 = 101
 
-	RejectAccept      uint8 = 255
+	RejectAccept uint8 = 255
 )
 
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
 var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36901)
-var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
+var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7*24*60*60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
 var MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
 var ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
-var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024 * 10))
+var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var AtRune, _ = utf8.DecodeRuneInString("@")
@@ -61,31 +61,31 @@ var outgoing map[[32]byte]*FMsgHeader
 
 // Updates DataDir from environment, panics if not a valid directory
 func setDataDir() {
-    value, hasValue := os.LookupEnv("FMSG_DATA_DIR")
+	value, hasValue := os.LookupEnv("FMSG_DATA_DIR")
 	if !hasValue {
-        log.Panic("ERROR: FMSG_DATA_DIR not set")
-    }
+		log.Panic("ERROR: FMSG_DATA_DIR not set")
+	}
 	_, err := os.Stat(value)
 	if err != nil {
 		log.Panicf("ERROR: FMSG_DATA_DIR, %s: %s", value, err)
 	}
-    DataDir = value
+	DataDir = value
 }
 
 // Updates Domain from environment, panics if not a valid domain
 func setDomain() {
-    domain, hasValue := os.LookupEnv("FMSG_DOMAIN")
+	domain, hasValue := os.LookupEnv("FMSG_DOMAIN")
 	if !hasValue {
-        log.Panic("ERROR: FMSG_DOMAIN not set")
-    }
-    _, err := net.LookupHost(domain)
-    if err != nil {
-        log.Panicf("ERROR: FMSG_DOMAIN, %s: %s", domain, err)
-    }
+		log.Panic("ERROR: FMSG_DOMAIN not set")
+	}
+	_, err := net.LookupHost(domain)
+	if err != nil {
+		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s", domain, err)
+	}
 	Domain = domain
 }
 
-func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) (time.Duration) {
+func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
 	rate := float64(sizeInBytes) / bytesPerSecond
 	d := time.Duration(rate * float64(time.Second))
 	if d < MinNetIODeadline {
@@ -95,6 +95,7 @@ func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) (time.Duration) 
 }
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
+	// TODO validate length
 	var addr = &FMsgAddress{}
 	addrStr := string(b)
 	firstAt := strings.IndexRune(addrStr, AtRune)
@@ -106,6 +107,7 @@ func parseAddress(b []byte) (*FMsgAddress, error) {
 		return addr, fmt.Errorf("invalid address, must have second @ %s", addr)
 	}
 	addr.User = addrStr[1:lastAt]
+	// TODO validate string
 	addr.Domain = addrStr[lastAt+1:]
 	return addr, nil
 }
@@ -157,7 +159,7 @@ func rejectAccept(c net.Conn, codes []byte) error {
 func readHeader(c net.Conn) (*FMsgHeader, error) {
 	r := bufio.NewReaderSize(c, ReadBufferSize)
 	var h = &FMsgHeader{}
-	
+
 	d := time.Duration(20 * time.Second) // TODO calc?
 	c.SetReadDeadline(time.Now().Add(d))
 
@@ -223,7 +225,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	delta := now - h.Timestamp
 	if PastTimeDelta > 0 && delta < 0 {
 		if math.Abs(delta) > PastTimeDelta {
-			codes := []byte{ RejectCodePastTime }
+			codes := []byte{RejectCodePastTime}
 			if err := rejectAccept(c, codes); err != nil {
 				return h, err
 			}
@@ -231,7 +233,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		}
 	}
 	if FutureTimeDelta > 0 && delta > FutureTimeDelta {
-		codes := []byte{ RejectCodeFutureTime }
+		codes := []byte{RejectCodeFutureTime}
 		if err := rejectAccept(c, codes); err != nil {
 			return h, err
 		}
@@ -257,7 +259,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		return h, err
 	}
 	if h.Size > MaxMessageSize {
-		codes := []byte{ RejectCodeTooBig }
+		codes := []byte{RejectCodeTooBig}
 		if err := rejectAccept(c, codes); err != nil {
 			return h, err
 		}
@@ -320,6 +322,12 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	return nil
 }
 
+func validateMessageForAddr(c net.Conn, h *FMsgHeader, addr *FMsgAddress) error {
+	// TODO check user accepts new
+	// TODO check quotas
+	return nil
+}
+
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
 
 	// first download to temp file
@@ -366,9 +374,16 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		ext = exts[0]
 	}
 
-	// copy to each recipient's directory
 	for i, addr := range addrs {
-		// TODO check disk space and user quota
+
+		// validate
+		err = validateMessageForAddr(c, h, &addr)
+		if err != nil {
+			log.Printf("WARN: validation failed, %s: %s", c.RemoteAddr().String(), err)
+			continue
+		}
+
+		// copy to recipient's directory
 		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
 		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
 		err := os.MkdirAll(dirpath, 0750) // TODO review perm
@@ -401,10 +416,10 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 
 func handleConn(c net.Conn) {
 	defer func() {
-        if r := recover(); r != nil {
-            log.Println("Recovered in handleConn", r)
-        }
-    }()
+		if r := recover(); r != nil {
+			log.Println("Recovered in handleConn", r)
+		}
+	}()
 
 	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
 
