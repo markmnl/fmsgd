@@ -424,7 +424,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			return err
 		}
 		if code != RejectCodeAccept {
-			log.Printf("WARN: Rejected message: %s", code)
+			log.Printf("WARN: Rejected message: %d", code)
 			codes[i] = code
 			continue
 		}
