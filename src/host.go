@@ -44,7 +44,8 @@ const (
 )
 
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
-var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36901)
+// The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
+var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36900) 
 var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
@@ -424,7 +425,7 @@ func handleConn(c net.Conn) {
 	// challenge
 	err = challenge(c, header)
 	if err != nil {
-		log.Printf("Challenge failed from, %s: %s", c.RemoteAddr().String(), err)
+		log.Printf("Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
 		return
 	}
 
