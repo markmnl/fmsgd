@@ -54,7 +54,7 @@ func (h *FMsgHeader) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
 	b.WriteByte(h.Flags)
-	if h.Flags&HasPid == 1 {
+	if h.Flags & FlagHasPid == 1 {
 		b.Write(h.Pid[:])
 	}
 	str := h.From.ToString()

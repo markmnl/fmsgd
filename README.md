@@ -43,7 +43,7 @@ IP address to bind to and listen on must be supplied as the first argument, e.g.
 
 ### systemd
 
-An example systemd service to run fmsgd as a daemon.
+An example systemd service to run fmsgd as a service on startup
 
 ASSUMES: 
 * Directory `/opt/fmsgd` has been created and contains built executable: `fmsgd`

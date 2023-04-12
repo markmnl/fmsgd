@@ -25,27 +25,28 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
-	HasPid    uint8 = 1
-	Important uint8 = 1 << 1
+	FlagHasPid    						uint8 = 1
+	FlagImportant 						uint8 = 1 << 1
 
-	RejectUndisclosed              uint8 = 1
-	RejectCodeTooBig               uint8 = 2
-	RejectCodeInsufficentResources uint8 = 3
-	RejectCodeParentNotFound       uint8 = 4
-	RejectCodePastTime             uint8 = 5
-	RejectCodeFutureTime           uint8 = 6
-	RejectCodeTimeTravel           uint8 = 7
-	RejectCodeDuplicate            uint8 = 8
+	RejectCodeUndisclosed               uint8 = 1
+	RejectCodeTooBig                	uint8 = 2
+	RejectCodeInsufficentResources  	uint8 = 3
+	RejectCodeParentNotFound        	uint8 = 4
+	RejectCodePastTime              	uint8 = 5
+	RejectCodeFutureTime            	uint8 = 6
+	RejectCodeTimeTravel            	uint8 = 7
+	RejectCodeDuplicate             	uint8 = 8
 
-	RejectCodeUserUnknown uint8 = 100
-	RejectCodeUserFull    uint8 = 101
+	RejectCodeUserUnknown				uint8 = 100
+	RejectCodeUserFull					uint8 = 101
+	RejectCodeUserDeclined          	uint8 = 102 // TODO better name for "user not accepting new messages"
 
-	RejectAccept uint8 = 255
+	RejectCodeAccept 					uint8 = 255
 )
 
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
-var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36900) 
+var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36900)
 var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
@@ -54,13 +55,14 @@ var ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
 var DataDir = "got on startup"
 var Domain = "got on startup"
+var IDURI = "got on startup"
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var MinNetIODeadline = 6 * time.Second
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
 
-// Updates DataDir from environment, panics if not a valid directory
+// Updates DataDir from environment, panics if not a valid directory.
 func setDataDir() {
 	value, hasValue := os.LookupEnv("FMSG_DATA_DIR")
 	if !hasValue {
@@ -73,7 +75,7 @@ func setDataDir() {
 	DataDir = value
 }
 
-// Updates Domain from environment, panics if not a valid domain
+// Updates Domain from environment, panics if not a valid domain.
 func setDomain() {
 	domain, hasValue := os.LookupEnv("FMSG_DOMAIN")
 	if !hasValue {
@@ -84,6 +86,20 @@ func setDomain() {
 		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s", domain, err)
 	}
 	Domain = domain
+}
+
+// Updates IDURI from environment, defaults to localhost if not set, panics if not a valid domain.
+func setIDURI() {
+	uri, hasValue := os.LookupEnv("FMSG_ID_URI")
+	if !hasValue {
+		uri = "https://localhost"
+		log.Printf("WARN: FMSG_ID_URI not set, using: %s\n", uri)
+	}
+	_, err := net.LookupHost(uri)
+	if err != nil {
+		log.Panicf("ERROR: FMSG_ID_URI, %s: %s", uri, err)
+	}
+	IDURI = uri
 }
 
 func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
@@ -185,7 +201,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	h.Flags = flags
 
 	// read pid if any
-	if flags&HasPid == 1 {
+	if flags & FlagHasPid == 1 {
 		pid, err := io.ReadAll(io.LimitReader(c, 32))
 		if err != nil {
 			return h, err
@@ -323,10 +339,35 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	return nil
 }
 
-func validateMessageForAddr(c net.Conn, h *FMsgHeader, addr *FMsgAddress) error {
-	// TODO check user accepts new
-	// TODO check quotas
-	return nil
+func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err error) {
+	detail, err := getAddressDetail(addr)
+	if err != nil {
+		return RejectCodeUserUnknown, err
+	}
+	if detail == nil {
+		return RejectCodeUserUnknown, nil
+	}
+
+	// check user accepting new
+	if !detail.AcceptingNew {
+		return RejectCodeUserDeclined, nil
+	}
+
+	// check user limits
+	if detail.RecvCountPer1d > -1 && detail.RecvCountPer1d + 1 > detail.LimitRecvCountPer1d {
+		log.Printf("WARN: Message rejected: RecvCountPer1d would exceed LimitRecvCountPer1d %d", detail.LimitRecvCountPer1d)
+		return RejectCodeUserFull, nil
+	}
+	if detail.RecvSizePer1d > -1 && detail.RecvSizePer1d + int(h.Size) > detail.LimitRecvSizePer1d {
+		log.Printf("WARN: Message rejected: RecvSizePer1d would exceed LimitRecvSizePer1d %d", detail.LimitRecvSizePer1d)
+		return RejectCodeUserFull, nil
+	}
+	if detail.RecvSizeTotal > -1 && detail.RecvSizeTotal + int(h.Size) > detail.LimitRecvSizeTotal {
+		log.Printf("WARN: Message rejected: RecvSizeTotal would exceed LimitRecvSizeTotal %d", detail.LimitRecvSizeTotal)
+		return RejectCodeUserFull, nil
+	}
+
+	return RejectCodeAccept, nil
 }
 
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
@@ -378,16 +419,20 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	for i, addr := range addrs {
 
 		// validate
-		err = validateMessageForAddr(c, h, &addr)
+		code, err := validateMsgRecvForAddr(h, &addr)
 		if err != nil {
-			log.Printf("WARN: validation failed, %s: %s", c.RemoteAddr().String(), err)
+			return err
+		}
+		if code != RejectCodeAccept {
+			log.Printf("WARN: Rejected message: %s", code)
+			codes[i] = code
 			continue
 		}
 
 		// copy to recipient's directory
 		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
 		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
-		err := os.MkdirAll(dirpath, 0750) // TODO review perm
+		err = os.MkdirAll(dirpath, 0750) // TODO review perm
 		if err != nil {
 			return err
 		}
@@ -398,16 +443,20 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		defer fd2.Close()
 		_, err = io.Copy(fd2, fd)
 		if err != nil {
-			log.Printf("Error copying downloaded message from: %s, to: %s\n", fd.Name(), fd2.Name())
-			codes[i] = RejectUndisclosed // TODO better error ?
+			log.Printf("ERROR: copying downloaded message from: %s, to: %s\n", fd.Name(), fd2.Name())
+			codes[i] = RejectCodeUndisclosed
 		} else {
 			h.Filepath = fp
 			err = storeMsgDetail(h)
 			if err != nil {
-				log.Printf("Error storing message: %s\n", err)
-				codes[i] = RejectUndisclosed // TODO better error ?
+				log.Printf("ERROR: storing message: %s\n", err)
+				codes[i] = RejectCodeUndisclosed
 			} else {
-				codes[i] = RejectAccept
+				codes[i] = RejectCodeAccept
+				err = postMsgStatRecv(&addr, h.Timestamp, int(h.Size))
+				if err != nil {
+					log.Printf("WARN: Failed to post msg recv stat: %s\n", err)
+				}
 			}
 		}
 	}
@@ -476,9 +525,10 @@ func main() {
 	}
 	log.Println("INFO: Initalized database")
 
-	// set data dir and domain from env
+	// set DataDir, Domain and IDURI from env
 	setDataDir()
 	setDomain()
+	setIDURI()
 
 	// start listening TODO start sending
 	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
