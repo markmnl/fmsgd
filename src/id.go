@@ -9,29 +9,31 @@ import (
 )
 
 type AddressDetail struct {
-    Name              	string 	`json:"name"`
     Address           	string 	`json:"address"`
     DisplayName       	string 	`json:"displayName"`
     AcceptingNew      	bool   	`json:"acceptingNew"`
-    LimitRecvSizeTotal 	int    	`json:"limitRecvSizeTotal"`
-    LimitRecvSizePerMsg int    	`json:"limitRecvSizePerMsg"`
-    LimitRecvSizePer1d 	int    	`json:"limitRecvSizePer1d"`
-    LimitRecvCountPer1d int    	`json:"limitRecvCountPer1d"`
-    LimitSendSizeTotal 	int    	`json:"limitSendSizeTotal"`
-    LimitSendSizePerMsg int    	`json:"limitSendSizePerMsg"`
-    LimitSendSizePer1d 	int    	`json:"limitSendSizePer1d"`
-    LimitSendCountPer1d int   	`json:"limitSendCountPer1d"`
-    RecvSizeTotal      	int     `json:"recvSizeTotal"`
-    RecvSizePer1d      	int     `json:"recvSizePer1d"`
-    RecvCountPer1d     	int     `json:"recvCountPer1d"`
-    SendSizeTotal      	int     `json:"sendSizeTotal"`
-    SendSizePer1d      	int     `json:"sendSizePer1d"`
-    SendCountPer1d     	int     `json:"sendCountPer1d"`
-    Tags              	[]string  `json:"tags"`
+    LimitRecvSizeTotal 	int64   `json:"limitRecvSizeTotal"`
+    LimitRecvSizePerMsg int64  	`json:"limitRecvSizePerMsg"`
+    LimitRecvSizePer1d 	int64   `json:"limitRecvSizePer1d"`
+    LimitRecvCountPer1d int64   `json:"limitRecvCountPer1d"`
+    LimitSendSizeTotal 	int64   `json:"limitSendSizeTotal"`
+    LimitSendSizePerMsg int64   `json:"limitSendSizePerMsg"`
+    LimitSendSizePer1d 	int64   `json:"limitSendSizePer1d"`
+    LimitSendCountPer1d int64	`json:"limitSendCountPer1d"`
+    RecvSizeTotal      	int64   `json:"recvSizeTotal"`
+    RecvSizePer1d      	int64   `json:"recvSizePer1d"`
+    RecvCountPer1d     	int64   `json:"recvCountPer1d"`
+    SendSizeTotal      	int64   `json:"sendSizeTotal"`
+    SendSizePer1d      	int64   `json:"sendSizePer1d"`
+    SendCountPer1d     	int64   `json:"sendCountPer1d"`
+    Tags              	[]string`json:"tags"`
 }
 
+
+// Returns pointer to an AddressDetail populated by querying fmsg Id standard at FMSG_ID_URI for 
+// address supplied. If the address is not found returns nil, nil.
 func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
-	uri := path.Join(IDURI, "user", addr.ToString())
+	uri := path.Join(IDURI, "addr", addr.ToString())
     resp, err := http.Get(uri)
     if err != nil {
         return nil, err
@@ -66,7 +68,7 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool)
 	} else {
 		part = "recv"
 	}
-	uri := path.Join(IDURI, "user", part, addr.ToString())
+	uri := path.Join(IDURI, "addr", part, addr.ToString())
 
 	payload := []byte(fmt.Sprintf(`{"timestamp": %f, "size": %d}`, timestamp, size))
     jsonPayload := json.RawMessage(payload)
