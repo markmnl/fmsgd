@@ -22,7 +22,7 @@ fmsgd uses environment variables as a control surface. `FMSG_DATA_DIR`, `FMSG_DO
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | FMSG_DATA_DIR              |         | Path where messages will be stored. e.g. /opt/fmsg/data                                                                                                 |
 | FMSG_DOMAIN                |         | Domain name this host is located. e.g. example.com                                                                                                      |
-| FMSG_ID_URI                | localhost | Base URI to communicate with fmsg Id API                                                                                                |
+| FMSG_ID_URL                |         | Base HTTP URL for fmsg Id API, e.g. http://localhost:5000                                                                                                    |
 | FMSG_MAX_MSG_SIZE          | 10240   | Bytes. Maximum size above which to reject messages greater than before downloading them.                                                                |
 | FMSG_PORT                  | 36900   | TCP port to listen on                                                                                                                                   |
 | FMSG_MAX_PAST_TIME_DELTA   | 604800  | Seconds. Duration since message timestamp to reject if greater than. Note sending host could have been holding messages waiting for us to be reachable. |

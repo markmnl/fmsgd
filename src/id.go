@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"path"
+	"net/url"
 )
 
 type AddressDetail struct {
@@ -30,15 +30,16 @@ type AddressDetail struct {
 }
 
 
-// Returns pointer to an AddressDetail populated by querying fmsg Id standard at FMSG_ID_URI for 
+// Returns pointer to an AddressDetail populated by querying fmsg Id standard at FMSG_ID_URL for 
 // address supplied. If the address is not found returns nil, nil.
 func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
-	uri := path.Join(IDURI, "addr", addr.ToString())
+	uri := IDURI + "/addr/" + url.PathEscape(addr.ToString())
     resp, err := http.Get(uri)
     if err != nil {
         return nil, err
     }
     defer resp.Body.Close()
+
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
@@ -48,7 +49,7 @@ func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
     err = json.NewDecoder(resp.Body).Decode(&detail)
     if err != nil {
         return nil, err
-    }
+    }   
 
     return &detail, nil
 }
@@ -68,9 +69,9 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool)
 	} else {
 		part = "recv"
 	}
-	uri := path.Join(IDURI, "addr", part, addr.ToString())
+	uri := fmt.Sprintf("%s/addr/%s", IDURI, part)
 
-	payload := []byte(fmt.Sprintf(`{"timestamp": %f, "size": %d}`, timestamp, size))
+	payload := []byte(fmt.Sprintf(`{"address": %s, "timestamp": %f, "size": %d}`, addr.ToString(), timestamp, size))
     jsonPayload := json.RawMessage(payload)
 
     resp, err := http.Post(uri, "application/json", bytes.NewBuffer(jsonPayload))

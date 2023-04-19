@@ -223,7 +223,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	if err != nil {
 		return h, err
 	}
-	log.Printf("from: @%s@%s", from.User, from.Domain)
+	log.Printf("from: %s", from.ToString())
 	h.From = *from
 
 	// read to addresses TODO validate addresses are unique
@@ -349,7 +349,6 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err error) {
 	detail, err := getAddressDetail(addr)
 	if err != nil {
-
 		return RejectCodeUndisclosed, err
 	}
 	if detail == nil {
@@ -415,7 +414,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return fmt.Errorf("%w actual hash doesn't match challenge response: %s %s", ErrProtocolViolation, msgHash, h.ChallengeHash)
 	}
 
-	// calc file extenstion from mime type
+	// calc file extension from mime type
 	exts, _ := mime.ExtensionsByType(h.Type)
 	var ext string
 	if exts == nil {
@@ -437,6 +436,8 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			continue
 		}
 
+		// TODO check for duplicate
+
 		// copy to recipient's directory
 		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
 		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
@@ -455,7 +456,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			codes[i] = RejectCodeUndisclosed
 		} else {
 			h.Filepath = fp
-			err = storeMsgDetail(h)
+			err = storeMsgDetail(h) // TODO should only be once, then per recipient in linked table
 			if err != nil {
 				log.Printf("ERROR: storing message: %s\n", err)
 				codes[i] = RejectCodeUndisclosed
@@ -511,7 +512,6 @@ func handleConn(c net.Conn) {
 		if errors.Is(err, ErrProtocolViolation) {
 			return
 		} else {
-
 			rejectAccept(c, []byte{ RejectCodeUndisclosed })
 		}
 	}

@@ -37,10 +37,11 @@ type FMsgHeader struct {
 	HeaderHash []byte
 	// Hash of message from challenge response
 	ChallengeHash [32]byte
-	// Actual hash of message data including any attachments
-	MessageHash []byte
 	// Absolute filepath set when downloaded
 	Filepath string
+
+	// Actual hash of message data including any attachments
+	messageHash []byte
 }
 
 // Returns a string representation of an address in the form @user@example.com
@@ -85,7 +86,7 @@ func (h *FMsgHeader) GetHeaderHash() []byte {
 }
 
 func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
-	if h.MessageHash == nil {
+	if h.messageHash == nil {
 		f, err := os.Open(h.Filepath)
 		if err != nil {
 			return nil, err
@@ -99,7 +100,7 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 
 		// TODO attachments
 
-		h.MessageHash = hash.Sum(nil)
+		h.messageHash = hash.Sum(nil)
 	}
-	return h.MessageHash, nil
+	return h.messageHash, nil
 }

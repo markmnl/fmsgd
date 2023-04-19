@@ -80,6 +80,11 @@ returning id`)
 	for i := 0; i < count; i++ {
 		to_addrs[i] = msg.To[i].ToString()
 	}
+
+	msgHash, err := msg.GetMessageHash()
+	if err != nil {
+		return err
+	}
 	
     _, err = stmt.Exec(msg.Version,
 		msg.Flags,
@@ -89,7 +94,7 @@ returning id`)
 		pq.Array(to_addrs),
 		msg.Topic,
 		msg.Type,
-		msg.MessageHash,
+		msgHash,
 		msg.Pid,
 		msg.Filepath)
     if err != nil {
