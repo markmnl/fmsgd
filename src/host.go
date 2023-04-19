@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"mime"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +45,8 @@ const (
 
 	RejectCodeAccept 					uint8 = 255
 )
+
+var ErrProtocolViolation = errors.New("protocol violation")
 
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
@@ -79,27 +83,30 @@ func setDataDir() {
 func setDomain() {
 	domain, hasValue := os.LookupEnv("FMSG_DOMAIN")
 	if !hasValue {
-		log.Panic("ERROR: FMSG_DOMAIN not set")
+		log.Panicln("ERROR: FMSG_DOMAIN not set")
 	}
 	_, err := net.LookupHost(domain)
 	if err != nil {
-		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s", domain, err)
+		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s\n", domain, err)
 	}
 	Domain = domain
 }
 
-// Updates IDURI from environment, defaults to localhost if not set, panics if not a valid domain.
-func setIDURI() {
-	uri, hasValue := os.LookupEnv("FMSG_ID_URI")
+// Updates IDURL from environment, panics if not valid.
+func setIDURL() {
+	rawUrl, hasValue := os.LookupEnv("FMSG_ID_URL")
 	if !hasValue {
-		uri = "https://localhost"
-		log.Printf("WARN: FMSG_ID_URI not set, using: %s\n", uri)
+		log.Panicln("ERROR: FMSG_ID_URL not set")
 	}
-	_, err := net.LookupHost(uri)
+	url, err := url.Parse(rawUrl)
 	if err != nil {
-		log.Panicf("ERROR: FMSG_ID_URI, %s: %s", uri, err)
+		log.Panicf("ERROR: FMSG_ID_URL not valid, %s: %s", rawUrl, err)
 	}
-	IDURI = uri
+	_, err = net.LookupHost(url.Hostname())
+	if err != nil {
+		log.Panicf("ERROR: FMSG_ID_URL lookup failed, %s: %s", url, err)
+	}
+	IDURI = rawUrl
 }
 
 func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
@@ -342,7 +349,8 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err error) {
 	detail, err := getAddressDetail(addr)
 	if err != nil {
-		return RejectCodeUserUnknown, err
+
+		return RejectCodeUndisclosed, err
 	}
 	if detail == nil {
 		return RejectCodeUserUnknown, nil
@@ -358,11 +366,11 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 		log.Printf("WARN: Message rejected: RecvCountPer1d would exceed LimitRecvCountPer1d %d", detail.LimitRecvCountPer1d)
 		return RejectCodeUserFull, nil
 	}
-	if detail.RecvSizePer1d > -1 && detail.RecvSizePer1d + int(h.Size) > detail.LimitRecvSizePer1d {
+	if detail.RecvSizePer1d > -1 && detail.RecvSizePer1d + int64(h.Size) > detail.LimitRecvSizePer1d {
 		log.Printf("WARN: Message rejected: RecvSizePer1d would exceed LimitRecvSizePer1d %d", detail.LimitRecvSizePer1d)
 		return RejectCodeUserFull, nil
 	}
-	if detail.RecvSizeTotal > -1 && detail.RecvSizeTotal + int(h.Size) > detail.LimitRecvSizeTotal {
+	if detail.RecvSizeTotal > -1 && detail.RecvSizeTotal + int64(h.Size) > detail.LimitRecvSizeTotal {
 		log.Printf("WARN: Message rejected: RecvSizeTotal would exceed LimitRecvSizeTotal %d", detail.LimitRecvSizeTotal)
 		return RejectCodeUserFull, nil
 	}
@@ -380,7 +388,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		}
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("our domain: %s, not in recipient list: %s", Domain, h.To)
+		return fmt.Errorf("%w our domain: %s, not in recipient list: %s", ErrProtocolViolation, Domain, h.To)
 	}
 	codes := make([]byte, len(addrs))
 	fd, err := os.CreateTemp("", "fmsg-download-*")
@@ -404,7 +412,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	if !bytes.Equal(h.ChallengeHash[:], msgHash) {
-		return fmt.Errorf("actual hash doesn't match challenge response: %s %s", msgHash, h.ChallengeHash)
+		return fmt.Errorf("%w actual hash doesn't match challenge response: %s %s", ErrProtocolViolation, msgHash, h.ChallengeHash)
 	}
 
 	// calc file extenstion from mime type
@@ -498,8 +506,14 @@ func handleConn(c net.Conn) {
 	c.SetReadDeadline(time.Now().Add(d))
 	err = downloadMessage(c, header)
 	if err != nil {
+		// if error was a protocal violation, abort; otherise let sender know there was an internal error
 		log.Printf("Download failed from, %s: %s", c.RemoteAddr().String(), err)
-		return
+		if errors.Is(err, ErrProtocolViolation) {
+			return
+		} else {
+
+			rejectAccept(c, []byte{ RejectCodeUndisclosed })
+		}
 	}
 
 	// gracefully close 1st connection
@@ -528,7 +542,7 @@ func main() {
 	// set DataDir, Domain and IDURI from env
 	setDataDir()
 	setDomain()
-	setIDURI()
+	setIDURL()
 
 	// start listening TODO start sending
 	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
