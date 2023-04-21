@@ -27,31 +27,32 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
-	FlagHasPid    						uint8 = 1
-	FlagImportant 						uint8 = 1 << 1
+	FlagHasPid    uint8 = 1
+	FlagImportant uint8 = 1 << 1
 
-	RejectCodeUndisclosed               uint8 = 1
-	RejectCodeTooBig                	uint8 = 2
-	RejectCodeInsufficentResources  	uint8 = 3
-	RejectCodeParentNotFound        	uint8 = 4
-	RejectCodePastTime              	uint8 = 5
-	RejectCodeFutureTime            	uint8 = 6
-	RejectCodeTimeTravel            	uint8 = 7
-	RejectCodeDuplicate             	uint8 = 8
+	RejectCodeUndisclosed          uint8 = 1
+	RejectCodeTooBig               uint8 = 2
+	RejectCodeInsufficentResources uint8 = 3
+	RejectCodeParentNotFound       uint8 = 4
+	RejectCodePastTime             uint8 = 5
+	RejectCodeFutureTime           uint8 = 6
+	RejectCodeTimeTravel           uint8 = 7
+	RejectCodeDuplicate            uint8 = 8
 
-	RejectCodeUserUnknown				uint8 = 100
-	RejectCodeUserFull					uint8 = 101
-	RejectCodeUserDeclined          	uint8 = 102 // TODO better name for "user not accepting new messages"
+	RejectCodeUserUnknown  uint8 = 100
+	RejectCodeUserFull     uint8 = 101
+	RejectCodeUserDeclined uint8 = 102 // TODO better name for "user not accepting new messages"
 
-	RejectCodeAccept 					uint8 = 255
+	RejectCodeAccept uint8 = 255
 )
 
 var ErrProtocolViolation = errors.New("protocol violation")
 
 var Port = env.GetIntDefault("FMSG_PORT", 36900)
+
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
 var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36900)
-var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7 * 24 * 60 * 60)
+var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7*24*60*60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
 var MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
@@ -208,7 +209,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	h.Flags = flags
 
 	// read pid if any
-	if flags & FlagHasPid == 1 {
+	if flags&FlagHasPid == 1 {
 		pid, err := io.ReadAll(io.LimitReader(c, 32))
 		if err != nil {
 			return h, err
@@ -361,15 +362,15 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 	}
 
 	// check user limits
-	if detail.RecvCountPer1d > -1 && detail.RecvCountPer1d + 1 > detail.LimitRecvCountPer1d {
+	if detail.RecvCountPer1d > -1 && detail.RecvCountPer1d+1 > detail.LimitRecvCountPer1d {
 		log.Printf("WARN: Message rejected: RecvCountPer1d would exceed LimitRecvCountPer1d %d", detail.LimitRecvCountPer1d)
 		return RejectCodeUserFull, nil
 	}
-	if detail.RecvSizePer1d > -1 && detail.RecvSizePer1d + int64(h.Size) > detail.LimitRecvSizePer1d {
+	if detail.RecvSizePer1d > -1 && detail.RecvSizePer1d+int64(h.Size) > detail.LimitRecvSizePer1d {
 		log.Printf("WARN: Message rejected: RecvSizePer1d would exceed LimitRecvSizePer1d %d", detail.LimitRecvSizePer1d)
 		return RejectCodeUserFull, nil
 	}
-	if detail.RecvSizeTotal > -1 && detail.RecvSizeTotal + int64(h.Size) > detail.LimitRecvSizeTotal {
+	if detail.RecvSizeTotal > -1 && detail.RecvSizeTotal+int64(h.Size) > detail.LimitRecvSizeTotal {
 		log.Printf("WARN: Message rejected: RecvSizeTotal would exceed LimitRecvSizeTotal %d", detail.LimitRecvSizeTotal)
 		return RejectCodeUserFull, nil
 	}
@@ -512,7 +513,7 @@ func handleConn(c net.Conn) {
 		if errors.Is(err, ErrProtocolViolation) {
 			return
 		} else {
-			rejectAccept(c, []byte{ RejectCodeUndisclosed })
+			rejectAccept(c, []byte{RejectCodeUndisclosed})
 		}
 	}
 
@@ -533,11 +534,11 @@ func main() {
 	listenAddress := os.Args[1]
 
 	// initalize database
-	err := initDb()
+	err := initDb(true)
 	if err != nil {
 		log.Fatalf("ERROR: initalizing database: %s\n", err)
 	}
-	log.Println("INFO: Initalized database")
+	log.Println("INFO: Connected to database")
 
 	// set DataDir, Domain and IDURI from env
 	setDataDir()

@@ -7,34 +7,8 @@ import (
 	"github.com/lib/pq"
 )
 
-var dbName = "fmsg"
-var sqlTables = `create table if not exists msg (
-    id            	bigserial       	primary key,
-	version			int					not null,
-    pid           	bigint          	references msg (id),
-	flags		  	int					not null,
-    time_sent     	double precision 	not null,
-	time_recv     	double precision 	not null,
-    from_addr     	varchar(255)    	not null,
-    to_addrs       	varchar(255)[]  	not null,
-    topic         	varchar(255)    	not null, 
-    type          	varchar(255)    	not null,
-    sha256        	bytea           	unique not null,
-    psha256       	bytea,
-	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
-    filepath      	text            	not null
-);
- 
-create table if not exists msg_attachment (
-    msg_id        	bigint          references msg (id),
-    filename      	varchar(255)    not null,
-    filesize      	int             not null, 
-    filepath      	text			not null,
-    primary key (msg_id, filename)
-);`
-
-func initDb() error {
-	db, err := sql.Open("postgres", "dbname="+dbName)
+func initDb(createDb bool) error {
+	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
 	}
@@ -43,22 +17,24 @@ func initDb() error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(sqlTables)
-	if err != nil {
-		return err
+	if createDb {
+		_, err = db.Exec(sqlTables)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func storeMsgDetail(msg *FMsgHeader) error {
-	
-	db, err := sql.Open("postgres", "dbname="+dbName)
+
+	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-    stmt, err := db.Prepare(`insert into msg (version
+	stmt, err := db.Prepare(`insert into msg (version
 	, flags
 	, time_sent
 	, time_recv
@@ -75,7 +51,7 @@ returning id`)
 		return err
 	}
 
-	count:= len(msg.To)
+	count := len(msg.To)
 	to_addrs := make([]string, count)
 	for i := 0; i < count; i++ {
 		to_addrs[i] = msg.To[i].ToString()
@@ -85,8 +61,8 @@ returning id`)
 	if err != nil {
 		return err
 	}
-	
-    _, err = stmt.Exec(msg.Version,
+
+	_, err = stmt.Exec(msg.Version,
 		msg.Flags,
 		msg.Timestamp,
 		timeutil.TimestampNow().Float64(),
@@ -97,9 +73,9 @@ returning id`)
 		msgHash,
 		msg.Pid,
 		msg.Filepath)
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 	// TODO set pid if psha256
 	// TODO attachments
 
