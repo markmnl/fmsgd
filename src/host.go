@@ -327,7 +327,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	hash := h.GetHeaderHash()
-	fmt.Printf("--> CHALLENGE %s\n", hex.EncodeToString(hash))
+	fmt.Printf("--> CHALLENGE\t%s\n", hex.EncodeToString(hash))
 	if _, err := conn2.Write(hash); err != nil {
 		return err
 	}
@@ -338,6 +338,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	copy(h.ChallengeHash[:], resp)
+	fmt.Printf("--> RESP\t%s\n", hex.EncodeToString(resp))
 
 	// gracefully close 2nd connection
 	if err := conn2.Close(); err != nil {
@@ -412,7 +413,9 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	if !bytes.Equal(h.ChallengeHash[:], msgHash) {
-		return fmt.Errorf("%w actual hash doesn't match challenge response: %s %s", ErrProtocolViolation, msgHash, h.ChallengeHash)
+		challengeHashStr := hex.EncodeToString(h.ChallengeHash[:])
+		actualHashStr := hex.EncodeToString(msgHash)
+		return fmt.Errorf("%w actual hash doesn't match challenge response: %s %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
 	}
 
 	// calc file extension from mime type
