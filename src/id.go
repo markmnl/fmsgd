@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 )
@@ -71,14 +72,25 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool)
 	}
 	uri := fmt.Sprintf("%s/addr/%s", IDURI, part)
 
-	payload := []byte(fmt.Sprintf(`{"address": %s, "timestamp": %f, "size": %d}`, addr.ToString(), timestamp, size))
-    jsonPayload := json.RawMessage(payload)
+    payload := map[string]interface{} {
+        "address": addr.ToString(), 
+        "ts": timestamp, 
+        "size": size}
+    jsonPayload, err := json.Marshal(payload)
+    if err != nil {
+        return err
+    }
 
     resp, err := http.Post(uri, "application/json", bytes.NewBuffer(jsonPayload))
     if err != nil {
         return err
     }
     defer resp.Body.Close()
+
+    // TODO should we raise an error so caller knows
+    if resp.StatusCode != 200 {
+        log.Printf("WARN: POST %s returned %d", uri, resp.StatusCode)
+    }
 
 	return nil
 }

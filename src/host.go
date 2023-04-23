@@ -435,7 +435,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			return err
 		}
 		if code != RejectCodeAccept {
-			log.Printf("WARN: Rejected message: %d", code)
+			log.Printf("WARN: Rejected message to: %s, : %d", addr.ToString(), code)
 			codes[i] = code
 			continue
 		}
