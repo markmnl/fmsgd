@@ -17,6 +17,7 @@ func testDb() error {
 	if err != nil {
 		return err
 	}
+	// TODO check at least tables exisit
 	return nil
 }
 
@@ -38,8 +39,9 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	, type
 	, sha256
 	, psha256
+	, size
 	, filepath) 
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 returning id`)
 	if err != nil {
 		return err
@@ -66,6 +68,7 @@ returning id`)
 		msg.Type,
 		msgHash,
 		msg.Pid,
+		int(msg.Size),
 		msg.Filepath)
 	if err != nil {
 		return err

@@ -94,6 +94,12 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 		defer f.Close()
 
 		hash := sha256.New()
+
+		headerBytes := h.Encode()
+		if _, err := io.Copy(hash, bytes.NewBuffer(headerBytes)); err != nil {
+			return nil, err
+		}
+
 		if _, err := io.Copy(hash, f); err != nil {
 			return nil, err
 		}

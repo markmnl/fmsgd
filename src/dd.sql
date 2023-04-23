@@ -4,6 +4,7 @@
  *
  ****************************************************************/
 
+-- database with encoding UTF8 should already be created and connected
 
 create table if not exists msg (
     id            	bigserial       	primary key,
@@ -35,6 +36,7 @@ create or replace function add_msg_to_addrs() returns trigger as $$
 		for i in 1..array_upper(NEW.to_addrs, 1) loop
 			insert into msg_to(msg_id, addr) values (NEW.id, NEW.to_addrs[i]);
 		end loop;
+        return null;
 	end;
 $$ language plpgsql;
 
