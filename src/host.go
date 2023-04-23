@@ -534,9 +534,9 @@ func main() {
 	listenAddress := os.Args[1]
 
 	// initalize database
-	err := initDb(true)
+	err := testDb()
 	if err != nil {
-		log.Fatalf("ERROR: initalizing database: %s\n", err)
+		log.Fatalf("ERROR: connecting to database: %s\n", err)
 	}
 	log.Println("INFO: Connected to database")
 

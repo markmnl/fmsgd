@@ -7,7 +7,7 @@ import (
 	"github.com/lib/pq"
 )
 
-func initDb(createDb bool) error {
+func testDb() error {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
@@ -16,12 +16,6 @@ func initDb(createDb bool) error {
 	err = db.Ping()
 	if err != nil {
 		return err
-	}
-	if createDb {
-		_, err = db.Exec(sqlTables)
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }
