@@ -415,7 +415,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	if !bytes.Equal(h.ChallengeHash[:], msgHash) {
 		challengeHashStr := hex.EncodeToString(h.ChallengeHash[:])
 		actualHashStr := hex.EncodeToString(msgHash)
-		return fmt.Errorf("%w actual hash doesn't match challenge response: %s %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
+		return fmt.Errorf("%w actual hash: %s mismatch challenge response: %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
 	}
 
 	// calc file extension from mime type
@@ -444,8 +444,8 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 
 		// copy to recipient's directory
 		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
-		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext)
-		err = os.MkdirAll(dirpath, 0750) // TODO review perm
+		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext) // TODO check file doesn't exist
+		err = os.MkdirAll(dirpath, 0750)                                         // TODO review perm
 		if err != nil {
 			return err
 		}
@@ -543,7 +543,7 @@ func main() {
 	}
 	log.Println("INFO: Connected to database")
 
-	// set DataDir, Domain and IDURI from env
+	// set DataDir, Domain and IDURL from env
 	setDataDir()
 	setDomain()
 	setIDURL()
