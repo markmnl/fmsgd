@@ -8,7 +8,7 @@ import (
 )
 
 func testDb() error {
-	db, err := sql.Open("postgres", "")
+	db, err := sql.Open("postgres", getDbConnString())
 	if err != nil {
 		return err
 	}
@@ -23,7 +23,7 @@ func testDb() error {
 
 func storeMsgDetail(msg *FMsgHeader) error {
 
-	db, err := sql.Open("postgres", "")
+	db, err := sql.Open("postgres", getDbConnString())
 	if err != nil {
 		return err
 	}

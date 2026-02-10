@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	env "github.com/caitlinelfring/go-env-default"
+	"github.com/joho/godotenv"
 	"github.com/levenlabs/golib/timeutil"
 )
 
@@ -117,6 +118,18 @@ func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
 		return MinNetIODeadline
 	}
 	return d
+}
+
+// getDbConnString returns a PostgreSQL connection string using environment variables
+// with sslmode=disable to support non-SSL connections
+func getDbConnString() string {
+	connStr := "host=" + os.Getenv("PGHOST") +
+		" port=" + os.Getenv("PGPORT") +
+		" user=" + os.Getenv("PGUSER") +
+		" password=" + os.Getenv("PGPASSWORD") +
+		" dbname=" + os.Getenv("PGDATABASE") +
+		" sslmode=disable"
+	return connStr
 }
 
 func parseAddress(b []byte) (*FMsgAddress, error) {
@@ -529,6 +542,11 @@ func main() {
 	outgoing = make(map[[32]byte]*FMsgHeader)
 
 	log.SetPrefix("fmsgd: ")
+
+	// load environment variables from .env file if present
+	if err := godotenv.Load(); err != nil {
+		log.Printf("INFO: Could not load .env file: %v", err)
+	}
 
 	// get listen address from args
 	if len(os.Args) < 2 {
