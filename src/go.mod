@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/caitlinelfring/go-env-default v1.1.0
+	github.com/joho/godotenv v1.5.1
 	github.com/levenlabs/golib v0.0.0-20180911183212-0f8974794783
 	github.com/lib/pq v1.10.7
 )

@@ -1,3 +1,4 @@
 .vscode/
+.claude/
 *.exe
 .env
