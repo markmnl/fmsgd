@@ -1,13 +1,13 @@
 # fmsgd
 
-[![go 1.19](https://github.com/markmnl/fmsgd/actions/workflows/go1.19.yml/badge.svg)](https://github.com/markmnl/fmsgd/actions/workflows/go1.19.yml)
+[![Go 1.25](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml/badge.svg)](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml)
 
 
 Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in go! Uses local filesystem and PostgreSQL database to store messages per the [fmsg-store-postgres standard](https://github.com/markmnl/fmsg/blob/main/STANDARDS.md).
 
 ## Building from source
 
-Tested with go 1.18, 1.19 and 1.20 on Linux (AMD64, ARM64) and Windows AMD64
+Tested with go 1.25 on Linux (AMD64, ARM64) and Windows AMD64
 
 1. Clone this repository
 2. Navigate to src/
