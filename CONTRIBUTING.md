@@ -1,3 +1,3 @@
 PRs are welcome!
 
-Please see TODOs in code for known issues.
+Please create a GitHub issue to discuss and relate a PR to that issue.

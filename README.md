@@ -7,7 +7,7 @@ Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in go! Us
 
 ## Building from source
 
-Tested with go 1.25 on Linux (AMD64, ARM64) and Windows AMD64
+Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 1. Clone this repository
 2. Navigate to src/
@@ -16,7 +16,7 @@ Tested with go 1.25 on Linux (AMD64, ARM64) and Windows AMD64
 
 ## Environment
 
-fmsgd uses environment variables as a control surface. `FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set; otherwise the host will fail to start. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
+fmsgd uses environment variables, `FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set; otherwise the host will fail to start. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
 
 | Variable                   | Default | Description                                                                                                                                             |
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
