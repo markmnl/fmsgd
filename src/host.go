@@ -549,10 +549,10 @@ func main() {
 	}
 
 	// get listen address from args
-	if len(os.Args) < 2 {
-		log.Fatalf("ERROR: Listen address is required as an argument, e.g.: \"0.0.0.0\"\n")
+	listenAddress := "127.0.0.1"
+	if len(os.Args) >= 2 {
+		listenAddress = os.Args[1]
 	}
-	listenAddress := os.Args[1]
 
 	// initalize database
 	err := testDb()
