@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -30,6 +31,7 @@ const (
 
 	FlagHasPid    uint8 = 1
 	FlagImportant uint8 = 1 << 1
+	FlagDeflate   uint8 = 1 << 5
 
 	RejectCodeUndisclosed          uint8 = 1
 	RejectCodeTooBig               uint8 = 2
@@ -345,7 +347,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
-	conn2, err := net.Dial("tcp", fmt.Sprintf("%s:%d", h.From.Domain, RemotePort))
+	conn2, err := net.Dial("tcp", net.JoinHostPort(h.From.Domain, fmt.Sprintf("%d", RemotePort)))
 	if err != nil {
 		return err
 	}
@@ -481,7 +483,16 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			return err
 		}
 		defer fd2.Close()
-		_, err = io.Copy(fd2, fd)
+		if _, err := fd.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		var src io.Reader = fd
+		if h.Flags&FlagDeflate != 0 {
+			fr := flate.NewReader(fd)
+			defer fr.Close()
+			src = fr
+		}
+		_, err = io.Copy(fd2, src)
 		if err != nil {
 			log.Printf("ERROR: copying downloaded message from: %s, to: %s\n", fd.Name(), fd2.Name())
 			codes[i] = RejectCodeUndisclosed
@@ -562,10 +573,15 @@ func main() {
 		log.Printf("INFO: Could not load .env file: %v", err)
 	}
 
-	// get listen address from args
+	// determine mode from args: "sender" or default receiver
+	mode := "receiver"
 	listenAddress := "127.0.0.1"
-	if len(os.Args) >= 2 {
-		listenAddress = os.Args[1]
+	for _, arg := range os.Args[1:] {
+		if arg == "sender" {
+			mode = "sender"
+		} else {
+			listenAddress = arg
+		}
 	}
 
 	// initalize database
@@ -580,7 +596,11 @@ func main() {
 	setDomain()
 	setIDURL()
 
-	// start listening TODO start sending
+	if mode == "sender" {
+		startSender() // blocks forever
+	}
+
+	// start listening
 	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

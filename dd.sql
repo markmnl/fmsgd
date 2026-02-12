@@ -11,8 +11,7 @@ create table if not exists msg (
 	version			int					not null,
     pid           	bigint          	references msg (id),
 	flags		  	int					not null,
-    time_sent     	double precision 	not null, -- time sending host recieved message for sending, message timestamp field
-	time_recv     	double precision 	not null, -- time recieving host downloaded the message
+    time_sent     	double precision 	not null,   -- time sending host recieved message for sending, message timestamp field
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null, 
     type          	varchar(255)    	not null,
@@ -26,7 +25,9 @@ create index on msg ((lower(from_addr)));
 create table if not exists msg_to (
 	msg_id			bigint				references msg (id),
 	addr			varchar(255)		not null,
-    status          smallint,
+    time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
+    time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
+    response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
 	primary key (msg_id, addr)
 );
 create index on msg_to ((lower(addr)));
@@ -38,3 +39,19 @@ create table if not exists msg_attachment (
     filepath      	text			not null,
     primary key (msg_id, filename)
 );
+
+-- notify when a new msg_to row is inserted with null time_delivered so the
+-- sender can pick it up immediately instead of waiting for the next poll.
+create or replace function notify_msg_to_insert() returns trigger as $$
+begin
+    if NEW.time_delivered is null then
+        perform pg_notify('new_msg_to', NEW.msg_id::text || ',' || NEW.addr);
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_to_insert on msg_to;
+create trigger trg_msg_to_insert
+    after insert on msg_to
+    for each row execute function notify_msg_to_insert();
