@@ -3,7 +3,7 @@
 [![Go 1.25](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml/badge.svg)](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml)
 
 
-Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in go! Uses local filesystem and PostgreSQL database to store messages per the [fmsg-store-postgres standard](https://github.com/markmnl/fmsg/blob/main/STANDARDS.md).
+Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in Go! Uses local filesystem and PostgreSQL database to store messages per the [fmsg-store-postgres standard](https://github.com/markmnl/fmsg/blob/main/STANDARDS.md).
 
 ## Building from source
 
@@ -16,7 +16,7 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 ## Environment
 
-fmsgd uses environment variables, `FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set; otherwise the host will fail to start. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
+`FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set and valid; otherwise the host will abort on startup. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
 
 | Variable                   | Default | Description                                                                                                                                             |
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -24,7 +24,7 @@ fmsgd uses environment variables, `FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_UR
 | FMSG_DOMAIN                |         | Domain name this host is located. e.g. example.com                                                                                                      |
 | FMSG_ID_URL                |         | Base HTTP URL for fmsg Id API, e.g. http://localhost:5000                                                                                                    |
 | FMSG_MAX_MSG_SIZE          | 10240   | Bytes. Maximum size above which to reject messages greater than before downloading them.                                                                |
-| FMSG_PORT                  | 36900   | TCP port to listen on                                                                                                                                   |
+| FMSG_PORT                  | 4930    | TCP port to listen on                                                                                                                                   |
 | FMSG_MAX_PAST_TIME_DELTA   | 604800  | Seconds. Duration since message timestamp to reject if greater than. Note sending host could have been holding messages waiting for us to be reachable. |
 | FMSG_MAX_FUTURE_TIME_DELTA | 300     | Seconds. Duration from message timestamp to reject if greater than.                                                                                     |
 | FMSG_MIN_DOWNLOAD_RATE     | 5000    | Bytes per second. Used in setting download deadlines while downloading a message.                                                                       |
@@ -35,7 +35,7 @@ fmsgd uses environment variables, `FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_UR
 
 ## Running
 
-IP address to bind to and listen on must be supplied as the first argument, e.g.:
+IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied e.g.:
 
 ```
 ./fmsgd "0.0.0.0"
