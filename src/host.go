@@ -49,10 +49,10 @@ const (
 
 var ErrProtocolViolation = errors.New("protocol violation")
 
-var Port = env.GetIntDefault("FMSG_PORT", 36900)
+var Port = env.GetIntDefault("FMSG_PORT", 4930)
 
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
-var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 36900)
+var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 4930)
 var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7*24*60*60)
 var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
 var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
@@ -118,18 +118,6 @@ func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
 		return MinNetIODeadline
 	}
 	return d
-}
-
-// getDbConnString returns a PostgreSQL connection string using environment variables
-// with sslmode=disable to support non-SSL connections
-func getDbConnString() string {
-	connStr := "host=" + os.Getenv("PGHOST") +
-		" port=" + os.Getenv("PGPORT") +
-		" user=" + os.Getenv("PGUSER") +
-		" password=" + os.Getenv("PGPASSWORD") +
-		" dbname=" + os.Getenv("PGDATABASE") +
-		" sslmode=disable"
-	return connStr
 }
 
 func parseAddress(b []byte) (*FMsgAddress, error) {

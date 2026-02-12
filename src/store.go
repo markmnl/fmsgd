@@ -8,7 +8,7 @@ import (
 )
 
 func testDb() error {
-	db, err := sql.Open("postgres", getDbConnString())
+	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
 	}
@@ -17,19 +17,19 @@ func testDb() error {
 	if err != nil {
 		return err
 	}
-	// TODO check at least tables exisit
+	// TODO check at least tables exist?
 	return nil
 }
 
 func storeMsgDetail(msg *FMsgHeader) error {
 
-	db, err := sql.Open("postgres", getDbConnString())
+	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	stmt, err := db.Prepare(`insert into msg (version
+	stmt, err := db.Prepare(`insert into msg (version	
 	, flags
 	, time_sent
 	, time_recv
