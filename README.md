@@ -16,7 +16,7 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 ## Environment
 
-`FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set and valid; otherwise the host will abort on startup. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
+`FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set and valid; otherwise fmsgd will abort on startup. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
 
 | Variable                   | Default | Description                                                                                                                                             |
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -35,10 +35,17 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 ## Running
 
-IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied e.g.:
+An up and running [fmsg Id API](https://github.com/markmnl/fmsgid) needs to be reachable by fmsgd to know users and their quotas for this fmsgd service.  
+
+IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied e.g. on Linux:
 
 ```
 ./fmsgd "0.0.0.0"
+```
+
+on Windows:
+```
+fmsgd.exe "0.0.0.0"
 ```
 
 ### systemd
