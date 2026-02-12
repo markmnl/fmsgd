@@ -297,25 +297,51 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	return h, nil
 }
 
+// lookupAuthorisedIPs resolves _fmsg.<domain> for A and AAAA records,
+// following CNAME chains until A/AAAA are obtained.
+func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
+	fmsgDomain := "_fmsg." + domain
+	ips, err := net.LookupIP(fmsgDomain)
+	if err != nil {
+		return nil, fmt.Errorf("DNS lookup for %s failed: %w", fmsgDomain, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no A/AAAA records found for %s", fmsgDomain)
+	}
+	return ips, nil
+}
+
 // Sends CHALLENGE request to sender domain first checking if domain is indeed located
-// at address in connection supplied by doing a host lookup.
+// at address in connection supplied by verifying the remote IP is in the
+// sender's _fmsg.<sender-domain> authorised IP set.
 func challenge(conn net.Conn, h *FMsgHeader) error {
 
 	// TODO check if no challenge requested and we allow it
-	addr := strings.Split(conn.RemoteAddr().String(), ":")[0]
-	addrs, err := net.LookupHost(h.From.Domain)
+
+	// verify remote IP is authorised by sender's _fmsg DNS record
+	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return fmt.Errorf("failed to parse remote address: %w", err)
+	}
+	remoteIP := net.ParseIP(remoteHost)
+	if remoteIP == nil {
+		return fmt.Errorf("failed to parse remote IP: %s", remoteHost)
+	}
+
+	authorisedIPs, err := lookupAuthorisedIPs(h.From.Domain)
 	if err != nil {
 		return err
 	}
+
 	found := false
-	for _, a := range addrs {
-		if addr == a { // TODO do we need any normalization?
+	for _, ip := range authorisedIPs {
+		if remoteIP.Equal(ip) {
 			found = true
 			break
 		}
 	}
 	if !found {
-		return fmt.Errorf("remote address: %s not found in lookup for host: %s", addr, h.From.Domain)
+		return fmt.Errorf("remote address %s not in _fmsg.%s authorised IPs", remoteIP.String(), h.From.Domain)
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
