@@ -29,43 +29,62 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
-	FlagHasPid    uint8 = 1
-	FlagImportant uint8 = 1 << 1
-	FlagDeflate   uint8 = 1 << 5
+	FlagHasPid        uint8 = 1
+	FlagImportant     uint8 = 1 << 1
+	FlagNoReply       uint8 = 1 << 3
+	FlagSkipChallenge uint8 = 1 << 4
+	FlagDeflate       uint8 = 1 << 5
 
-	RejectCodeUndisclosed          uint8 = 1
-	RejectCodeTooBig               uint8 = 2
-	RejectCodeInsufficentResources uint8 = 3
-	RejectCodeParentNotFound       uint8 = 4
-	RejectCodePastTime             uint8 = 5
-	RejectCodeFutureTime           uint8 = 6
-	RejectCodeTimeTravel           uint8 = 7
-	RejectCodeDuplicate            uint8 = 8
+	RejectCodeInvalid              uint8 = 1
+	RejectCodeUnsupportedVersion   uint8 = 2
+	RejectCodeUndisclosed          uint8 = 3
+	RejectCodeTooBig               uint8 = 4
+	RejectCodeInsufficentResources uint8 = 5
+	RejectCodeParentNotFound       uint8 = 6
+	RejectCodePastTime             uint8 = 7
+	RejectCodeFutureTime           uint8 = 8
+	RejectCodeTimeTravel           uint8 = 9
+	RejectCodeDuplicate            uint8 = 10
+	RejectCodeMustChallenge        uint8 = 11
+	RejectCodeCannotChallenge      uint8 = 12
 
-	RejectCodeUserUnknown  uint8 = 100
-	RejectCodeUserFull     uint8 = 101
-	RejectCodeUserDeclined uint8 = 102 // TODO better name for "user not accepting new messages"
+	RejectCodeUserUnknown uint8 = 100
+	RejectCodeUserFull    uint8 = 101
 
-	RejectCodeAccept uint8 = 255
+	RejectCodeAccept uint8 = 200
 )
 
 var ErrProtocolViolation = errors.New("protocol violation")
 
-var Port = env.GetIntDefault("FMSG_PORT", 4930)
+var Port = 4930
 
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
-var RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 4930)
-var PastTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7*24*60*60)
-var FutureTimeDelta float64 = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
-var MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
-var MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
-var ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
-var MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
+var RemotePort = 4930
+var PastTimeDelta float64 = 7 * 24 * 60 * 60
+var FutureTimeDelta float64 = 300
+var MinDownloadRate float64 = 5000
+var MinUploadRate float64 = 5000
+var ReadBufferSize = 1600
+var MaxMessageSize = uint32(1024 * 10)
+var AllowSkipChallenge = 0
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var MinNetIODeadline = 6 * time.Second
+
+// loadEnvConfig reads env vars (after godotenv.Load so .env is picked up).
+func loadEnvConfig() {
+	Port = env.GetIntDefault("FMSG_PORT", 4930)
+	RemotePort = env.GetIntDefault("FMSG_REMOTE_PORT", 4930)
+	PastTimeDelta = env.GetFloatDefault("FMSG_MAX_PAST_TIME_DELTA", 7*24*60*60)
+	FutureTimeDelta = env.GetFloatDefault("FMSG_MAX_FUTURE_TIME_DELTA", 300)
+	MinDownloadRate = env.GetFloatDefault("FMSG_MIN_DOWNLOAD_RATE", 5000)
+	MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
+	ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
+	MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
+	AllowSkipChallenge = env.GetIntDefault("FMSG_ALLOW_SKIP_CHALLENGE", 0)
+}
 
 // outgoing message headers keyed on header hash
 var outgoing map[[32]byte]*FMsgHeader
@@ -94,6 +113,9 @@ func setDomain() {
 		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s\n", domain, err)
 	}
 	Domain = domain
+
+	// verify our external IP is in the _fmsg authorised IP set
+	checkDomainIP(domain)
 }
 
 // Updates IDURL from environment, panics if not valid.
@@ -111,6 +133,7 @@ func setIDURL() {
 		log.Panicf("ERROR: FMSG_ID_URL lookup failed, %s: %s", url, err)
 	}
 	IDURI = rawUrl
+	log.Printf("INFO: ID URL: %s", IDURI)
 }
 
 func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
@@ -122,8 +145,46 @@ func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
 	return d
 }
 
+func isValidUser(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidDomain(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func parseAddress(b []byte) (*FMsgAddress, error) {
-	// TODO validate length
+	if len(b) < 4 {
+		return nil, fmt.Errorf("invalid address: too short (%d bytes)", len(b))
+	}
 	var addr = &FMsgAddress{}
 	addrStr := string(b)
 	firstAt := strings.IndexRune(addrStr, AtRune)
@@ -135,8 +196,13 @@ func parseAddress(b []byte) (*FMsgAddress, error) {
 		return addr, fmt.Errorf("invalid address, must have second @ %s", addr)
 	}
 	addr.User = addrStr[1:lastAt]
-	// TODO validate string
+	if !isValidUser(addr.User) {
+		return addr, fmt.Errorf("invalid user in address: %s", addr.User)
+	}
 	addr.Domain = addrStr[lastAt+1:]
+	if !isValidDomain(addr.Domain) {
+		return addr, fmt.Errorf("invalid domain in address: %s", addr.Domain)
+	}
 	return addr, nil
 }
 
@@ -188,7 +254,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	r := bufio.NewReaderSize(c, ReadBufferSize)
 	var h = &FMsgHeader{}
 
-	d := time.Duration(20 * time.Second) // TODO calc?
+	d := calcNetIODuration(66000, MinDownloadRate) // max possible header size
 	c.SetReadDeadline(time.Now().Add(d))
 
 	// read version
@@ -219,7 +285,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		}
 		h.Pid = make([]byte, 32)
 		copy(h.Pid, pid)
-		// TODO verify pid exists
+		// pid existence is verified in downloadMessage after hash check
 	}
 
 	// read from address
@@ -230,16 +296,22 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	log.Printf("from: %s", from.ToString())
 	h.From = *from
 
-	// read to addresses TODO validate addresses are unique
+	// read to addresses
 	num, err := r.ReadByte()
 	if err != nil {
 		return h, err
 	}
+	seen := make(map[string]bool)
 	for num > 0 {
 		addr, err := readAddress(r)
 		if err != nil {
 			return h, err
 		}
+		key := strings.ToLower(addr.ToString())
+		if seen[key] {
+			return h, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
+		}
+		seen[key] = true
 		h.To = append(h.To, *addr)
 		num--
 		log.Printf("to: @%s@%s", addr.User, addr.Domain)
@@ -294,23 +366,16 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		return h, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
 	}
 
-	// TODO attachments
+	// read attachment count
+	var attachCount uint8
+	if err := binary.Read(r, binary.LittleEndian, &attachCount); err != nil {
+		return h, err
+	}
+	if attachCount > 0 {
+		return h, fmt.Errorf("attachments not yet supported (count: %d)", attachCount)
+	}
 
 	return h, nil
-}
-
-// lookupAuthorisedIPs resolves _fmsg.<domain> for A and AAAA records,
-// following CNAME chains until A/AAAA are obtained.
-func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
-	fmsgDomain := "_fmsg." + domain
-	ips, err := net.LookupIP(fmsgDomain)
-	if err != nil {
-		return nil, fmt.Errorf("DNS lookup for %s failed: %w", fmsgDomain, err)
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A/AAAA records found for %s", fmsgDomain)
-	}
-	return ips, nil
 }
 
 // Sends CHALLENGE request to sender domain first checking if domain is indeed located
@@ -318,7 +383,16 @@ func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
 // sender's _fmsg.<sender-domain> authorised IP set.
 func challenge(conn net.Conn, h *FMsgHeader) error {
 
-	// TODO check if no challenge requested and we allow it
+	// skip challenge if sender requested it and we allow it
+	if h.Flags&FlagSkipChallenge != 0 {
+		if AllowSkipChallenge == 1 {
+			log.Printf("INFO: skip challenge requested and allowed from %s", conn.RemoteAddr().String())
+			return nil
+		}
+		log.Printf("WARN: skip challenge requested but not allowed from %s", conn.RemoteAddr().String())
+		rejectAccept(conn, []byte{RejectCodeMustChallenge})
+		return fmt.Errorf("skip challenge requested but not allowed")
+	}
 
 	// verify remote IP is authorised by sender's _fmsg DNS record
 	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
@@ -388,7 +462,7 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 
 	// check user accepting new
 	if !detail.AcceptingNew {
-		return RejectCodeUserDeclined, nil
+		return RejectCodeUserUnknown, nil
 	}
 
 	// check user limits
@@ -408,9 +482,25 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 	return RejectCodeAccept, nil
 }
 
+// uniqueFilepath generates a unique file path in the given directory,
+// appending a counter suffix if the base name already exists.
+func uniqueFilepath(dir string, timestamp uint32, ext string) string {
+	base := fmt.Sprintf("%d", timestamp)
+	fp := filepath.Join(dir, base+ext)
+	if _, err := os.Stat(fp); os.IsNotExist(err) {
+		return fp
+	}
+	for i := 1; ; i++ {
+		fp = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, i, ext))
+		if _, err := os.Stat(fp); os.IsNotExist(err) {
+			return fp
+		}
+	}
+}
+
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
 
-	// first download to temp file
+	// filter to local domain recipients
 	addrs := []FMsgAddress{}
 	for _, addr := range h.To {
 		if addr.Domain == Domain {
@@ -421,6 +511,8 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return fmt.Errorf("%w our domain: %s, not in recipient list: %s", ErrProtocolViolation, Domain, h.To)
 	}
 	codes := make([]byte, len(addrs))
+
+	// download to temp file
 	fd, err := os.CreateTemp("", "fmsg-download-*")
 	if err != nil {
 		return err
@@ -433,9 +525,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return err
 	}
 
-	// TODO attachments
-
-	// check checksum of downloaded message matches challenge resp.
+	// verify hash matches challenge response
 	h.Filepath = fd.Name()
 	msgHash, err := h.GetMessageHash()
 	if err != nil {
@@ -447,7 +537,33 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		return fmt.Errorf("%w actual hash: %s mismatch challenge response: %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
 	}
 
-	// calc file extension from mime type
+	// check for duplicate message
+	dupID, err := lookupMsgIdByHash(msgHash)
+	if err != nil {
+		return err
+	}
+	if dupID > 0 {
+		for i := range codes {
+			codes[i] = RejectCodeDuplicate
+		}
+		return rejectAccept(c, codes)
+	}
+
+	// verify parent exists if pid is set
+	if h.Flags&FlagHasPid != 0 {
+		parentID, err := lookupMsgIdByHash(h.Pid)
+		if err != nil {
+			return err
+		}
+		if parentID == 0 {
+			for i := range codes {
+				codes[i] = RejectCodeParentNotFound
+			}
+			return rejectAccept(c, codes)
+		}
+	}
+
+	// determine file extension from MIME type
 	exts, _ := mime.ExtensionsByType(h.Type)
 	var ext string
 	if exts == nil {
@@ -456,57 +572,78 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 		ext = exts[0]
 	}
 
+	// validate each recipient and copy message for accepted ones
+	acceptedAddrs := []FMsgAddress{}
+	var primaryFilepath string
 	for i, addr := range addrs {
-
-		// validate
 		code, err := validateMsgRecvForAddr(h, &addr)
 		if err != nil {
 			return err
 		}
 		if code != RejectCodeAccept {
-			log.Printf("WARN: Rejected message to: %s, : %d", addr.ToString(), code)
+			log.Printf("WARN: Rejected message to: %s, code: %d", addr.ToString(), code)
 			codes[i] = code
 			continue
 		}
 
-		// TODO check for duplicate
-
 		// copy to recipient's directory
 		dirpath := filepath.Join(DataDir, addr.Domain, addr.User, InboxDirName)
-		fp := filepath.Join(dirpath, fmt.Sprintf("%d", uint32(h.Timestamp))+ext) // TODO check file doesn't exist
-		err = os.MkdirAll(dirpath, 0750)                                         // TODO review perm
-		if err != nil {
+		if err := os.MkdirAll(dirpath, 0750); err != nil {
 			return err
 		}
+
+		fp := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
+		if _, err := fd.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+
 		fd2, err := os.Create(fp)
 		if err != nil {
 			return err
 		}
-		defer fd2.Close()
-		if _, err := fd.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		var src io.Reader = fd
+
+		var copyErr error
 		if h.Flags&FlagDeflate != 0 {
 			fr := flate.NewReader(fd)
-			defer fr.Close()
-			src = fr
-		}
-		_, err = io.Copy(fd2, src)
-		if err != nil {
-			log.Printf("ERROR: copying downloaded message from: %s, to: %s\n", fd.Name(), fd2.Name())
-			codes[i] = RejectCodeUndisclosed
+			_, copyErr = io.Copy(fd2, fr)
+			fr.Close()
 		} else {
-			h.Filepath = fp
-			err = storeMsgDetail(h) // TODO should only be once, then per recipient in linked table
-			if err != nil {
-				log.Printf("ERROR: storing message: %s\n", err)
-				codes[i] = RejectCodeUndisclosed
-			} else {
-				codes[i] = RejectCodeAccept
-				err = postMsgStatRecv(&addr, h.Timestamp, int(h.Size))
-				if err != nil {
-					log.Printf("WARN: Failed to post msg recv stat: %s\n", err)
+			_, copyErr = io.Copy(fd2, fd)
+		}
+		fd2.Close()
+
+		if copyErr != nil {
+			log.Printf("ERROR: copying downloaded message from: %s, to: %s", fd.Name(), fp)
+			os.Remove(fp)
+			codes[i] = RejectCodeUndisclosed
+			continue
+		}
+
+		codes[i] = RejectCodeAccept
+		acceptedAddrs = append(acceptedAddrs, addr)
+		if primaryFilepath == "" {
+			primaryFilepath = fp
+		}
+	}
+
+	// store message details once for all accepted recipients
+	if len(acceptedAddrs) > 0 {
+		origTo := h.To
+		h.To = acceptedAddrs
+		h.Filepath = primaryFilepath
+		if err := storeMsgDetail(h); err != nil {
+			log.Printf("ERROR: storing message: %s", err)
+			h.To = origTo
+			for i := range codes {
+				if codes[i] == RejectCodeAccept {
+					codes[i] = RejectCodeUndisclosed
+				}
+			}
+		} else {
+			h.To = origTo
+			for i := range acceptedAddrs {
+				if err := postMsgStatRecv(&acceptedAddrs[i], h.Timestamp, int(h.Size)); err != nil {
+					log.Printf("WARN: Failed to post msg recv stat: %s", err)
 				}
 			}
 		}
@@ -573,6 +710,9 @@ func main() {
 		log.Printf("INFO: Could not load .env file: %v", err)
 	}
 
+	// read env config (must be after godotenv.Load)
+	loadEnvConfig()
+
 	// determine mode from args: "sender" or default receiver
 	mode := "receiver"
 	listenAddress := "127.0.0.1"
@@ -589,7 +729,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("ERROR: connecting to database: %s\n", err)
 	}
-	log.Println("INFO: Connected to database")
 
 	// set DataDir, Domain and IDURL from env
 	setDataDir()
@@ -598,21 +737,22 @@ func main() {
 
 	if mode == "sender" {
 		startSender() // blocks forever
-	}
-
-	// start listening
-	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("INFO: Listening on %s\n", addr)
-	for {
-		conn, err := ln.Accept()
+	} else {
+		// start listening
+		addr := fmt.Sprintf("%s:%d", listenAddress, Port)
+		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
-		} else {
-			go handleConn(conn)
+			log.Fatal(err)
+		}
+		log.Printf("INFO: Ready to receive on %s\n", addr)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
+			} else {
+				go handleConn(conn)
+			}
 		}
 	}
+
 }

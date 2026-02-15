@@ -30,6 +30,10 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 | FMSG_MIN_DOWNLOAD_RATE     | 5000    | Bytes per second. Used in setting download deadlines while downloading a message.                                                                       |
 | FMSG_MIN_UPLOAD_RATE       | 5000    | Bytes per second. Used in setting upload deadlines while sending a message.                                                                             |
 | FMSG_READ_BUFFER_SIZE      | 1600    | Bytes. Internal read buffer size per incoming connection                                                                                                |
+| FMSG_RETRY_INTERVAL        | 20      | Seconds. Minimum time before retrying delivery to a recipient that previously failed.                                                                  |
+| FMSG_POLL_INTERVAL         | 10      | Seconds. How often the sender polls the database for pending messages.                                                                                 |
+| FMSG_MAX_CONCURRENT_SEND   | 32      | Maximum number of concurrent outbound message deliveries.                                                                                              |
+| FMSG_SKIP_DOMAIN_IP_CHECK  | false   | Set to "true" to skip verifying this host's external IP is in the _fmsg DNS authorised IP set on startup.                                              |
 
 
 
@@ -37,7 +41,7 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 An up and running [fmsg Id API](https://github.com/markmnl/fmsgid) needs to be reachable by fmsgd to know users and their quotas for this fmsgd service.  
 
-IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied e.g. on Linux:
+IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied. e.g. on Linux:
 
 ```
 ./fmsgd "0.0.0.0"
