@@ -54,6 +54,44 @@ const (
 	RejectCodeAccept uint8 = 200
 )
 
+// responseCodeName returns the human-friendly name for a response code.
+func responseCodeName(code uint8) string {
+	switch code {
+	case RejectCodeInvalid:
+		return "invalid"
+	case RejectCodeUnsupportedVersion:
+		return "unsupported version"
+	case RejectCodeUndisclosed:
+		return "undisclosed"
+	case RejectCodeTooBig:
+		return "too big"
+	case RejectCodeInsufficentResources:
+		return "insufficient resources"
+	case RejectCodeParentNotFound:
+		return "parent not found"
+	case RejectCodePastTime:
+		return "past time"
+	case RejectCodeFutureTime:
+		return "future time"
+	case RejectCodeTimeTravel:
+		return "time travel"
+	case RejectCodeDuplicate:
+		return "duplicate"
+	case RejectCodeMustChallenge:
+		return "must challenge"
+	case RejectCodeCannotChallenge:
+		return "cannot challenge"
+	case RejectCodeUserUnknown:
+		return "user unknown"
+	case RejectCodeUserFull:
+		return "user full"
+	case RejectCodeAccept:
+		return "accept"
+	default:
+		return fmt.Sprintf("unknown(%d)", code)
+	}
+}
+
 var ErrProtocolViolation = errors.New("protocol violation")
 
 var Port = 4930
@@ -161,6 +199,9 @@ func isValidDomain(s string) bool {
 	if len(s) == 0 || len(s) > 253 {
 		return false
 	}
+	if s == "localhost" {
+		return true
+	}
 	labels := strings.Split(s, ".")
 	if len(labels) < 2 {
 		return false
@@ -233,7 +274,7 @@ func handleChallenge(c net.Conn, r *bufio.Reader) error {
 	fmt.Printf("<-- %s", hex.EncodeToString(hashSlice))
 	header, exists := outgoing[hash]
 	if !exists {
-		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
+		return fmt.Errorf("challenge for unknown message: %s, from: %s\n", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
 	}
 	msgHash, err := header.GetMessageHash()
 	if err != nil {
@@ -266,6 +307,7 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 		return nil, handleChallenge(c, r)
 	}
 	if v != 1 {
+		// TODO how to send unsupported reject code
 		return h, fmt.Errorf("unsupported version: %d", v)
 	}
 	h.Version = v
@@ -323,16 +365,14 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	}
 	now := timeutil.TimestampNow().Float64()
 	delta := now - h.Timestamp
-	if PastTimeDelta > 0 && delta < 0 {
-		if math.Abs(delta) > PastTimeDelta {
-			codes := []byte{RejectCodePastTime}
-			if err := rejectAccept(c, codes); err != nil {
-				return h, err
-			}
-			return h, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
+	if PastTimeDelta > 0 && delta > PastTimeDelta {
+		codes := []byte{RejectCodePastTime}
+		if err := rejectAccept(c, codes); err != nil {
+			return h, err
 		}
+		return h, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
 	}
-	if FutureTimeDelta > 0 && delta > FutureTimeDelta {
+	if FutureTimeDelta > 0 && delta < 0 && math.Abs(delta) > FutureTimeDelta {
 		codes := []byte{RejectCodeFutureTime}
 		if err := rejectAccept(c, codes); err != nil {
 			return h, err
@@ -500,7 +540,7 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 
 func downloadMessage(c net.Conn, h *FMsgHeader) error {
 
-	// filter to local domain recipients
+	// filter to our domain recipients
 	addrs := []FMsgAddress{}
 	for _, addr := range h.To {
 		if addr.Domain == Domain {
@@ -581,7 +621,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 			return err
 		}
 		if code != RejectCodeAccept {
-			log.Printf("WARN: Rejected message to: %s, code: %d", addr.ToString(), code)
+			log.Printf("WARN: Rejected message to: %s: %s (%d)", addr.ToString(), responseCodeName(code), code)
 			codes[i] = code
 			continue
 		}
@@ -652,6 +692,13 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	return rejectAccept(c, codes)
 }
 
+func abortConn(c net.Conn) {
+	if tcp, ok := c.(*net.TCPConn); ok {
+		tcp.SetLinger(0)
+	}
+	_ = c.Close()
+}
+
 func handleConn(c net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -664,7 +711,8 @@ func handleConn(c net.Conn) {
 	// read header
 	header, err := readHeader(c)
 	if err != nil {
-		log.Printf("Error reading header from, %s: %s", c.RemoteAddr().String(), err)
+		log.Printf("WARN: reading header from, %s: %s", c.RemoteAddr().String(), err)
+		abortConn(c)
 		return
 	}
 
@@ -678,6 +726,7 @@ func handleConn(c net.Conn) {
 	err = challenge(c, header)
 	if err != nil {
 		log.Printf("Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
+		abortConn(c)
 		return
 	}
 
@@ -687,7 +736,7 @@ func handleConn(c net.Conn) {
 	err = downloadMessage(c, header)
 	if err != nil {
 		// if error was a protocal violation, abort; otherise let sender know there was an internal error
-		log.Printf("Download failed from, %s: %s", c.RemoteAddr().String(), err)
+		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
 		if errors.Is(err, ErrProtocolViolation) {
 			return
 		} else {
@@ -713,15 +762,10 @@ func main() {
 	// read env config (must be after godotenv.Load)
 	loadEnvConfig()
 
-	// determine mode from args: "sender" or default receiver
-	mode := "receiver"
+	// determine listen address from args
 	listenAddress := "127.0.0.1"
 	for _, arg := range os.Args[1:] {
-		if arg == "sender" {
-			mode = "sender"
-		} else {
-			listenAddress = arg
-		}
+		listenAddress = arg
 	}
 
 	// initalize database
@@ -735,23 +779,25 @@ func main() {
 	setDomain()
 	setIDURL()
 
-	if mode == "sender" {
-		startSender() // blocks forever
-	} else {
-		// start listening
-		addr := fmt.Sprintf("%s:%d", listenAddress, Port)
-		ln, err := net.Listen("tcp", addr)
+	// start sender in background (small delay so listener is ready first)
+	go func() {
+		time.Sleep(1 * time.Second)
+		startSender()
+	}()
+
+	// start listening
+	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("INFO: Ready to receive on %s\n", addr)
+	for {
+		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("INFO: Ready to receive on %s\n", addr)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
-			} else {
-				go handleConn(conn)
-			}
+			log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
+		} else {
+			go handleConn(conn)
 		}
 	}
 
