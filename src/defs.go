@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 type FMsgAddress struct {
@@ -55,7 +57,7 @@ func (h *FMsgHeader) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
 	b.WriteByte(h.Flags)
-	if h.Flags & FlagHasPid == 1 {
+	if h.Flags&FlagHasPid == 1 {
 		b.Write(h.Pid[:])
 	}
 	str := h.From.ToString()
@@ -75,6 +77,27 @@ func (h *FMsgHeader) Encode() []byte {
 	b.WriteByte(byte(len(h.Type)))
 	b.WriteString(h.Type)
 	return b.Bytes()
+}
+
+// String returns a human-readable summary of the header fields.
+func (h *FMsgHeader) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "v%d flags=%d", h.Version, h.Flags)
+	if len(h.Pid) > 0 {
+		fmt.Fprintf(&b, " pid=%s", hex.EncodeToString(h.Pid))
+	}
+	fmt.Fprintf(&b, "\nfrom:\t%s", h.From.ToString())
+	for i, addr := range h.To {
+		if i == 0 {
+			fmt.Fprintf(&b, "\nto:\t%s", addr.ToString())
+		} else {
+			fmt.Fprintf(&b, "\n\t%s", addr.ToString())
+		}
+	}
+	fmt.Fprintf(&b, "\ntopic:\t%s", h.Topic)
+	fmt.Fprintf(&b, "\ntype:\t%s", h.Type)
+	fmt.Fprintf(&b, "\nsize:\t%d", h.Size)
+	return b.String()
 }
 
 func (h *FMsgHeader) GetHeaderHash() []byte {

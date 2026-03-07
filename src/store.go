@@ -143,3 +143,63 @@ values ($1, $2, $3)`)
 	return tx.Commit()
 
 }
+
+// loadMsg loads a message and all its recipients from the database within the
+// given transaction and returns a fully populated FMsgHeader.
+func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
+	var version, flags, size int
+	var pid []byte
+	var fromAddr, topic, typ, filepath string
+	var timeSent float64
+	err := tx.QueryRow(`
+		SELECT version, flags, psha256, from_addr, topic, type, time_sent, size, filepath
+		FROM msg WHERE id = $1
+	`, msgID).Scan(&version, &flags, &pid, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	if err != nil {
+		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
+	}
+
+	recipRows, err := tx.Query(`SELECT addr FROM msg_to WHERE msg_id = $1 ORDER BY id`, msgID)
+	if err != nil {
+		return nil, fmt.Errorf("load recipients for msg %d: %w", msgID, err)
+	}
+	var allRecipientAddrs []string
+	for recipRows.Next() {
+		var a string
+		if err := recipRows.Scan(&a); err != nil {
+			recipRows.Close()
+			return nil, fmt.Errorf("scan recipient addr: %w", err)
+		}
+		allRecipientAddrs = append(allRecipientAddrs, a)
+	}
+	recipRows.Close()
+	if err := recipRows.Err(); err != nil {
+		return nil, fmt.Errorf("recipients query err for msg %d: %w", msgID, err)
+	}
+
+	from, err := parseAddress([]byte(fromAddr))
+	if err != nil {
+		return nil, fmt.Errorf("invalid from address %s: %w", fromAddr, err)
+	}
+	allTo := make([]FMsgAddress, 0, len(allRecipientAddrs))
+	for _, a := range allRecipientAddrs {
+		addr, err := parseAddress([]byte(a))
+		if err != nil {
+			return nil, fmt.Errorf("invalid to address %s: %w", a, err)
+		}
+		allTo = append(allTo, *addr)
+	}
+
+	return &FMsgHeader{
+		Version:   uint8(version),
+		Flags:     uint8(flags),
+		Pid:       pid,
+		From:      *from,
+		To:        allTo,
+		Timestamp: timeSent,
+		Topic:     topic,
+		Type:      typ,
+		Size:      uint32(size),
+		Filepath:  filepath,
+	}, nil
+}

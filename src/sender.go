@@ -183,80 +183,23 @@ func deliverMessage(target pendingTarget) {
 	}
 
 	// Load the full message from msg table
-	var version, flags, size int
-	var pid []byte
-	var fromAddr, topic, typ, filepath string
-	var timeSent float64
-	err = tx.QueryRow(`
-		SELECT version, flags, psha256, from_addr, topic, type, time_sent, size, filepath
-		FROM msg WHERE id = $1
-	`, target.MsgID).Scan(&version, &flags, &pid, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	h, err := loadMsg(tx, target.MsgID)
 	if err != nil {
-		log.Printf("ERROR: sender: load msg %d: %s", target.MsgID, err)
+		log.Printf("ERROR: sender: %s", err)
 		return
-	}
-
-	// Load ALL recipients from msg_to so the original To list is sent on the wire.
-	recipRows, err := tx.Query(`SELECT addr FROM msg_to WHERE msg_id = $1 ORDER BY id`, target.MsgID)
-	if err != nil {
-		log.Printf("ERROR: sender: load recipients for msg %d: %s", target.MsgID, err)
-		return
-	}
-	var allRecipientAddrs []string
-	for recipRows.Next() {
-		var a string
-		if err := recipRows.Scan(&a); err != nil {
-			recipRows.Close()
-			log.Printf("ERROR: sender: scan recipient addr: %s", err)
-			return
-		}
-		allRecipientAddrs = append(allRecipientAddrs, a)
-	}
-	recipRows.Close()
-	if err := recipRows.Err(); err != nil {
-		log.Printf("ERROR: sender: recipients query err for msg %d: %s", target.MsgID, err)
-		return
-	}
-
-	// Build FMsgHeader with ALL recipients
-	from, err := parseAddress([]byte(fromAddr))
-	if err != nil {
-		log.Printf("ERROR: sender: invalid from address %s: %s", fromAddr, err)
-		return
-	}
-	allTo := make([]FMsgAddress, 0, len(allRecipientAddrs))
-	for _, a := range allRecipientAddrs {
-		addr, err := parseAddress([]byte(a))
-		if err != nil {
-			log.Printf("ERROR: sender: invalid to address %s: %s", a, err)
-			return
-		}
-		allTo = append(allTo, *addr)
-	}
-
-	h := &FMsgHeader{
-		Version:   uint8(version),
-		Flags:     uint8(flags),
-		Pid:       pid,
-		From:      *from,
-		To:        allTo,
-		Timestamp: timeSent,
-		Topic:     topic,
-		Type:      typ,
-		Size:      uint32(size),
-		Filepath:  filepath,
 	}
 
 	// Register in outgoing map so challenge handler can look up this message
 	hash := h.GetHeaderHash()
 	hashArr := *(*[32]byte)(hash)
 	log.Printf("INFO: sender: registering outgoing message %s", hex.EncodeToString(hash[:]))
-	outgoing[hashArr] = h
-	defer delete(outgoing, hashArr)
+	registerOutgoing(hashArr, h)
+	defer deleteOutgoing(hashArr)
 
-	// Build the list of recipients on the target domain (in To-field order) and
+	// Build the list of recipients on the target domain (in order) and
 	// note which ones we locked (i.e. are pending delivery this round). Per spec,
 	// response codes arrive per-recipient in To-field order excluding other domains.
+	// TODO check rety logic when some recipients on this domain are not locked (e.g. already delivered or locked by another sender) — do we still get per-recipient codes for the locked ones?
 	lockedSet := make(map[string]bool)
 	for _, a := range lockedAddrs {
 		lockedSet[strings.ToLower(a)] = true
@@ -328,6 +271,10 @@ func deliverMessage(target pendingTarget) {
 
 	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int(h.Size), MinUploadRate)))
 	n, err := io.CopyN(conn, fd, int64(h.Size))
+	if n != int64(h.Size) {
+		log.Printf("ERROR: sender: file size mismatch for msg %d: expected %d, got %d", target.MsgID, h.Size, n)
+		return
+	}
 	if err != nil {
 		log.Printf("ERROR: sender: sending data (%d/%d bytes): %s", n, h.Size, err)
 		return
@@ -384,6 +331,7 @@ func deliverMessage(target pendingTarget) {
 	for i, dr := range domainRecips {
 		if !dr.isLocked {
 			continue // not our responsibility this round
+			// TODO well receiving host still attempted delivery to this recipient — do we update response code for it? Spec is not clear on this scenario.
 		}
 		c := codes[i]
 		if c == RejectCodeAccept {

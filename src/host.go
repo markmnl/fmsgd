@@ -124,9 +124,6 @@ func loadEnvConfig() {
 	AllowSkipChallenge = env.GetIntDefault("FMSG_ALLOW_SKIP_CHALLENGE", 0)
 }
 
-// outgoing message headers keyed on header hash
-var outgoing map[[32]byte]*FMsgHeader
-
 // Updates DataDir from environment, panics if not a valid directory.
 func setDataDir() {
 	value, hasValue := os.LookupEnv("FMSG_DATA_DIR")
@@ -170,6 +167,7 @@ func setIDURL() {
 	if err != nil {
 		log.Panicf("ERROR: FMSG_ID_URL lookup failed, %s: %s", url, err)
 	}
+	// TODO ping URL to verify its up and responding in a timely manner
 	IDURI = rawUrl
 	log.Printf("INFO: ID URL: %s", IDURI)
 }
@@ -266,13 +264,13 @@ func readAddress(r io.Reader) (*FMsgAddress, error) {
 }
 
 func handleChallenge(c net.Conn, r *bufio.Reader) error {
-	hashSlice, err := io.ReadAll(io.LimitReader(c, 32))
+	hashSlice, err := io.ReadAll(io.LimitReader(r, 32))
 	if err != nil {
 		return err
 	}
 	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
-	fmt.Printf("<-- %s", hex.EncodeToString(hashSlice))
-	header, exists := outgoing[hash]
+	log.Printf("INFO: CHALLENGE <-- %s", hex.EncodeToString(hashSlice))
+	header, exists := lookupOutgoing(hash)
 	if !exists {
 		return fmt.Errorf("challenge for unknown message: %s, from: %s\n", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
 	}
@@ -291,7 +289,7 @@ func rejectAccept(c net.Conn, codes []byte) error {
 	return err
 }
 
-func readHeader(c net.Conn) (*FMsgHeader, error) {
+func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	r := bufio.NewReaderSize(c, ReadBufferSize)
 	var h = &FMsgHeader{}
 
@@ -301,29 +299,29 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	// read version
 	v, err := r.ReadByte()
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
 	if v == 255 {
-		return nil, handleChallenge(c, r)
+		return nil, r, handleChallenge(c, r)
 	}
 	if v != 1 {
 		// TODO how to send unsupported reject code
-		return h, fmt.Errorf("unsupported version: %d", v)
+		return h, r, fmt.Errorf("unsupported version: %d", v)
 	}
 	h.Version = v
 
 	// read flags
 	flags, err := r.ReadByte()
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
 	h.Flags = flags
 
 	// read pid if any
 	if flags&FlagHasPid == 1 {
-		pid, err := io.ReadAll(io.LimitReader(c, 32))
+		pid, err := io.ReadAll(io.LimitReader(r, 32))
 		if err != nil {
-			return h, err
+			return h, r, err
 		}
 		h.Pid = make([]byte, 32)
 		copy(h.Pid, pid)
@@ -333,89 +331,90 @@ func readHeader(c net.Conn) (*FMsgHeader, error) {
 	// read from address
 	from, err := readAddress(r)
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
-	log.Printf("from: %s", from.ToString())
+
 	h.From = *from
 
 	// read to addresses
 	num, err := r.ReadByte()
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
 	seen := make(map[string]bool)
 	for num > 0 {
 		addr, err := readAddress(r)
 		if err != nil {
-			return h, err
+			return h, r, err
 		}
 		key := strings.ToLower(addr.ToString())
 		if seen[key] {
-			return h, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
+			return h, r, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
 		}
 		seen[key] = true
 		h.To = append(h.To, *addr)
 		num--
-		log.Printf("to: @%s@%s", addr.User, addr.Domain)
 	}
 
 	// read timestamp
 	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
-		return h, err
+		return h, r, err
 	}
 	now := timeutil.TimestampNow().Float64()
 	delta := now - h.Timestamp
 	if PastTimeDelta > 0 && delta > PastTimeDelta {
 		codes := []byte{RejectCodePastTime}
 		if err := rejectAccept(c, codes); err != nil {
-			return h, err
+			return h, r, err
 		}
-		return h, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
+		return h, r, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
 	}
 	if FutureTimeDelta > 0 && delta < 0 && math.Abs(delta) > FutureTimeDelta {
 		codes := []byte{RejectCodeFutureTime}
 		if err := rejectAccept(c, codes); err != nil {
-			return h, err
+			return h, r, err
 		}
-		return h, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
+		return h, r, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
 	}
 
 	// read topic
 	topic, err := ReadUInt8Slice(r)
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
 	h.Topic = string(topic)
 
 	// read type
 	mime, err := ReadUInt8Slice(r)
 	if err != nil {
-		return h, err
+		return h, r, err
 	}
 	h.Type = string(mime)
 
 	// read message size
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
-		return h, err
+		return h, r, err
 	}
 	if h.Size > MaxMessageSize {
 		codes := []byte{RejectCodeTooBig}
 		if err := rejectAccept(c, codes); err != nil {
-			return h, err
+			return h, r, err
 		}
-		return h, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
+		return h, r, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
 	}
 
 	// read attachment count
 	var attachCount uint8
 	if err := binary.Read(r, binary.LittleEndian, &attachCount); err != nil {
-		return h, err
+		return h, r, err
 	}
 	if attachCount > 0 {
-		return h, fmt.Errorf("attachments not yet supported (count: %d)", attachCount)
+		return h, r, fmt.Errorf("attachments not yet supported (count: %d)", attachCount)
 	}
 
-	return h, nil
+	log.Printf("INFO: <-- MSG\n%s", h)
+
+	return h, r, nil
 }
 
 // Sends CHALLENGE request to sender domain first checking if domain is indeed located
@@ -470,7 +469,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	hash := h.GetHeaderHash()
-	fmt.Printf("--> CHALLENGE\t%s\n", hex.EncodeToString(hash))
+	log.Printf("INFO: --> CHALLENGE\t%s\n", hex.EncodeToString(hash))
 	if _, err := conn2.Write(hash); err != nil {
 		return err
 	}
@@ -481,7 +480,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		return err
 	}
 	copy(h.ChallengeHash[:], resp)
-	fmt.Printf("--> RESP\t%s\n", hex.EncodeToString(resp))
+	log.Printf("INFO: <-- CHALLENGE RESP\t%s\n", hex.EncodeToString(resp))
 
 	// gracefully close 2nd connection
 	if err := conn2.Close(); err != nil {
@@ -538,7 +537,7 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 	}
 }
 
-func downloadMessage(c net.Conn, h *FMsgHeader) error {
+func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 
 	// filter to our domain recipients
 	addrs := []FMsgAddress{}
@@ -560,7 +559,7 @@ func downloadMessage(c net.Conn, h *FMsgHeader) error {
 	defer os.Remove(fd.Name())
 	defer fd.Close()
 
-	_, err = io.CopyN(fd, c, int64(h.Size))
+	_, err = io.CopyN(fd, r, int64(h.Size))
 	if err != nil {
 		return err
 	}
@@ -702,14 +701,14 @@ func abortConn(c net.Conn) {
 func handleConn(c net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Println("Recovered in handleConn", r)
+			log.Printf("ERROR: Recovered in handleConn: %v", r)
 		}
 	}()
 
-	log.Printf("Connection from: %s\n", c.RemoteAddr().String())
+	log.Printf("INFO: Connection from: %s\n", c.RemoteAddr().String())
 
 	// read header
-	header, err := readHeader(c)
+	header, r, err := readHeader(c)
 	if err != nil {
 		log.Printf("WARN: reading header from, %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
@@ -725,7 +724,7 @@ func handleConn(c net.Conn) {
 	// challenge
 	err = challenge(c, header)
 	if err != nil {
-		log.Printf("Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
+		log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
 		return
 	}
@@ -733,7 +732,7 @@ func handleConn(c net.Conn) {
 	// store message
 	d := calcNetIODuration(int(header.Size), MinDownloadRate)
 	c.SetReadDeadline(time.Now().Add(d))
-	err = downloadMessage(c, header)
+	err = downloadMessage(c, r, header)
 	if err != nil {
 		// if error was a protocal violation, abort; otherise let sender know there was an internal error
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
@@ -750,9 +749,7 @@ func handleConn(c net.Conn) {
 
 func main() {
 
-	outgoing = make(map[[32]byte]*FMsgHeader)
-
-	log.SetPrefix("fmsgd: ")
+	initOutgoing()
 
 	// load environment variables from .env file if present
 	if err := godotenv.Load(); err != nil {
