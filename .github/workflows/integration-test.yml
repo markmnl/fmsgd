@@ -1,0 +1,53 @@
+name: Integration Test
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger and wait for integration test
+        env:
+          GH_TOKEN: ${{ secrets.FMSG_DOCKER_PAT }}
+        run: |
+          FMSGD_REF="${{ github.event.pull_request.head.ref }}"
+
+          # Trigger the integration test workflow in fmsg-docker,
+          # passing the PR branch so it builds fmsgd from the PR
+          gh workflow run integration-test.yml \
+            --repo markmnl/fmsg-docker \
+            --ref main \
+            -f fmsgd_ref="$FMSGD_REF"
+
+          echo "Triggered integration test for fmsgd_ref=$FMSGD_REF, polling for run..."
+
+          # Poll until we find the run matching our fmsgd_ref
+          RUN_ID=""
+          for i in $(seq 1 30); do
+            sleep 10
+            RUN_ID=$(gh run list \
+              --repo markmnl/fmsg-docker \
+              --workflow integration-test.yml \
+              --limit 10 \
+              --json databaseId,displayTitle \
+              --jq ".[] | select(.displayTitle | contains(\"$FMSGD_REF\")) | .databaseId" \
+            | head -1)
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+            echo "Attempt $i: run not found yet..."
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Timed out waiting for integration test run to appear"
+            exit 1
+          fi
+
+          echo "Found run $RUN_ID, waiting for completion..."
+
+          # Wait for completion and exit with its status
+          gh run watch "$RUN_ID" \
+            --repo markmnl/fmsg-docker \
+            --exit-status

@@ -52,6 +52,7 @@ func findPendingTargets() ([]pendingTarget, error) {
 		FROM msg_to mt
 		INNER JOIN msg m ON m.id = mt.msg_id
 		WHERE mt.time_delivered IS NULL
+		  AND m.time_sent IS NOT NULL
 		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5))
 		  AND (mt.time_last_attempt IS NULL OR ($1 - mt.time_last_attempt) > $2)
 		  AND ($1 - m.time_sent) < $3
@@ -149,6 +150,7 @@ func deliverMessage(target pendingTarget) {
 		INNER JOIN msg m ON m.id = mt.msg_id
 		WHERE mt.msg_id = $1
 		  AND mt.time_delivered IS NULL
+		  AND m.time_sent IS NOT NULL
 		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5))
 		  AND (mt.time_last_attempt IS NULL OR ($2 - mt.time_last_attempt) > $3)
 		  AND ($2 - m.time_sent) < $4
