@@ -493,7 +493,7 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err error) {
 	detail, err := getAddressDetail(addr)
 	if err != nil {
-		return RejectCodeUndisclosed, err
+		return RejectCodeUndisclosed, fmt.Errorf("validateMsgRecvForAddr(%s): %w", addr.ToString(), err)
 	}
 	if detail == nil {
 		return RejectCodeUserUnknown, nil
@@ -559,9 +559,12 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	defer os.Remove(fd.Name())
 	defer fd.Close()
 
-	_, err = io.CopyN(fd, r, int64(h.Size))
+	n, err := io.Copy(fd, io.LimitReader(r, int64(h.Size)))
 	if err != nil {
-		return err
+		return fmt.Errorf("downloading message body: copied %d of %d bytes: %w", n, h.Size, err)
+	}
+	if n != int64(h.Size) {
+		return fmt.Errorf("downloading message body: incomplete, copied %d of %d bytes", n, h.Size)
 	}
 
 	// verify hash matches challenge response
@@ -711,6 +714,7 @@ func handleConn(c net.Conn) {
 	header, r, err := readHeader(c)
 	if err != nil {
 		log.Printf("WARN: reading header from, %s: %s", c.RemoteAddr().String(), err)
+		// TODO should we always abort on err - what if e.g. too big
 		abortConn(c)
 		return
 	}
@@ -737,6 +741,7 @@ func handleConn(c net.Conn) {
 		// if error was a protocal violation, abort; otherise let sender know there was an internal error
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
 		if errors.Is(err, ErrProtocolViolation) {
+			abortConn(c)
 			return
 		} else {
 			rejectAccept(c, []byte{RejectCodeUndisclosed})

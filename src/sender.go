@@ -269,7 +269,20 @@ func deliverMessage(target pendingTarget) {
 	}
 	defer fd.Close()
 
-	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int(h.Size), MinUploadRate)))
+	// check size
+	fi, err := fd.Stat()
+	if err != nil {
+		log.Printf("ERROR: sender: stat file %s: %s", h.Filepath, err)
+		return
+	}
+	if fi.Size() != int64(h.Size) {
+		log.Printf("ERROR: sender: file size mismatch for msg %d: header says %d bytes but file is %d bytes", target.MsgID, h.Size, fi.Size())
+		return
+	}
+	writeDeadline := calcNetIODuration(int(h.Size), MinUploadRate)
+	log.Printf("INFO: sender: sending %d bytes to %s (deadline %.1fs)", h.Size, conn.RemoteAddr().String(), writeDeadline.Seconds())
+
+	conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 	n, err := io.CopyN(conn, fd, int64(h.Size))
 	if n != int64(h.Size) {
 		log.Printf("ERROR: sender: file size mismatch for msg %d: expected %d, got %d", target.MsgID, h.Size, n)
@@ -285,7 +298,7 @@ func deliverMessage(target pendingTarget) {
 	// --- read response ---
 	// A code < 100 is a global rejection (single byte for all recipients).
 	// Otherwise one code per recipient on this domain, in To-field order.
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // TODO duration
 
 	firstByte := make([]byte, 1)
 	if _, err := io.ReadFull(conn, firstByte); err != nil {

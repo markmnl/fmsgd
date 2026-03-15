@@ -35,7 +35,7 @@ func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
 	uri := IDURI + "/addr/" + url.PathEscape(addr.ToString())
 	resp, err := http.Get(uri)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getAddressDetail(%s): GET %s: %w", addr.ToString(), uri, err)
 	}
 	defer resp.Body.Close()
 
@@ -46,7 +46,7 @@ func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
 	var detail AddressDetail
 	err = json.NewDecoder(resp.Body).Decode(&detail)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getAddressDetail(%s): decoding response from %s: %w", addr.ToString(), uri, err)
 	}
 
 	return &detail, nil
