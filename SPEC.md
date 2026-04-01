@@ -209,15 +209,27 @@ _add to_ order. Host A records codes and retries transient failures
 
 ### Handling a Challenge
 
-While transmitting on Connection 1, Host A MUST listen for incoming connections.
-On receiving a connection: read first byte — if >128 and (256 - value) is a
-supported version, this is a CHALLENGE; otherwise TERMINATE. Read the 32-byte
-header hash. Match it against a currently outgoing message's header hash;
-if no match → TERMINATE. Compute the message hash and transmit it as CHALLENGE
-RESPONSE. Close the connection.
+A sending host MUST be listening for incoming connections on the same IP address
+it uses to send outgoing messages. While a message is being transmitted on
+Connection 1, the receiving host may open Connection 2 back to the sending host to
+issue a CHALLENGE. The sending host handles this as follows:
+
+1.  Download the first byte:
+    -   If the value is less than 128 and a supported fmsg version — this is an
+        incoming message and should be processed per 1. Connection and Header Exchange.
+    -   If the value is greater than 128 and (256 - value) is a supported fmsg
+        version, this is a CHALLENGE; continue.
+    -   Otherwise send REJECT code 2 (unsupported version) and close the connection.
+2.  Download the next 32 bytes — the header hash supplied by the challenger.
+3.  Verify the header hash exactly matches the message header hash of a message
+    currently being transmitted. If no match → TERMINATE.
+4.  Compute the message hash (SHA-256 of entire message) and transmit it as
+    CHALLENGE RESPONSE.
+5.  Close Connection 2. The message exchange continues on Connection 1.
 
 Host A MUST maintain a record of outgoing messages keyed by header hash,
 created before transmission begins and removed after the exchange completes.
+Implementors should be mindful of concurrent access to this record.
 
 ------------------------------------------------------------------------
 
