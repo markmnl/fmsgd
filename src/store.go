@@ -126,6 +126,12 @@ values ($1, $2, $3)`)
 		}
 	}
 
+	// TODO [Spec]: Also insert add-to recipients (msg.AddTo) into msg_to,
+	// preserving their order AFTER to recipients. The DB should distinguish
+	// to vs add-to (e.g. a boolean column or separate table) so loadMsg can
+	// reconstruct the correct FMsgHeader.To and FMsgHeader.AddTo slices.
+	// Per-recipient response codes must arrive in "to then add to" order.
+
 	// resolve pid from psha256 (parent message hash)
 	if len(msg.Pid) > 0 {
 		var parentID sql.NullInt64
@@ -146,6 +152,17 @@ values ($1, $2, $3)`)
 
 // loadMsg loads a message and all its recipients from the database within the
 // given transaction and returns a fully populated FMsgHeader.
+//
+// TODO [Spec]: All recipients are loaded into FMsgHeader.To with no distinction
+// between "to" and "add to". Once the DB schema distinguishes the two groups
+// (see storeMsgDetail TODO), populate FMsgHeader.To and FMsgHeader.AddTo
+// separately, preserving their original wire-format order. The sender relies
+// on this ordering for correct per-recipient response code mapping.
+//
+// TODO [Spec]: Attachment headers are not loaded. Once the msg_attachment table
+// stores attachment metadata (flags, type, filename, size, filepath), loadMsg
+// should populate FMsgHeader.Attachments so the sender can write attachment
+// headers and data on the wire and compute a correct header/message hash.
 func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	var version, flags, size int
 	var pid []byte
