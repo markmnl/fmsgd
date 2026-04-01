@@ -7,17 +7,6 @@ correctness issues, then enhancements.
 
 ## P0 — Foundational (blocks most other work)
 
-### ~~1. Realign flag bit assignments to spec~~
-**File:** `host.go` constants  
-~~Current flags are wrong: `FlagImportant` is on bit 1 (spec: bit 3),
-`FlagNoReply` on bit 3 (spec: bit 4), and `FlagSkipChallenge` (bit 4) does not
-exist in the spec. Missing: `FlagHasAddTo` (bit 1), `FlagCommonType` (bit 2).
-All flag definitions and every usage site must be realigned.~~
-**DONE:** Flags realigned to spec. Added `FlagHasAddTo` (bit 1), `FlagCommonType` (bit 2).
-Moved `FlagImportant` to bit 3, `FlagNoReply` to bit 4. Removed `FlagSkipChallenge`.
-Removed `RejectCodeMustChallenge`/`RejectCodeCannotChallenge`, added `AcceptCodeHeader` (11),
-`RejectCodeUserNotAccepting` (102), `RejectCodeUserUndisclosed` (103).
-Fixed `validateMsgRecvForAddr` to return code 102 instead of 100 for non-accepting users.
 
 ### 2. Fix `Encode()` to produce the full message header per spec
 **File:** `defs.go` `Encode()`  
