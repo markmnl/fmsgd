@@ -29,6 +29,13 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
+	// TODO: Flag bit assignments do not match the revised spec. Spec defines:
+	// bit 0 = has pid, bit 1 = has add to, bit 2 = common type, bit 3 = important,
+	// bit 4 = no reply, bit 5 = deflate, bits 6-7 = reserved.
+	// Current implementation is missing FlagHasAddTo (bit 1) and FlagCommonType (bit 2),
+	// has FlagImportant on bit 1 (spec: bit 3), FlagNoReply on bit 3 (spec: bit 4),
+	// and defines FlagSkipChallenge (bit 4) which does not exist in the spec.
+	// All flag definitions and their usages must be realigned to the spec.
 	FlagHasPid        uint8 = 1
 	FlagImportant     uint8 = 1 << 1
 	FlagNoReply       uint8 = 1 << 3
@@ -45,11 +52,19 @@ const (
 	RejectCodeFutureTime           uint8 = 8
 	RejectCodeTimeTravel           uint8 = 9
 	RejectCodeDuplicate            uint8 = 10
-	RejectCodeMustChallenge        uint8 = 11
-	RejectCodeCannotChallenge      uint8 = 12
+	// TODO: Spec defines code 11 as "accept header" (message header received for
+	// add-to-only messages). RejectCodeMustChallenge (11) and
+	// RejectCodeCannotChallenge (12) do not exist in the spec and should be
+	// replaced with the spec-defined code 11 = accept header.
+	RejectCodeMustChallenge   uint8 = 11
+	RejectCodeCannotChallenge uint8 = 12
 
 	RejectCodeUserUnknown uint8 = 100
 	RejectCodeUserFull    uint8 = 101
+	// TODO: Add missing per-user response codes from the spec:
+	// 102 = user not accepting (known user but not accepting new messages)
+	// 103 = user undisclosed (no reason given; MAY be used instead of 100-102
+	//       so Host B does not have to disclose the reason).
 
 	RejectCodeAccept uint8 = 200
 )
@@ -301,11 +316,20 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	if err != nil {
 		return h, r, err
 	}
+	// TODO [Spec 1.3]: Per spec step 1.3, the first byte determines the message type:
+	//  - 1..127: fmsg version (currently only version 1 supported).
+	//  - 128..255: incoming CHALLENGE; the fmsg version is (256 - value).
+	//    E.g. 255 = challenge for version 1, 254 = challenge for version 2, etc.
+	//  Currently only v==255 is handled as a challenge. This should be generalised
+	//  to handle any value > 128 where (256 - value) is a supported version.
+	//  For unsupported versions or invalid first-byte values, Host B MUST send
+	//  REJECT code 2 (unsupported version) on the connection before closing.
 	if v == 255 {
 		return nil, r, handleChallenge(c, r)
 	}
 	if v != 1 {
-		// TODO how to send unsupported reject code
+		// TODO [Spec 1.3.iii]: Send REJECT code 2 (unsupported version) on the
+		// connection before returning/closing, per spec step 1.3.iii.
 		return h, r, fmt.Errorf("unsupported version: %d", v)
 	}
 	h.Version = v
@@ -325,7 +349,9 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		}
 		h.Pid = make([]byte, 32)
 		copy(h.Pid, pid)
-		// pid existence is verified in downloadMessage after hash check
+		// TODO [Spec 1.4.v]: pid verification depends on the add-to field and must
+		// be performed here (during header exchange), not deferred to downloadMessage.
+		// See step 1.4.v for the full decision tree.
 	}
 
 	// read from address
@@ -341,6 +367,8 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	if err != nil {
 		return h, r, err
 	}
+	// TODO [Spec 1.4.i.a]: Spec requires at least one address in "to". If num == 0,
+	// reject with code 1 (invalid).
 	seen := make(map[string]bool)
 	for num > 0 {
 		addr, err := readAddress(r)
@@ -355,6 +383,23 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		h.To = append(h.To, *addr)
 		num--
 	}
+
+	// TODO [Spec 1.4.v.b / flag bit 1]: Parse the "add to" field when the
+	// has-add-to flag (bit 1) is set. This requires:
+	//  - Reading uint8 count + list of additional recipient addresses.
+	//  - Verifying add-to addresses are distinct from each other and from "to"
+	//    addresses (case-insensitive), per spec step 1.4.i.a.
+	//  - Adding an AddTo []FMsgAddress field to FMsgHeader.
+	//  - Implementing the pid/add-to decision tree from spec step 1.4.v.b:
+	//    * If add-to exists, pid MUST also exist; else reject code 1.
+	//    * If any add-to recipients are for our domain, continue normally
+	//      (pid message does NOT have to be stored).
+	//    * If NO add-to recipients are for our domain:
+	//      - pid MUST refer to a stored message per "Verifying Message Stored";
+	//        else reject code 6.
+	//      - At least one "to" recipient must be for our domain; else reject 1.
+	//      - Record message header, respond ACCEPT code 11 (accept header),
+	//        close connection (no further data to download).
 
 	// read timestamp
 	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
@@ -377,12 +422,22 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		return h, r, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
 	}
 
+	// TODO [Spec definition]: Topic is only present when pid is NOT set (first
+	// message in a thread). When pid exists the entire topic field MUST NOT be
+	// included on the wire. Currently topic is read unconditionally.
+
 	// read topic
 	topic, err := ReadUInt8Slice(r)
 	if err != nil {
 		return h, r, err
 	}
 	h.Topic = string(topic)
+
+	// TODO [Spec 1.4.i.b / flag bit 2]: When the "common type" flag (bit 2) is
+	// set, the type field is a single uint8 that maps to a predefined Media Type
+	// string per the Common Media Types table. If the value has no mapping, reject
+	// with code 1 (invalid). Currently the code always reads type as uint8-prefixed
+	// string, ignoring the common type flag entirely.
 
 	// read type
 	mime, err := ReadUInt8Slice(r)
@@ -395,6 +450,9 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
 		return h, r, err
 	}
+	// TODO [Spec 1.4.iii]: Size check must be total of data size PLUS all
+	// attachment sizes, not just data size alone. Currently only h.Size (data)
+	// is checked against MaxMessageSize.
 	if h.Size > MaxMessageSize {
 		codes := []byte{RejectCodeTooBig}
 		if err := rejectAccept(c, codes); err != nil {
@@ -408,11 +466,23 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	if err := binary.Read(r, binary.LittleEndian, &attachCount); err != nil {
 		return h, r, err
 	}
+	// TODO [Spec 1.4.i.c / attachments]: Parse attachment headers (flags, type,
+	// filename, size) for each attachment. Validate:
+	//  - Each attachment's type when its own common-type flag is set exists in
+	//    Common Media Type mapping; else reject code 1 (invalid).
+	//  - Filename is valid UTF-8 per spec (Unicode letters/numbers, limited
+	//    special chars, unique case-insensitive, < 256 bytes).
+	//  - Incorporate attachment sizes into the MAX_SIZE check above.
+	//  - Store parsed attachment headers on FMsgHeader.
 	if attachCount > 0 {
 		return h, r, fmt.Errorf("attachments not yet supported (count: %d)", attachCount)
 	}
 
 	log.Printf("INFO: <-- MSG\n%s", h)
+
+\t// TODO [Spec 1.4.ii]: DNS verification of sender's IP address MUST be\n\t// performed here during header exchange (not deferred to the challenge\n\t// step). Host B must resolve _fmsg.<from-domain> and verify the incoming\n\t// connection's IP is in the authorised set. If not authorised, Host B MUST\n\t// TERMINATE the message exchange (abort connection, no reject code sent).\n\t// Currently this check only happens inside challenge() and is skipped\n\t// entirely when skip-challenge is allowed.
+
+	// TODO [Spec 1.4.v.c]: When pid exists and add-to does not:\n\t//  a. The message or message header pid refers to MUST be verified as stored\n\t//     per \"Verifying Message Stored\"; else reject code 6 (parent not found).\n\t//     \"Verifying Message Stored\" means: the digest matches a previously\n\t//     accepted message (code 200) or accepted header (code 11), AND the\n\t//     corresponding data currently exists on the host.\n\t//  b. The stored parent's time MUST be before the incoming message's time;\n\t//     else reject code 9 (time travel).\n\t//  Both checks should be here (step 1), not deferred to downloadMessage.
 
 	return h, r, nil
 }
@@ -420,6 +490,10 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 // Sends CHALLENGE request to sender domain first checking if domain is indeed located
 // at address in connection supplied by verifying the remote IP is in the
 // sender's _fmsg.<sender-domain> authorised IP set.
+// TODO [Spec step 2]: The spec defines challenge modes (NEVER, ALWAYS,
+// HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices — the
+// FlagSkipChallenge mechanism is not part of the spec. Refactor to use an
+// implementation-defined challenge mode instead of a sender-controlled flag.
 func challenge(conn net.Conn, h *FMsgHeader) error {
 
 	// skip challenge if sender requested it and we allow it
@@ -460,6 +534,11 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
+	// TODO [Spec 2.1]: Connection 2 MUST be initiated to the same IP address as
+	// the incoming Connection 1 (conn.RemoteAddr()), NOT to h.From.Domain.
+	// The spec says: "Host B MUST initiate a separate new connection (Connection 2)
+	// back to Host A using the same incoming IP address of Connection 1."
+	// Dialling h.From.Domain may resolve to a different IP.
 	conn2, err := net.Dial("tcp", net.JoinHostPort(h.From.Domain, fmt.Sprintf("%d", RemotePort)))
 	if err != nil {
 		return err
@@ -500,6 +579,10 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 	}
 
 	// check user accepting new
+	// TODO [Spec 3.4.i.d]: When a user is known but not accepting new messages
+	// the spec requires reject code 102 (user not accepting) or 103 (user
+	// undisclosed). Currently RejectCodeUserUnknown (100) is returned which is
+	// incorrect — code 100 means the address is unknown to the host.
 	if !detail.AcceptingNew {
 		return RejectCodeUserUnknown, nil
 	}
@@ -539,7 +622,17 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 
 func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 
+	// TODO [Spec 3.1]: Per spec step 3.1, BEFORE downloading the remaining
+	// message data, if the CHALLENGE/CHALLENGE-RESP exchange was completed the
+	// message hash from the CHALLENGE-RESP SHOULD be used to check if the
+	// message is already stored (duplicate check). If found, respond REJECT
+	// code 10 (duplicate) and close. Currently the duplicate check happens
+	// AFTER downloading all data, wasting bandwidth on duplicates.
+
 	// filter to our domain recipients
+	// TODO [Spec 3.4.i]: Per spec step 3.4, response codes must be sent for
+	// each recipient on our domain in the order they appear in "to" THEN
+	// "add to". Currently only "to" is considered (add-to not implemented).
 	addrs := []FMsgAddress{}
 	for _, addr := range h.To {
 		if addr.Domain == Domain {
@@ -564,7 +657,16 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 		return err
 	}
 
+	// TODO [Spec 3.2]: Also download attachment data (sequential byte sequences
+	// whose boundaries are defined by attachment header sizes). Currently only
+	// message body data is downloaded; attachment bodies are not handled.
+
 	// verify hash matches challenge response
+	// TODO [Spec 3.3]: This verification MUST only be performed when the
+	// CHALLENGE/CHALLENGE-RESP exchange was actually completed. If the challenge
+	// was skipped (or not issued), ChallengeHash will be zero-valued and this
+	// comparison will erroneously fail for every message. Guard this check behind
+	// a flag or sentinel indicating whether the challenge exchange occurred.
 	h.Filepath = fd.Name()
 	msgHash, err := h.GetMessageHash()
 	if err != nil {
@@ -589,6 +691,17 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	}
 
 	// verify parent exists if pid is set
+	// TODO [Spec 1.4.v.c]: This pid verification should happen during header
+	// exchange (readHeader / step 1.4.v), not after downloading the message.
+	// Additionally, the spec requires checking the parent's timestamp is before
+	// the current message's timestamp (reject code 9 = time travel), and the
+	// verification must follow the "Verifying Message Stored" semantics:
+	//  - The digest must match a previously accepted message (code 200) or
+	//    accepted header (code 11).
+	//  - The message/header must currently exist and be retrievable.
+	//  - pid references a message hash if from was in "to" of parent; references
+	//    the message header hash if from was only in "add to" of parent. Both
+	//    must be checked.
 	if h.Flags&FlagHasPid != 0 {
 		parentID, err := lookupMsgIdByHash(h.Pid)
 		if err != nil {
