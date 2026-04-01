@@ -24,13 +24,12 @@ type FMsgAttachmentHeader struct {
 }
 
 type FMsgHeader struct {
-	Version uint8
-	Flags   uint8
-	Pid     []byte
-	From    FMsgAddress
-	To      []FMsgAddress
-	// TODO [Spec]: Add AddTo []FMsgAddress field for the "add to" recipients
-	// (present when has-add-to flag bit 1 is set).
+	Version   uint8
+	Flags     uint8
+	Pid       []byte
+	From      FMsgAddress
+	To        []FMsgAddress
+	AddTo     []FMsgAddress
 	Timestamp float64
 	Topic     string
 	Type      string
@@ -63,7 +62,6 @@ func (addr *FMsgAddress) ToString() string {
 // instead of returning one.
 // TODO [Spec]: The spec defines "message header" as all fields up to and
 // including the attachment headers field. This Encode() is missing:
-//   - The "add to" field (uint8 count + addresses, when has-add-to flag set).
 //   - The "size" field (uint32).
 //   - The "attachment headers" field (uint8 count + list of attachment headers).
 //
@@ -86,6 +84,14 @@ func (h *FMsgHeader) Encode() []byte {
 		b.WriteByte(byte(len(str)))
 		b.WriteString(str)
 	}
+	if h.Flags&FlagHasAddTo != 0 {
+		b.WriteByte(byte(len(h.AddTo)))
+		for _, addr := range h.AddTo {
+			str = addr.ToString()
+			b.WriteByte(byte(len(str)))
+			b.WriteString(str)
+		}
+	}
 	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
 		panic(err)
 	}
@@ -107,6 +113,13 @@ func (h *FMsgHeader) String() string {
 	for i, addr := range h.To {
 		if i == 0 {
 			fmt.Fprintf(&b, "\nto:\t%s", addr.ToString())
+		} else {
+			fmt.Fprintf(&b, "\n\t%s", addr.ToString())
+		}
+	}
+	for i, addr := range h.AddTo {
+		if i == 0 {
+			fmt.Fprintf(&b, "\nadd to:\t%s", addr.ToString())
 		} else {
 			fmt.Fprintf(&b, "\n\t%s", addr.ToString())
 		}

@@ -33,6 +33,17 @@ create table if not exists msg_to (
 );
 create index on msg_to ((lower(addr)));
 
+create table if not exists msg_add_to (
+	id				bigserial			primary key,
+	msg_id			bigint				not null references msg (id),
+	addr			varchar(255)		not null,
+    time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
+    time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
+    response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+	unique (msg_id, addr)
+);
+create index on msg_add_to ((lower(addr)));
+
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
     filename      	varchar(255)    not null,

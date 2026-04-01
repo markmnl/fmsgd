@@ -8,20 +8,6 @@ correctness issues, then enhancements.
 ## P0 — Foundational (blocks most other work)
 
 
-### 2. Fix `Encode()` to produce the full message header per spec
-**File:** `defs.go` `Encode()`  
-Currently encodes only version through type. Missing: add-to field, size
-(uint32), attachment headers (uint8 count + headers). Topic is always encoded
-but must be absent when pid is set. Type is always length-prefixed but must be a
-single uint8 index when the common-type flag (bit 2) is set. The header hash
-(SHA-256 of encoded header) is wrong without these fields, breaking challenge
-verification and pid references.
-
-### 3. Add `AddTo` field to `FMsgHeader`
-**File:** `defs.go` struct  
-Add `AddTo []FMsgAddress` field. Required before any add-to parsing, encoding,
-storage, or per-recipient response ordering can work.
-
 ### 4. Add `Attachments` field to `FMsgHeader`
 **File:** `defs.go` struct  
 Add `Attachments []FMsgAttachmentHeader` to store parsed attachment headers
@@ -35,14 +21,6 @@ Add a `ChallengeCompleted bool` to distinguish "challenge was completed and
 hash verification check in `downloadMessage` erroneously fails when the
 challenge was skipped.
 
-### ~~6. Fix response code constants~~
-**File:** `host.go` constants  
-~~`RejectCodeMustChallenge` (11) and `RejectCodeCannotChallenge` (12) do not
-exist in the spec. Code 11 = "accept header" (add-to notification success).
-Add missing per-user codes: 102 (user not accepting), 103 (user undisclosed).~~
-**DONE:** Replaced with `AcceptCodeHeader` (11), added `RejectCodeUserNotAccepting` (102)
-and `RejectCodeUserUndisclosed` (103).
-
 ---
 
 ## P1 — Receiving path (host.go) correctness
@@ -54,11 +32,6 @@ connection's IP is authorised. If not → TERMINATE (no reject code). Currently
 this only happens inside `challenge()` and is skipped when skip-challenge is
 allowed.
 
-### 8. Parse "add to" field when has-add-to flag is set
-**File:** `host.go` `readHeader()`  
-Spec 1.4.v.b: Read uint8 count + addresses. Verify distinct from each other and
-from "to" (case-insensitive). Implement the pid/add-to decision tree (add-to
-requires pid; if no add-to recipients on our domain → accept header code 11).
 
 ### 9. Make topic conditional on pid absence
 **File:** `host.go` `readHeader()`  

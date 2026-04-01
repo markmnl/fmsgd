@@ -39,11 +39,6 @@ type pendingTarget struct {
 // retryable recipients. This is a lightweight read-only query — row-level
 // locks are acquired per-delivery in deliverMessage.
 //
-// TODO [Spec]: This query does not distinguish between "to" and "add to"
-// recipients — all are stored in msg_to. Once add-to support is implemented
-// (FMsgHeader.AddTo, storeMsgDetail, loadMsg), ensure add-to recipients are
-// also discovered here and their response codes handled correctly.
-//
 // TODO [Spec]: Spec says to retry "with back-off" (e.g. exponential back-off).
 // Currently uses a fixed RetryInterval. Implement an exponential back-off
 // strategy — e.g. double the wait after each failed attempt per (msg, domain).
@@ -60,6 +55,7 @@ func findPendingTargets() ([]pendingTarget, error) {
 
 	now := timeutil.TimestampNow().Float64()
 
+	// query both msg_to and msg_add_to for pending targets
 	rows, err := db.Query(`
 		SELECT mt.msg_id, mt.addr
 		FROM msg_to mt
@@ -68,6 +64,15 @@ func findPendingTargets() ([]pendingTarget, error) {
 		  AND m.time_sent IS NOT NULL
 		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5))
 		  AND (mt.time_last_attempt IS NULL OR ($1 - mt.time_last_attempt) > $2)
+		  AND ($1 - m.time_sent) < $3
+		UNION ALL
+		SELECT mat.msg_id, mat.addr
+		FROM msg_add_to mat
+		INNER JOIN msg m ON m.id = mat.msg_id
+		WHERE mat.time_delivered IS NULL
+		  AND m.time_sent IS NOT NULL
+		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5))
+		  AND (mat.time_last_attempt IS NULL OR ($1 - mat.time_last_attempt) > $2)
 		  AND ($1 - m.time_sent) < $3
 	`, now, RetryInterval, RetryMaxAge)
 	if err != nil {
@@ -182,7 +187,6 @@ func deliverMessage(target pendingTarget) {
 			log.Printf("ERROR: sender: scan locked addr: %s", err)
 			return
 		}
-		// keep only addresses on the target domain
 		lastAt := strings.LastIndex(addr, "@")
 		if lastAt != -1 && strings.EqualFold(addr[lastAt+1:], target.Domain) {
 			lockedAddrs = append(lockedAddrs, addr)
@@ -193,7 +197,45 @@ func deliverMessage(target pendingTarget) {
 		log.Printf("ERROR: sender: lock rows err for msg %d: %s", target.MsgID, err)
 		return
 	}
-	if len(lockedAddrs) == 0 {
+
+	// Also lock pending msg_add_to rows for this message on the target domain.
+	lockAddToRows, err := tx.Query(`
+		SELECT mat.addr
+		FROM msg_add_to mat
+		INNER JOIN msg m ON m.id = mat.msg_id
+		WHERE mat.msg_id = $1
+		  AND mat.time_delivered IS NULL
+		  AND m.time_sent IS NOT NULL
+		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5))
+		  AND (mat.time_last_attempt IS NULL OR ($2 - mat.time_last_attempt) > $3)
+		  AND ($2 - m.time_sent) < $4
+		FOR UPDATE OF mat SKIP LOCKED
+	`, target.MsgID, now, RetryInterval, RetryMaxAge)
+	if err != nil {
+		log.Printf("ERROR: sender: lock add-to rows for msg %d: %s", target.MsgID, err)
+		return
+	}
+
+	var lockedAddToAddrs []string
+	for lockAddToRows.Next() {
+		var addr string
+		if err := lockAddToRows.Scan(&addr); err != nil {
+			lockAddToRows.Close()
+			log.Printf("ERROR: sender: scan locked add-to addr: %s", err)
+			return
+		}
+		lastAt := strings.LastIndex(addr, "@")
+		if lastAt != -1 && strings.EqualFold(addr[lastAt+1:], target.Domain) {
+			lockedAddToAddrs = append(lockedAddToAddrs, addr)
+		}
+	}
+	lockAddToRows.Close()
+	if err := lockAddToRows.Err(); err != nil {
+		log.Printf("ERROR: sender: lock add-to rows err for msg %d: %s", target.MsgID, err)
+		return
+	}
+
+	if len(lockedAddrs) == 0 && len(lockedAddToAddrs) == 0 {
 		return // already locked by another sender or no longer eligible
 	}
 
@@ -213,22 +255,21 @@ func deliverMessage(target pendingTarget) {
 
 	// Build the list of recipients on the target domain (in order) and
 	// note which ones we locked (i.e. are pending delivery this round). Per spec,
-	// response codes arrive per-recipient in To-field order excluding other domains.
+	// response codes arrive per-recipient in to then add-to order excluding other domains.
 	// TODO check retry logic when some recipients on this domain are not locked
 	// (e.g. already delivered or locked by another sender) — do we still get
 	// per-recipient codes for the locked ones?
-	//
-	// TODO [Spec]: This loop only iterates h.To. Per spec, per-recipient response
-	// codes arrive "in the order they appear in to then add to, excluding recipients
-	// for other domains." Once add-to is implemented (FMsgHeader.AddTo), append
-	// add-to recipients on the target domain AFTER the to recipients.
 	lockedSet := make(map[string]bool)
 	for _, a := range lockedAddrs {
+		lockedSet[strings.ToLower(a)] = true
+	}
+	for _, a := range lockedAddToAddrs {
 		lockedSet[strings.ToLower(a)] = true
 	}
 	type domainRecip struct {
 		addr     string
 		isLocked bool
+		isAddTo  bool
 	}
 	var domainRecips []domainRecip
 	for _, addr := range h.To {
@@ -237,6 +278,17 @@ func deliverMessage(target pendingTarget) {
 			domainRecips = append(domainRecips, domainRecip{
 				addr:     s,
 				isLocked: lockedSet[strings.ToLower(s)],
+				isAddTo:  false,
+			})
+		}
+	}
+	for _, addr := range h.AddTo {
+		if strings.EqualFold(addr.Domain, target.Domain) {
+			s := addr.ToString()
+			domainRecips = append(domainRecips, domainRecip{
+				addr:     s,
+				isLocked: lockedSet[strings.ToLower(s)],
+				isAddTo:  true,
 			})
 		}
 	}
@@ -267,15 +319,11 @@ func deliverMessage(target pendingTarget) {
 	}
 	defer conn.Close()
 
-	// Send header (FMsgHeader.Encode writes version through type)
-	// TODO [Spec]: Encode() is incomplete — it is missing the "add to" field
-	// (uint8 count + addresses when has-add-to flag set), and it always encodes
-	// the topic field even when pid IS set (spec: topic must be absent when pid
-	// is set). It also always encodes the type as a length-prefixed string, but
-	// spec says common-type flag (bit 2) means type is a single uint8 index.
-	// Because the header hash is computed from Encode() output, the outgoing
-	// registration hash (used by the challenge handler) will be WRONG until
-	// Encode() is fixed — challenge verification will fail.
+	// Send header (FMsgHeader.Encode writes version through type, including add-to)
+	// TODO [Spec]: Encode() always encodes the topic field even when pid IS set
+	// (spec: topic must be absent when pid is set). It also always encodes the
+	// type as a length-prefixed string, but spec says common-type flag (bit 2)
+	// means type is a single uint8 index.
 	headerBytes := h.Encode()
 	if _, err := conn.Write(headerBytes); err != nil {
 		log.Printf("ERROR: sender: writing header: %s", err)
@@ -339,11 +387,34 @@ func deliverMessage(target pendingTarget) {
 	now = timeutil.TimestampNow().Float64()
 
 	if code < 100 {
+		// Code 11 (accept header) is a success for add-to notification.
+		if code == AcceptCodeHeader {
+			log.Printf("INFO: sender: msg %d add-to notification accepted by %s (code 11)", target.MsgID, target.Domain)
+			for _, a := range lockedAddrs {
+				if _, err := tx.Exec(`
+					UPDATE msg_to SET time_delivered = $1, response_code = $2
+					WHERE msg_id = $3 AND addr = $4
+				`, now, int(code), target.MsgID, a); err != nil {
+					log.Printf("ERROR: sender: update delivered for %s: %s", a, err)
+				}
+			}
+			for _, a := range lockedAddToAddrs {
+				if _, err := tx.Exec(`
+					UPDATE msg_add_to SET time_delivered = $1, response_code = $2
+					WHERE msg_id = $3 AND addr = $4
+				`, now, int(code), target.MsgID, a); err != nil {
+					log.Printf("ERROR: sender: update delivered add-to for %s: %s", a, err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				log.Printf("ERROR: sender: commit tx for msg %d: %s", target.MsgID, err)
+			} else {
+				committed = true
+			}
+			return
+		}
+
 		// global rejection — update all locked recipients
-		// TODO [Spec]: Code 11 (accept header) is < 100 but is NOT a rejection.
-		// It means "message header received (add-to notification only)" and should
-		// be treated as a success for add-to-only scenarios. Handle code 11
-		// separately before falling into this rejection branch.
 		//
 		// TODO [Spec]: Permanent failures (1 invalid, 2 unsupported version,
 		// 4 too big, 10 duplicate) should NOT be retried. Currently all global
@@ -358,6 +429,14 @@ func deliverMessage(target pendingTarget) {
 				WHERE msg_id = $3 AND addr = $4
 			`, now, int(code), target.MsgID, a); err != nil {
 				log.Printf("ERROR: sender: update last attempt for %s: %s", a, err)
+			}
+		}
+		for _, a := range lockedAddToAddrs {
+			if _, err := tx.Exec(`
+				UPDATE msg_add_to SET time_last_attempt = $1, response_code = $2
+				WHERE msg_id = $3 AND addr = $4
+			`, now, int(code), target.MsgID, a); err != nil {
+				log.Printf("ERROR: sender: update last attempt add-to for %s: %s", a, err)
 			}
 		}
 		if err := tx.Commit(); err != nil {
@@ -386,26 +465,25 @@ func deliverMessage(target pendingTarget) {
 			// TODO well receiving host still attempted delivery to this recipient — do we update response code for it? Spec is not clear on this scenario.
 		}
 		c := codes[i]
-		// TODO [Spec]: Code 11 (accept header) is a success for add-to-only
-		// recipients — treat it like code 200 (mark as delivered). Also handle
-		// codes 102 (user not accepting) and 103 (user undisclosed) which are
-		// per-user codes defined in spec but missing from the response code
-		// constants. Code 102 "not accepting at this time" may be transient.
+		table := "msg_to"
+		if dr.isAddTo {
+			table = "msg_add_to"
+		}
 		if c == RejectCodeAccept {
 			log.Printf("INFO: sender: delivered msg %d to %s", target.MsgID, dr.addr)
-			if _, err := tx.Exec(`
-				UPDATE msg_to SET time_delivered = $1, response_code = 200
+			if _, err := tx.Exec(fmt.Sprintf(`
+				UPDATE %s SET time_delivered = $1, response_code = 200
 				WHERE msg_id = $2 AND addr = $3
-			`, now, target.MsgID, dr.addr); err != nil {
+			`, table), now, target.MsgID, dr.addr); err != nil {
 				log.Printf("ERROR: sender: update delivered for %s: %s", dr.addr, err)
 			}
 		} else {
 			log.Printf("WARN: sender: msg %d to %s rejected: %s (%d)",
 				target.MsgID, dr.addr, responseCodeName(c), c)
-			if _, err := tx.Exec(`
-				UPDATE msg_to SET time_last_attempt = $1, response_code = $2
+			if _, err := tx.Exec(fmt.Sprintf(`
+				UPDATE %s SET time_last_attempt = $1, response_code = $2
 				WHERE msg_id = $3 AND addr = $4
-			`, now, int(c), target.MsgID, dr.addr); err != nil {
+			`, table), now, int(c), target.MsgID, dr.addr); err != nil {
 				log.Printf("ERROR: sender: update last attempt for %s: %s", dr.addr, err)
 			}
 		}

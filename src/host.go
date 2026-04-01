@@ -374,22 +374,46 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		num--
 	}
 
-	// TODO [Spec 1.4.v.b / flag bit 1]: Parse the "add to" field when the
-	// has-add-to flag (bit 1) is set. This requires:
-	//  - Reading uint8 count + list of additional recipient addresses.
-	//  - Verifying add-to addresses are distinct from each other and from "to"
-	//    addresses (case-insensitive), per spec step 1.4.i.a.
-	//  - Adding an AddTo []FMsgAddress field to FMsgHeader.
-	//  - Implementing the pid/add-to decision tree from spec step 1.4.v.b:
-	//    * If add-to exists, pid MUST also exist; else reject code 1.
-	//    * If any add-to recipients are for our domain, continue normally
-	//      (pid message does NOT have to be stored).
-	//    * If NO add-to recipients are for our domain:
-	//      - pid MUST refer to a stored message per "Verifying Message Stored";
-	//        else reject code 6.
-	//      - At least one "to" recipient must be for our domain; else reject 1.
-	//      - Record message header, respond ACCEPT code 11 (accept header),
-	//        close connection (no further data to download).
+	// parse "add to" field when has-add-to flag (bit 1) is set
+	if flags&FlagHasAddTo != 0 {
+		// add to requires pid per spec 1.4.v.b.a
+		if flags&FlagHasPid == 0 {
+			codes := []byte{RejectCodeInvalid}
+			if err := rejectAccept(c, codes); err != nil {
+				return h, r, err
+			}
+			return h, r, fmt.Errorf("add to exists but pid does not")
+		}
+
+		addToCount, err := r.ReadByte()
+		if err != nil {
+			return h, r, err
+		}
+		if addToCount == 0 {
+			codes := []byte{RejectCodeInvalid}
+			if err := rejectAccept(c, codes); err != nil {
+				return h, r, err
+			}
+			return h, r, fmt.Errorf("add to flag set but count is 0")
+		}
+		for addToCount > 0 {
+			addr, err := readAddress(r)
+			if err != nil {
+				return h, r, err
+			}
+			key := strings.ToLower(addr.ToString())
+			if seen[key] {
+				codes := []byte{RejectCodeInvalid}
+				if err := rejectAccept(c, codes); err != nil {
+					return h, r, err
+				}
+				return h, r, fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
+			}
+			seen[key] = true
+			h.AddTo = append(h.AddTo, *addr)
+			addToCount--
+		}
+	}
 
 	// read timestamp
 	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
@@ -477,6 +501,68 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	// TERMINATE the message exchange (abort connection, no reject code sent).
 	// Currently this check only happens inside challenge() and is skipped
 	// entirely when skip-challenge is allowed.
+
+	// add-to pid decision tree per spec 1.4.v.b
+	if len(h.AddTo) > 0 {
+		// check if any add-to recipients are for our domain
+		addToHasOurDomain := false
+		for _, addr := range h.AddTo {
+			if strings.EqualFold(addr.Domain, Domain) {
+				addToHasOurDomain = true
+				break
+			}
+		}
+		if !addToHasOurDomain {
+			// none of the add-to recipients are for our domain — this is an
+			// add-to notification for existing "to" recipients on our domain.
+
+			// pid must refer to a stored message per "Verifying Message Stored"
+			parentID, err := lookupMsgIdByHash(h.Pid)
+			if err != nil {
+				return h, r, err
+			}
+			if parentID == 0 {
+				codes := []byte{RejectCodeParentNotFound}
+				if err := rejectAccept(c, codes); err != nil {
+					return h, r, err
+				}
+				return h, r, fmt.Errorf("add-to notification: parent not found for pid %s", hex.EncodeToString(h.Pid))
+			}
+
+			// at least one "to" recipient must be for our domain
+			toHasOurDomain := false
+			for _, addr := range h.To {
+				if strings.EqualFold(addr.Domain, Domain) {
+					toHasOurDomain = true
+					break
+				}
+			}
+			if !toHasOurDomain {
+				codes := []byte{RejectCodeInvalid}
+				if err := rejectAccept(c, codes); err != nil {
+					return h, r, err
+				}
+				return h, r, fmt.Errorf("add-to notification: no 'to' recipients for our domain %s", Domain)
+			}
+
+			// record this message header and respond accept header (code 11)
+			if err := storeMsgHeaderOnly(h); err != nil {
+				codes := []byte{RejectCodeUndisclosed}
+				if err2 := rejectAccept(c, codes); err2 != nil {
+					return h, r, err2
+				}
+				return h, r, fmt.Errorf("add-to notification: storing header: %w", err)
+			}
+			codes := []byte{AcceptCodeHeader}
+			if err := rejectAccept(c, codes); err != nil {
+				return h, r, err
+			}
+			log.Printf("INFO: add-to notification accepted (code 11) for pid %s", hex.EncodeToString(h.Pid))
+			return nil, r, nil // nil header signals handled (like challenge)
+		}
+		// else: add-to recipients are for our domain, continue normally
+		// (pid message does NOT have to be already stored per spec 1.4.v.b.b)
+	}
 
 	// TODO [Spec 1.4.v.c]: When pid exists and add-to does not:
 	//  a. The message or message header pid refers to MUST be verified as stored
@@ -621,18 +707,20 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	// code 10 (duplicate) and close. Currently the duplicate check happens
 	// AFTER downloading all data, wasting bandwidth on duplicates.
 
-	// filter to our domain recipients
-	// TODO [Spec 3.4.i]: Per spec step 3.4, response codes must be sent for
-	// each recipient on our domain in the order they appear in "to" THEN
-	// "add to". Currently only "to" is considered (add-to not implemented).
+	// filter to our domain recipients in "to" then "add to" order per spec 3.4.i
 	addrs := []FMsgAddress{}
 	for _, addr := range h.To {
-		if addr.Domain == Domain {
+		if strings.EqualFold(addr.Domain, Domain) {
+			addrs = append(addrs, addr)
+		}
+	}
+	for _, addr := range h.AddTo {
+		if strings.EqualFold(addr.Domain, Domain) {
 			addrs = append(addrs, addr)
 		}
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("%w our domain: %s, not in recipient list: %s", ErrProtocolViolation, Domain, h.To)
+		return fmt.Errorf("%w our domain: %s, not in recipient list", ErrProtocolViolation, Domain)
 	}
 	codes := make([]byte, len(addrs))
 
@@ -717,7 +805,13 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	}
 
 	// validate each recipient and copy message for accepted ones
-	acceptedAddrs := []FMsgAddress{}
+	// Build a set of add-to addresses for later classification
+	addToSet := make(map[string]bool)
+	for _, addr := range h.AddTo {
+		addToSet[strings.ToLower(addr.ToString())] = true
+	}
+	acceptedTo := []FMsgAddress{}
+	acceptedAddTo := []FMsgAddress{}
 	var primaryFilepath string
 	for i, addr := range addrs {
 		code, err := validateMsgRecvForAddr(h, &addr)
@@ -764,20 +858,27 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 		}
 
 		codes[i] = RejectCodeAccept
-		acceptedAddrs = append(acceptedAddrs, addr)
+		if addToSet[strings.ToLower(addr.ToString())] {
+			acceptedAddTo = append(acceptedAddTo, addr)
+		} else {
+			acceptedTo = append(acceptedTo, addr)
+		}
 		if primaryFilepath == "" {
 			primaryFilepath = fp
 		}
 	}
 
 	// store message details once for all accepted recipients
-	if len(acceptedAddrs) > 0 {
+	if len(acceptedTo) > 0 || len(acceptedAddTo) > 0 {
 		origTo := h.To
-		h.To = acceptedAddrs
+		origAddTo := h.AddTo
+		h.To = acceptedTo
+		h.AddTo = acceptedAddTo
 		h.Filepath = primaryFilepath
 		if err := storeMsgDetail(h); err != nil {
 			log.Printf("ERROR: storing message: %s", err)
 			h.To = origTo
+			h.AddTo = origAddTo
 			for i := range codes {
 				if codes[i] == RejectCodeAccept {
 					codes[i] = RejectCodeUndisclosed
@@ -785,8 +886,10 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 			}
 		} else {
 			h.To = origTo
-			for i := range acceptedAddrs {
-				if err := postMsgStatRecv(&acceptedAddrs[i], h.Timestamp, int(h.Size)); err != nil {
+			h.AddTo = origAddTo
+			allAccepted := append(acceptedTo, acceptedAddTo...)
+			for i := range allAccepted {
+				if err := postMsgStatRecv(&allAccepted[i], h.Timestamp, int(h.Size)); err != nil {
 					log.Printf("WARN: Failed to post msg recv stat: %s", err)
 				}
 			}
