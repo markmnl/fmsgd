@@ -29,18 +29,15 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
-	// TODO: Flag bit assignments do not match the revised spec. Spec defines:
+	// Flag bit assignments per SPEC.md:
 	// bit 0 = has pid, bit 1 = has add to, bit 2 = common type, bit 3 = important,
 	// bit 4 = no reply, bit 5 = deflate, bits 6-7 = reserved.
-	// Current implementation is missing FlagHasAddTo (bit 1) and FlagCommonType (bit 2),
-	// has FlagImportant on bit 1 (spec: bit 3), FlagNoReply on bit 3 (spec: bit 4),
-	// and defines FlagSkipChallenge (bit 4) which does not exist in the spec.
-	// All flag definitions and their usages must be realigned to the spec.
-	FlagHasPid        uint8 = 1
-	FlagImportant     uint8 = 1 << 1
-	FlagNoReply       uint8 = 1 << 3
-	FlagSkipChallenge uint8 = 1 << 4
-	FlagDeflate       uint8 = 1 << 5
+	FlagHasPid     uint8 = 1
+	FlagHasAddTo   uint8 = 1 << 1
+	FlagCommonType uint8 = 1 << 2
+	FlagImportant  uint8 = 1 << 3
+	FlagNoReply    uint8 = 1 << 4
+	FlagDeflate    uint8 = 1 << 5
 
 	RejectCodeInvalid              uint8 = 1
 	RejectCodeUnsupportedVersion   uint8 = 2
@@ -52,19 +49,12 @@ const (
 	RejectCodeFutureTime           uint8 = 8
 	RejectCodeTimeTravel           uint8 = 9
 	RejectCodeDuplicate            uint8 = 10
-	// TODO: Spec defines code 11 as "accept header" (message header received for
-	// add-to-only messages). RejectCodeMustChallenge (11) and
-	// RejectCodeCannotChallenge (12) do not exist in the spec and should be
-	// replaced with the spec-defined code 11 = accept header.
-	RejectCodeMustChallenge   uint8 = 11
-	RejectCodeCannotChallenge uint8 = 12
+	AcceptCodeHeader               uint8 = 11
 
-	RejectCodeUserUnknown uint8 = 100
-	RejectCodeUserFull    uint8 = 101
-	// TODO: Add missing per-user response codes from the spec:
-	// 102 = user not accepting (known user but not accepting new messages)
-	// 103 = user undisclosed (no reason given; MAY be used instead of 100-102
-	//       so Host B does not have to disclose the reason).
+	RejectCodeUserUnknown      uint8 = 100
+	RejectCodeUserFull         uint8 = 101
+	RejectCodeUserNotAccepting uint8 = 102
+	RejectCodeUserUndisclosed  uint8 = 103
 
 	RejectCodeAccept uint8 = 200
 )
@@ -92,14 +82,16 @@ func responseCodeName(code uint8) string {
 		return "time travel"
 	case RejectCodeDuplicate:
 		return "duplicate"
-	case RejectCodeMustChallenge:
-		return "must challenge"
-	case RejectCodeCannotChallenge:
-		return "cannot challenge"
+	case AcceptCodeHeader:
+		return "accept header"
 	case RejectCodeUserUnknown:
 		return "user unknown"
 	case RejectCodeUserFull:
 		return "user full"
+	case RejectCodeUserNotAccepting:
+		return "user not accepting"
+	case RejectCodeUserUndisclosed:
+		return "user undisclosed"
 	case RejectCodeAccept:
 		return "accept"
 	default:
@@ -119,7 +111,6 @@ var MinDownloadRate float64 = 5000
 var MinUploadRate float64 = 5000
 var ReadBufferSize = 1600
 var MaxMessageSize = uint32(1024 * 10)
-var AllowSkipChallenge = 0
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
@@ -136,7 +127,6 @@ func loadEnvConfig() {
 	MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
 	ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 	MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
-	AllowSkipChallenge = env.GetIntDefault("FMSG_ALLOW_SKIP_CHALLENGE", 0)
 }
 
 // Updates DataDir from environment, panics if not a valid directory.
@@ -505,21 +495,9 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 // at address in connection supplied by verifying the remote IP is in the
 // sender's _fmsg.<sender-domain> authorised IP set.
 // TODO [Spec step 2]: The spec defines challenge modes (NEVER, ALWAYS,
-// HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices — the
-// FlagSkipChallenge mechanism is not part of the spec. Refactor to use an
-// implementation-defined challenge mode instead of a sender-controlled flag.
+// HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices.
+// Currently defaults to ALWAYS. Implement configurable challenge mode.
 func challenge(conn net.Conn, h *FMsgHeader) error {
-
-	// skip challenge if sender requested it and we allow it
-	if h.Flags&FlagSkipChallenge != 0 {
-		if AllowSkipChallenge == 1 {
-			log.Printf("INFO: skip challenge requested and allowed from %s", conn.RemoteAddr().String())
-			return nil
-		}
-		log.Printf("WARN: skip challenge requested but not allowed from %s", conn.RemoteAddr().String())
-		rejectAccept(conn, []byte{RejectCodeMustChallenge})
-		return fmt.Errorf("skip challenge requested but not allowed")
-	}
 
 	// verify remote IP is authorised by sender's _fmsg DNS record
 	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
@@ -598,7 +576,7 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 	// undisclosed). Currently RejectCodeUserUnknown (100) is returned which is
 	// incorrect — code 100 means the address is unknown to the host.
 	if !detail.AcceptingNew {
-		return RejectCodeUserUnknown, nil
+		return RejectCodeUserNotAccepting, nil
 	}
 
 	// check user limits
