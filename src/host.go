@@ -480,9 +480,23 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 
 	log.Printf("INFO: <-- MSG\n%s", h)
 
-\t// TODO [Spec 1.4.ii]: DNS verification of sender's IP address MUST be\n\t// performed here during header exchange (not deferred to the challenge\n\t// step). Host B must resolve _fmsg.<from-domain> and verify the incoming\n\t// connection's IP is in the authorised set. If not authorised, Host B MUST\n\t// TERMINATE the message exchange (abort connection, no reject code sent).\n\t// Currently this check only happens inside challenge() and is skipped\n\t// entirely when skip-challenge is allowed.
+	// TODO [Spec 1.4.ii]: DNS verification of sender's IP address MUST be
+	// performed here during header exchange (not deferred to the challenge
+	// step). Host B must resolve _fmsg.<from-domain> and verify the incoming
+	// connection's IP is in the authorised set. If not authorised, Host B MUST
+	// TERMINATE the message exchange (abort connection, no reject code sent).
+	// Currently this check only happens inside challenge() and is skipped
+	// entirely when skip-challenge is allowed.
 
-	// TODO [Spec 1.4.v.c]: When pid exists and add-to does not:\n\t//  a. The message or message header pid refers to MUST be verified as stored\n\t//     per \"Verifying Message Stored\"; else reject code 6 (parent not found).\n\t//     \"Verifying Message Stored\" means: the digest matches a previously\n\t//     accepted message (code 200) or accepted header (code 11), AND the\n\t//     corresponding data currently exists on the host.\n\t//  b. The stored parent's time MUST be before the incoming message's time;\n\t//     else reject code 9 (time travel).\n\t//  Both checks should be here (step 1), not deferred to downloadMessage.
+	// TODO [Spec 1.4.v.c]: When pid exists and add-to does not:
+	//  a. The message or message header pid refers to MUST be verified as stored
+	//     per "Verifying Message Stored"; else reject code 6 (parent not found).
+	//     "Verifying Message Stored" means: the digest matches a previously
+	//     accepted message (code 200) or accepted header (code 11), AND the
+	//     corresponding data currently exists on the host.
+	//  b. The stored parent's time MUST be before the incoming message's time;
+	//     else reject code 9 (time travel).
+	//  Both checks should be here (step 1), not deferred to downloadMessage.
 
 	return h, r, nil
 }

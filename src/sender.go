@@ -38,6 +38,19 @@ type pendingTarget struct {
 // findPendingTargets discovers (msg_id, domain) pairs with undelivered,
 // retryable recipients. This is a lightweight read-only query — row-level
 // locks are acquired per-delivery in deliverMessage.
+//
+// TODO [Spec]: This query does not distinguish between "to" and "add to"
+// recipients — all are stored in msg_to. Once add-to support is implemented
+// (FMsgHeader.AddTo, storeMsgDetail, loadMsg), ensure add-to recipients are
+// also discovered here and their response codes handled correctly.
+//
+// TODO [Spec]: Spec says to retry "with back-off" (e.g. exponential back-off).
+// Currently uses a fixed RetryInterval. Implement an exponential back-off
+// strategy — e.g. double the wait after each failed attempt per (msg, domain).
+//
+// TODO [Spec]: Per-user code 101 (user full = "insufficient resources for
+// specific recipient") is analogous to global code 5 and is likely transient.
+// Consider adding 101 to the retryable set alongside codes 3 and 5.
 func findPendingTargets() ([]pendingTarget, error) {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
@@ -201,7 +214,14 @@ func deliverMessage(target pendingTarget) {
 	// Build the list of recipients on the target domain (in order) and
 	// note which ones we locked (i.e. are pending delivery this round). Per spec,
 	// response codes arrive per-recipient in To-field order excluding other domains.
-	// TODO check rety logic when some recipients on this domain are not locked (e.g. already delivered or locked by another sender) — do we still get per-recipient codes for the locked ones?
+	// TODO check retry logic when some recipients on this domain are not locked
+	// (e.g. already delivered or locked by another sender) — do we still get
+	// per-recipient codes for the locked ones?
+	//
+	// TODO [Spec]: This loop only iterates h.To. Per spec, per-recipient response
+	// codes arrive "in the order they appear in to then add to, excluding recipients
+	// for other domains." Once add-to is implemented (FMsgHeader.AddTo), append
+	// add-to recipients on the target domain AFTER the to recipients.
 	lockedSet := make(map[string]bool)
 	for _, a := range lockedAddrs {
 		lockedSet[strings.ToLower(a)] = true
@@ -223,6 +243,9 @@ func deliverMessage(target pendingTarget) {
 
 	// --- network delivery ---
 
+	// TODO [Spec]: DNSSEC validation SHOULD be performed on the DNS lookup.
+	// If DNSSEC validation fails the connection MUST terminate (no retry).
+	// lookupAuthorisedIPs does not currently perform or report DNSSEC validation.
 	targetIPs, err := lookupAuthorisedIPs(target.Domain)
 	if err != nil {
 		log.Printf("ERROR: sender: DNS lookup for _fmsg.%s failed: %s", target.Domain, err)
@@ -245,11 +268,24 @@ func deliverMessage(target pendingTarget) {
 	defer conn.Close()
 
 	// Send header (FMsgHeader.Encode writes version through type)
+	// TODO [Spec]: Encode() is incomplete — it is missing the "add to" field
+	// (uint8 count + addresses when has-add-to flag set), and it always encodes
+	// the topic field even when pid IS set (spec: topic must be absent when pid
+	// is set). It also always encodes the type as a length-prefixed string, but
+	// spec says common-type flag (bit 2) means type is a single uint8 index.
+	// Because the header hash is computed from Encode() output, the outgoing
+	// registration hash (used by the challenge handler) will be WRONG until
+	// Encode() is fixed — challenge verification will fail.
 	headerBytes := h.Encode()
 	if _, err := conn.Write(headerBytes); err != nil {
 		log.Printf("ERROR: sender: writing header: %s", err)
 		return
 	}
+
+	// TODO [Spec]: Encode() should include size and attachment headers as part
+	// of the header (spec defines header as all fields through attachment headers).
+	// Currently size and attachment count are written separately here, which is
+	// correct on the wire but means they are NOT included in the header hash.
 
 	// size (uint32 LE)
 	if err := binary.Write(conn, binary.LittleEndian, h.Size); err != nil {
@@ -257,7 +293,9 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	// TODO: attachment_count and attachment headers
+	// TODO [Spec]: Write actual attachment headers here. Each attachment header
+	// is: flags (uint8), type (uint8 + [ASCII string]), filename (uint8 + UTF-8),
+	// size (uint32). Currently hardcoded to 0 attachment count.
 	if err := binary.Write(conn, binary.LittleEndian, uint8(0)); err != nil {
 		log.Printf("ERROR: sender: writing attachment count: %s", err)
 		return
@@ -282,7 +320,9 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	// TODO: send attachment bodies
+	// TODO [Spec]: Send attachment bodies — sequential byte sequences following
+	// the message data, with boundaries determined by the attachment header sizes.
+	// Each attachment's data length must match the size declared in its header.
 
 	// --- read response ---
 	// A code < 100 is a global rejection (single byte for all recipients).
@@ -300,6 +340,16 @@ func deliverMessage(target pendingTarget) {
 
 	if code < 100 {
 		// global rejection — update all locked recipients
+		// TODO [Spec]: Code 11 (accept header) is < 100 but is NOT a rejection.
+		// It means "message header received (add-to notification only)" and should
+		// be treated as a success for add-to-only scenarios. Handle code 11
+		// separately before falling into this rejection branch.
+		//
+		// TODO [Spec]: Permanent failures (1 invalid, 2 unsupported version,
+		// 4 too big, 10 duplicate) should NOT be retried. Currently all global
+		// codes are stored identically; findPendingTargets only retries codes
+		// 3 and 5, which is correct for global codes. But ensure code 10
+		// (duplicate) is explicitly recognised as permanent and not retried.
 		log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 			target.MsgID, target.Domain, responseCodeName(code), code)
 		for _, a := range lockedAddrs {
@@ -336,6 +386,11 @@ func deliverMessage(target pendingTarget) {
 			// TODO well receiving host still attempted delivery to this recipient — do we update response code for it? Spec is not clear on this scenario.
 		}
 		c := codes[i]
+		// TODO [Spec]: Code 11 (accept header) is a success for add-to-only
+		// recipients — treat it like code 200 (mark as delivered). Also handle
+		// codes 102 (user not accepting) and 103 (user undisclosed) which are
+		// per-user codes defined in spec but missing from the response code
+		// constants. Code 102 "not accepting at this time" may be transient.
 		if c == RejectCodeAccept {
 			log.Printf("INFO: sender: delivered msg %d to %s", target.MsgID, dr.addr)
 			if _, err := tx.Exec(`
