@@ -2,7 +2,7 @@
 
 ## Protocol Identity
 
--   Protocol: fmsg (fmsg) 
+-   Protocol: fmsg (f-message)
 -   Current Version: 1
 -   All messages are binary encoded.
 
@@ -167,6 +167,57 @@ and can be retrieved.
 | MAX_SIZE        | 1048576       | Maximum allowed total size in bytes (data + all attachment sizes)         |
 | MAX_MESSAGE_AGE | 700000        | Maximum age since message time for acceptance (seconds)                   |
 | MAX_TIME_SKEW   | 20            | Maximum tolerance for message time ahead of current time (seconds)        |
+
+------------------------------------------------------------------------
+
+## Protocol Steps Summary
+
+### 1. Connection and Header Exchange
+
+Host A connects to Host B via first responsive authorised IP from Domain Resolution.
+Host A transmits the message. Host B reads the first byte to determine type
+(version vs CHALLENGE), then downloads and verifies the remaining header.
+Verification includes: recipient uniqueness, sender IP authorisation, size limits,
+time bounds, common type mappings, and pid/add-to rules.
+
+### 2. The Automatic Challenge
+
+Host B MAY challenge Host A (modes: NEVER, ALWAYS, HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN).
+Host B opens Connection 2 to the **same IP** as Connection 1, sends a CHALLENGE
+(version byte + message header hash). Host A verifies the header hash matches its
+outgoing message; if not → TERMINATE. Host A responds with the message hash.
+Host B keeps the response hash for later verification. Both close Connection 2.
+
+### 3. Integrity Verification, Per-Recipient Response and Disposition
+
+Before downloading remaining data: if challenge was completed, check for duplicate
+via message hash → code 10. Host B downloads data + attachments. If challenge was
+completed, verify computed hash matches challenge response → TERMINATE on mismatch.
+Host B sends per-recipient ACCEPT/REJECT codes in _to_ then _add to_ order
+(excluding other domains).
+
+### 4. Sending a Message
+
+Host A determines unique recipient domains (excluding own). For each domain:
+resolve authorised IPs, connect in order until responsive, register outgoing message
+header hash, transmit complete message in wire format order, handle any incoming
+CHALLENGE per Handling a Challenge, read response codes. Global code (<100) applies
+to all recipients on that domain; per-recipient codes (≥100) arrive in _to_ then
+_add to_ order. Host A records codes and retries transient failures
+(3 undisclosed, 5 insufficient resources) with back-off. Permanent failures
+(1 invalid, 2 unsupported version, 4 too big, 10 duplicate) are not retried.
+
+### Handling a Challenge
+
+While transmitting on Connection 1, Host A MUST listen for incoming connections.
+On receiving a connection: read first byte — if >128 and (256 - value) is a
+supported version, this is a CHALLENGE; otherwise TERMINATE. Read the 32-byte
+header hash. Match it against a currently outgoing message's header hash;
+if no match → TERMINATE. Compute the message hash and transmit it as CHALLENGE
+RESPONSE. Close the connection.
+
+Host A MUST maintain a record of outgoing messages keyed by header hash,
+created before transmission begins and removed after the exchange completes.
 
 ------------------------------------------------------------------------
 
