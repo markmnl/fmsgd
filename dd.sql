@@ -17,7 +17,7 @@ create table if not exists msg (
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null, 
     type          	varchar(255)    	not null,
-    sha256        	bytea           	unique not null,
+    sha256        	bytea           	unique,
     psha256       	bytea,
 	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
     filepath      	text            	not null
