@@ -10,7 +10,9 @@ create table if not exists msg (
     id            	bigserial       	primary key,
 	version			int					not null,
     pid           	bigint          	references msg (id),
-	flags		  	int					not null,
+	no_reply		boolean				not null default false,
+	is_important	boolean				not null default false,
+	is_deflate		boolean				not null default false,
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null, 
@@ -67,4 +69,11 @@ $$ language plpgsql;
 drop trigger if exists trg_msg_to_insert on msg_to;
 create trigger trg_msg_to_insert
     after insert on msg_to
+    for each row execute function notify_msg_to_insert();
+
+-- notify when a new msg_add_to row is inserted with null time_delivered so the
+-- sender can pick it up immediately instead of waiting for the next poll.
+drop trigger if exists trg_msg_add_to_insert on msg_add_to;
+create trigger trg_msg_add_to_insert
+    after insert on msg_add_to
     for each row execute function notify_msg_to_insert();

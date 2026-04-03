@@ -98,11 +98,10 @@ Currently only v==255 is handled.
 
 ## P2 — Sending path (sender.go) correctness
 
-### 21. Include add-to recipients in domain recipient list
+### ~~21. Include add-to recipients in domain recipient list~~ DONE
 **File:** `sender.go` `deliverMessage()`  
-`domainRecips` only iterates `h.To`. Per spec, per-recipient codes arrive in
-"to then add to" order. Append add-to recipients on the target domain after to
-recipients.
+`domainRecips` already iterates both `h.To` and `h.AddTo` in order, with
+`isAddTo` flag set appropriately. Implemented as part of the add-to feature.
 
 ### 22. Write attachment headers and attachment bodies
 **File:** `sender.go` `deliverMessage()`  

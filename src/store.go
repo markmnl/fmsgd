@@ -82,7 +82,9 @@ func storeMsgDetail(msg *FMsgHeader) error {
 
 	var msgID int64
 	err = tx.QueryRow(`insert into msg (version
-	, flags
+	, no_reply
+	, is_important
+	, is_deflate
 	, time_sent
 	, from_addr
 	, topic
@@ -91,10 +93,12 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 returning id`,
 		msg.Version,
-		msg.Flags,
+		msg.Flags&FlagNoReply != 0,
+		msg.Flags&FlagImportant != 0,
+		msg.Flags&FlagDeflate != 0,
 		msg.Timestamp,
 		msg.From.ToString(),
 		msg.Topic,
@@ -184,7 +188,9 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 
 	var msgID int64
 	err = tx.QueryRow(`insert into msg (version
-	, flags
+	, no_reply
+	, is_important
+	, is_deflate
 	, time_sent
 	, from_addr
 	, topic
@@ -193,10 +199,12 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 returning id`,
 		msg.Version,
-		msg.Flags,
+		msg.Flags&FlagNoReply != 0,
+		msg.Flags&FlagImportant != 0,
+		msg.Flags&FlagDeflate != 0,
 		msg.Timestamp,
 		msg.From.ToString(),
 		msg.Topic,
@@ -260,14 +268,15 @@ returning id`,
 // should populate FMsgHeader.Attachments so the sender can write attachment
 // headers and data on the wire and compute a correct header/message hash.
 func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
-	var version, flags, size int
+	var version, size int
+	var noReply, isImportant, isDeflate bool
 	var pid []byte
 	var fromAddr, topic, typ, filepath string
 	var timeSent float64
 	err := tx.QueryRow(`
-		SELECT version, flags, psha256, from_addr, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, psha256, from_addr, topic, type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&version, &flags, &pid, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
 	if err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
 	}
@@ -327,9 +336,29 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 		return nil, fmt.Errorf("add-to recipients query err for msg %d: %w", msgID, err)
 	}
 
+	// Compute flags bitfield from stored booleans and loaded data.
+	// has_pid and has_add_to are derived from actual data rather than stored,
+	// so add-to recipients added after the original message are included.
+	var flags uint8
+	if len(pid) > 0 {
+		flags |= FlagHasPid
+	}
+	if len(allAddTo) > 0 {
+		flags |= FlagHasAddTo
+	}
+	if noReply {
+		flags |= FlagNoReply
+	}
+	if isImportant {
+		flags |= FlagImportant
+	}
+	if isDeflate {
+		flags |= FlagDeflate
+	}
+
 	return &FMsgHeader{
 		Version:   uint8(version),
-		Flags:     uint8(flags),
+		Flags:     flags,
 		Pid:       pid,
 		From:      *from,
 		To:        allTo,
