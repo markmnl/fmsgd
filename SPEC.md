@@ -10,13 +10,13 @@
 
 ## Wire Format (Field Order -- MUST NOT CHANGE)
 
-1.  version (uint8) -- 1..127 = fmsg version; 128..255 = CHALLENGE (version = 256 - value)
+1.  version (uint8) -- 1..127 = fmsg version; 129..255 = CHALLENGE (version = 256 - value); 0 and 128 are undefined
 2.  flags (uint8)
 3.  [pid] (32 byte SHA-256 hash) -- present only if flag bit 0 set
 4.  from (uint8 + UTF-8 address)
 5.  to (uint8 count + list of addresses, distinct case-insensitive, at least one)
 6.  [add to] (uint8 count + list of addresses) -- present only if flag bit 1 set, distinct case-insensitive, at least one
-7.  time (float64 POSIX timestamp)
+7.  time (float64 POSIX timestamp, stamped by sender's host when message acquired)
 8.  [topic] (uint8 + UTF-8 string) -- present only when pid is NOT set, may be 0-length
 9.  type (uint8 common-type index when flag bit 2 set; otherwise uint8 length + ASCII MIME string per RFC 6838)
 10. size (uint32, data size in bytes, 0 or greater)
@@ -26,6 +26,8 @@
 
 All multi-byte integers are little-endian.
 All strings are prefixed with uint8 length.
+_case-insensitive_ means byte-wise equality after Unicode default case folding (locale-independent).
+TERMINATE means tear down all connection(s) with the remote host immediately.
 
 ------------------------------------------------------------------------
 
@@ -35,9 +37,11 @@ All strings are prefixed with uint8 length.
 -   When pid exists the entire topic field MUST NOT be included on the wire.
 -   Root messages MUST NOT include pid.
 -   Reply messages MUST include pid.
--   All recipients (to + add to combined) MUST be distinct (case-insensitive).
--   pid references previous message hash if from was in to of previous message;
-    references previous message header hash if from was only in add to.
+-   All recipients in to MUST be distinct (case-insensitive).
+-   All recipients in add to MUST be distinct (case-insensitive).
+-   pid always references the previous message hash.
+-   When add to exists, pid MUST also exist.
+-   A sender (from) MUST have been a participant in the message referenced by pid.
 -   Data size MUST match the declared size field.
 -   Attachment count MUST fit within uint8 range.
 
@@ -136,13 +140,14 @@ in _to_ then _add to_, excluding recipients for other domains.
 | 7    | too old                | timestamp is too far in the past for this host to accept           |
 | 8    | future time            | timestamp is too far in the future for this host to accept         |
 | 9    | time travel            | timestamp is before parent timestamp                               |
-| 10   | duplicate              | message has already been received                                  |
-| 11   | accept header          | message header received (add-to notification only)                 |
+| 10   | duplicate              | message has already been received for all recipients on this host  |
+| 11   | accept add to          | additional recipients received                                     |
 |      |                        |                                                                    |
 | 100  | user unknown           | the recipient is unknown by this host                              |
 | 101  | user full              | insufficient resources for specific recipient                      |
 | 102  | user not accepting     | user is known but not accepting new messages at this time          |
-| 103  | user undisclosed       | no reason given (MAY be used instead of 100-102 to avoid disclosure)|
+| 103  | user duplicate         | message has already been received for this recipient               |
+| 105  | user undisclosed       | no reason given (MAY be used instead of 100-103 to avoid disclosure)|
 |      |                        |                                                                    |
 | 200  | accept                 | message received for recipient                                     |
 
@@ -154,9 +159,15 @@ A **message** is verified stored if: the SHA-256 digest exactly matches a
 previously accepted (code 200) message, and that message currently exists and
 can be retrieved.
 
-A **message header** is verified stored if: the SHA-256 digest exactly matches
-a previously accepted (code 11) message header, and that header currently exists
+OR the SHA-256 digest exactly matches the digest computed over message bytes
+with add to recipients included and add to flag set, previously accepted
+(code 11, additional recipients received), and that message currently exists
 and can be retrieved.
+
+NOTE: Multiple add to messages may arrive for the same pid, each with a
+different batch of additional recipients. The host MUST record each batch
+individually (not accumulate) so the exact message bytes can be reconstructed
+per batch for hash verification.
 
 ------------------------------------------------------------------------
 
@@ -177,16 +188,44 @@ and can be retrieved.
 Host A connects to Host B via first responsive authorised IP from Domain Resolution.
 Host A transmits the message. Host B reads the first byte to determine type
 (version vs CHALLENGE), then downloads and verifies the remaining header.
-Verification includes: recipient uniqueness, sender IP authorisation, size limits,
-time bounds, common type mappings, and pid/add-to rules.
+
+Verification includes: at least one recipient in to, recipient distinctness
+(to and add to checked separately), at least one recipient for Host B's domain,
+sender IP authorisation, size limits, time bounds, and common type mappings.
+
+pid/add-to rules:
+-   No pid, no add to → first message in thread, continue normally.
+-   pid exists, no add to → pid MUST be verified stored; parent time MUST be
+    before message time. NOTE: Verified stored checks the host has the parent,
+    not that every recipient still has it in their mailbox. Implementations
+    SHOULD consider restoring the parent to a recipient's mailbox if deleted.
+-   add to exists → pid MUST also exist, otherwise reject (code 1).
+    -   If any add to recipients are for Host B → message download continues in
+        full (pid references previous message Host B might not have).
+    -   If no add to recipients are for Host B → only the message header is
+        sent (no data/attachments). pid MUST match a message originally accepted
+        with code 200 (not code 11, preventing add to chaining); code 6 if not
+        found; parent time MUST be before message time (code 9).
+        Host B records the new add to recipients for future hash reconstruction,
+        responds code 11 (additional recipients received), closes connection.
+        NOTE: Implementations SHOULD consider restoring the referenced message to
+        a recipient's mailbox if previously deleted, so newly added recipients
+        have proper thread context.
 
 ### 2. The Automatic Challenge
 
 Host B MAY challenge Host A (modes: NEVER, ALWAYS, HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN).
-Host B opens Connection 2 to the **same IP** as Connection 1, sends a CHALLENGE
-(version byte + message header hash). Host A verifies the header hash matches its
-outgoing message; if not → TERMINATE. Host A responds with the message hash.
-Host B keeps the response hash for later verification. Both close Connection 2.
+Host B MUST verify sender IP is in the authorised set for the from domain
+**before** opening Connection 2. Host B opens Connection 2 to the **same IP** as
+Connection 1, sends a CHALLENGE (version byte + message header hash). Host A
+verifies the header hash matches its outgoing message; if not → TERMINATE. Host A
+responds with the message hash. Host B keeps the response hash for later
+verification. Both close Connection 2.
+
+HAS_NOT_PARTICIPATED is particularly important for messages with add to recipients
+for Host B's domain — Host B may not have the parent referenced by pid and cannot
+verify it is stored, making such messages indistinguishable from unsolicited ones
+without a challenge.
 
 ### 3. Integrity Verification, Per-Recipient Response and Disposition
 
@@ -194,7 +233,11 @@ Before downloading remaining data: if challenge was completed, check for duplica
 via message hash → code 10. Host B downloads data + attachments. If challenge was
 completed, verify computed hash matches challenge response → TERMINATE on mismatch.
 Host B sends per-recipient ACCEPT/REJECT codes in _to_ then _add to_ order
-(excluding other domains).
+(excluding other domains). For each recipient, check in order: already received
+(103 user duplicate) → unknown (100) → exceeds quota (101 user full) → not
+accepting (102) → otherwise accept (200). For any per-user REJECT, 105
+(user undisclosed) MAY be used instead. Global duplicate (code 10) is for the
+entire message across all recipients.
 
 ### 4. Sending a Message
 
@@ -206,6 +249,8 @@ to all recipients on that domain; per-recipient codes (≥100) arrive in _to_ th
 _add to_ order. Host A records codes and retries transient failures
 (3 undisclosed, 5 insufficient resources) with back-off. Permanent failures
 (1 invalid, 2 unsupported version, 4 too big, 10 duplicate) are not retried.
+Per-user codes: 101 (user full) MAY warrant retry; 100 (user unknown) or
+103 (user duplicate) typically would not.
 
 ### Handling a Challenge
 
@@ -236,8 +281,12 @@ Implementors should be mindful of concurrent access to this record.
 ## Rejection Conditions (MUST Reject)
 
 -   Cannot decode / malformed structure → TERMINATE
--   Duplicate recipients (to + add to, case-insensitive) → code 1
+-   No recipients in to → code 1
+-   Duplicate recipients in to (case-insensitive) → code 1
+-   Duplicate recipients in add to (case-insensitive) → code 1
+-   No recipients in to or add to for receiving host's domain → code 1
 -   Common type flag set but value has no mapping → code 1
+-   Attachment common type flag set but value has no mapping → code 1
 -   add to exists but pid does not → code 1
 -   Unauthorised sender IP → TERMINATE
 -   DNSSEC validation failure → TERMINATE
@@ -245,7 +294,7 @@ Implementors should be mindful of concurrent access to this record.
 -   Message too old (DELTA > MAX_MESSAGE_AGE) → code 7
 -   Message too far in future (|DELTA| > MAX_TIME_SKEW) → code 8
 -   pid parent not found (when required per add-to rules) → code 6
--   Parent time ≥ message time → code 9
+-   Parent time ≥ message time (when parent is required and found) → code 9
 -   Duplicate message (via challenge hash lookup) → code 10
 -   Hash mismatch after full download (challenge was completed) → TERMINATE
 
@@ -258,7 +307,7 @@ When generating or modifying code:
 -   Always serialize and parse fields exactly in defined order.
 -   Never use TXT, MX, or SRV for host discovery.
 -   Always resolve `_fmsg.<domain>` using A/AAAA (with CNAME support).
--   Enforce recipient uniqueness across to and add to.
+-   Enforce recipient uniqueness within to and within add to separately.
 -   Validate sender IP before issuing CHALLENGE.
 -   Terminate immediately on DNSSEC failure.
 -   Respect all flag semantics strictly (use spec bit assignments).
