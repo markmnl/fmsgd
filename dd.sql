@@ -79,6 +79,22 @@ create trigger trg_msg_to_insert
     after insert on msg_to
     for each row execute function notify_msg_to_insert();
 
+-- notify when a new msg_to row is inserted with time_delivered set so that
+-- listeners can be notified a new message has arrived.
+create or replace function notify_msg_to_received() returns trigger as $$
+begin
+    if NEW.time_delivered is not null then
+        perform pg_notify('new_msg_from', NEW.msg_id::text || ',' || NEW.addr);
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_to_received on msg_to;
+create trigger trg_msg_to_received
+    after insert on msg_to
+    for each row execute function notify_msg_to_received();
+
 -- notify when a new msg_add_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
 -- Must resolve msg_id through the batch table since msg_add_to references

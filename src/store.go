@@ -275,14 +275,20 @@ func storeAddToBatch(msgID int64, msg *FMsgHeader) error {
 	return tx.Commit()
 }
 
-// loadMsg loads a message and all its recipients from the database within the
+// loadMsg loads a message and its recipients from the database within the
 // given transaction and returns a fully populated FMsgHeader.
 //
+// batchNo controls add-to recipient loading:
+//   - 0: load the original message without any add-to recipients
+//   - >0: load add-to recipients from the specified batch only
+//
+// When batchNo > 0, pid is overridden with the msg row's own sha256
+// (the original message hash) since add-to messages reference the original.
 // TODO [Spec]: Attachment headers are not loaded. Once the msg_attachment table
 // stores attachment metadata (flags, type, filename, size, filepath), loadMsg
 // should populate FMsgHeader.Attachments so the sender can write attachment
 // headers and data on the wire and compute a correct header/message hash.
-func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
+func loadMsg(tx *sql.Tx, msgID int64, batchNo int) (*FMsgHeader, error) {
 	var version, size int
 	var noReply, isImportant, isDeflate bool
 	var pid, msgHash []byte
@@ -337,44 +343,42 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 		allTo = append(allTo, *addr)
 	}
 
-	// load all add-to recipients across all batches for this message
-	addToRows, err := tx.Query(`SELECT a.addr FROM msg_add_to a
-		JOIN msg_add_to_batch b ON a.batch_id = b.id
-		WHERE b.msg_id = $1
-		ORDER BY b.batch_no, a.id`, msgID)
-	if err != nil {
-		return nil, fmt.Errorf("load add-to recipients for msg %d: %w", msgID, err)
-	}
+	// load add-to recipients up to the specified batch number
 	var allAddTo []FMsgAddress
-	for addToRows.Next() {
-		var a string
-		if err := addToRows.Scan(&a); err != nil {
-			addToRows.Close()
-			return nil, fmt.Errorf("scan add-to addr: %w", err)
-		}
-		addr, err := parseAddress([]byte(a))
+	if batchNo > 0 {
+		addToRows, err := tx.Query(`SELECT a.addr FROM msg_add_to a
+			JOIN msg_add_to_batch b ON a.batch_id = b.id
+			WHERE b.msg_id = $1 AND b.batch_no = $2
+			ORDER BY a.id`, msgID, batchNo)
 		if err != nil {
-			addToRows.Close()
-			return nil, fmt.Errorf("invalid add-to address %s: %w", a, err)
+			return nil, fmt.Errorf("load add-to recipients for msg %d batch %d: %w", msgID, batchNo, err)
 		}
-		allAddTo = append(allAddTo, *addr)
+		for addToRows.Next() {
+			var a string
+			if err := addToRows.Scan(&a); err != nil {
+				addToRows.Close()
+				return nil, fmt.Errorf("scan add-to addr: %w", err)
+			}
+			addr, err := parseAddress([]byte(a))
+			if err != nil {
+				addToRows.Close()
+				return nil, fmt.Errorf("invalid add-to address %s: %w", a, err)
+			}
+			allAddTo = append(allAddTo, *addr)
+		}
+		addToRows.Close()
+		if err := addToRows.Err(); err != nil {
+			return nil, fmt.Errorf("add-to recipients query err for msg %d: %w", msgID, err)
+		}
 	}
-	addToRows.Close()
-	if err := addToRows.Err(); err != nil {
-		return nil, fmt.Errorf("add-to recipients query err for msg %d: %w", msgID, err)
+
+	// When loading an add-to batch, pid is the original message's own hash
+	// (not its parent), since the add-to message references the original.
+	if batchNo > 0 {
+		pid = msgHash
 	}
 
 	// Compute flags bitfield from stored booleans and loaded data.
-	// has_pid and has_add_to are derived from actual data rather than stored,
-	// so add-to recipients added after the original message are included.
-	//
-	// When add-to recipients exist on a root message (no pid), set pid to the
-	// message's own hash so the wire format is valid: spec requires pid when
-	// add-to is present. This turns the outgoing message into an add-to
-	// notification referencing the original message. TODO FIXME
-	if len(allAddTo) > 0 && len(pid) == 0 {
-		pid = msgHash
-	}
 	var flags uint8
 	if len(pid) > 0 {
 		flags |= FlagHasPid
