@@ -245,6 +245,19 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
+	// Ensure sha256 is populated for outgoing messages so future pid lookups
+	// (e.g. add-to notifications referencing this message) can find it.
+	msgHash, err := h.GetMessageHash()
+	if err != nil {
+		log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
+		return
+	}
+	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`,
+		msgHash, target.MsgID); err != nil {
+		log.Printf("ERROR: sender: storing sha256 for msg %d: %s", target.MsgID, err)
+		return
+	}
+
 	// Register in outgoing map so challenge handler can look up this message
 	hash := h.GetHeaderHash()
 	hashArr := *(*[32]byte)(hash)
