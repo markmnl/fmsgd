@@ -111,6 +111,7 @@ var MinDownloadRate float64 = 5000
 var MinUploadRate float64 = 5000
 var ReadBufferSize = 1600
 var MaxMessageSize = uint32(1024 * 10)
+var SkipAuthorisedIPs = false
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
@@ -127,6 +128,7 @@ func loadEnvConfig() {
 	MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
 	ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 	MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
+	SkipAuthorisedIPs = os.Getenv("FMSG_SKIP_AUTHORISED_IPS") == "true"
 }
 
 // Updates DataDir from environment, panics if not a valid directory.
@@ -569,29 +571,33 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 func challenge(conn net.Conn, h *FMsgHeader) error {
 
 	// verify remote IP is authorised by sender's _fmsg DNS record
-	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse remote address: %w", err)
-	}
-	remoteIP := net.ParseIP(remoteHost)
-	if remoteIP == nil {
-		return fmt.Errorf("failed to parse remote IP: %s", remoteHost)
-	}
-
-	authorisedIPs, err := lookupAuthorisedIPs(h.From.Domain)
-	if err != nil {
-		return err
-	}
-
-	found := false
-	for _, ip := range authorisedIPs {
-		if remoteIP.Equal(ip) {
-			found = true
-			break
+	if SkipAuthorisedIPs {
+		log.Println("WARN: skipping authorised IP check (FMSG_SKIP_AUTHORISED_IPS=true)")
+	} else {
+		remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			return fmt.Errorf("failed to parse remote address: %w", err)
 		}
-	}
-	if !found {
-		return fmt.Errorf("remote address %s not in _fmsg.%s authorised IPs", remoteIP.String(), h.From.Domain)
+		remoteIP := net.ParseIP(remoteHost)
+		if remoteIP == nil {
+			return fmt.Errorf("failed to parse remote IP: %s", remoteHost)
+		}
+
+		authorisedIPs, err := lookupAuthorisedIPs(h.From.Domain)
+		if err != nil {
+			return err
+		}
+
+		found := false
+		for _, ip := range authorisedIPs {
+			if remoteIP.Equal(ip) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("remote address %s not in _fmsg.%s authorised IPs", remoteIP.String(), h.From.Domain)
+		}
 	}
 
 	// okay lets give sender a call and confirm they are sending this message
