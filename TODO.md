@@ -70,16 +70,6 @@ Currently `ChallengeHash` is zero-valued when skipped, causing false mismatch.
 Spec 3.2: Download sequential attachment byte sequences after message body,
 bounded by attachment header sizes. Currently only message body is downloaded.
 
-### 16. Include add-to recipients in per-recipient response codes
-**File:** `host.go` `downloadMessage()`  
-Spec 3.4: Response codes in order of "to" then "add to", excluding other
-domains. Currently only "to" is considered.
-
-### 17. Return correct code for "not accepting" users
-**File:** `host.go` `validateMsgRecvForAddr()`  
-When user is known but not accepting, return code 102 (user not accepting) or
-103 (user undisclosed), not 100 (user unknown).
-
 ### 18. Validate at least one "to" recipient
 **File:** `host.go` `readHeader()`  
 Spec 1.4.i.a: If to count is 0, reject code 1 (invalid).
@@ -108,12 +98,6 @@ Currently only v==255 is handled.
 Attachment count is hardcoded to 0. Write actual attachment headers (flags,
 type, filename, size) and send attachment data after message body.
 
-### 23. Handle code 11 (accept header) as success
-**File:** `sender.go` `deliverMessage()`  
-Code 11 is < 100 but is NOT a rejection — it means "header received" for
-add-to-only scenarios. Handle separately from the global rejection branch.
-Also treat code 11 as success in per-recipient handling for add-to recipients.
-
 ### 24. Handle missing per-user codes 102 and 103
 **File:** `sender.go` `deliverMessage()`  
 Code 102 (user not accepting) may be transient — consider retry. Code 103 (user
@@ -138,21 +122,11 @@ and not part of the spec.
 
 ## P4 — Storage layer
 
-### 27. Distinguish to vs add-to in msg_to table
-**File:** `store.go` `storeMsgDetail()`  
-Need a way (boolean column, separate table, or ordering convention) to tell "to"
-from "add to" recipients so `loadMsg` can reconstruct both slices in order.
-
 ### 28. Store and load attachment metadata
 **File:** `store.go` `storeMsgDetail()` / `loadMsg()`  
 Insert attachment headers into `msg_attachment` and load them back into
 `FMsgHeader.Attachments` so the sender can write them on the wire and hashing is
 correct.
-
-### 29. Load add-to recipients separately in loadMsg
-**File:** `store.go` `loadMsg()`  
-Currently all recipients go into `FMsgHeader.To`. Populate `.To` and `.AddTo`
-separately, preserving wire-format order.
 
 ---
 

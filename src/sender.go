@@ -387,9 +387,9 @@ func deliverMessage(target pendingTarget) {
 	now = timeutil.TimestampNow().Float64()
 
 	if code < 100 {
-		// Code 11 (accept header) is a success for add-to notification.
-		if code == AcceptCodeHeader {
-			log.Printf("INFO: sender: msg %d add-to notification accepted by %s (code 11)", target.MsgID, target.Domain)
+		// Code 11 (accept add to) — additional recipients received.
+		if code == AcceptCodeAddTo {
+			log.Printf("INFO: sender: msg %d additional recipients received by %s (code 11)", target.MsgID, target.Domain)
 			for _, a := range lockedAddrs {
 				if _, err := tx.Exec(`
 					UPDATE msg_to SET time_delivered = $1, response_code = $2

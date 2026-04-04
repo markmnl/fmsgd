@@ -49,7 +49,7 @@ const (
 	RejectCodeFutureTime           uint8 = 8
 	RejectCodeTimeTravel           uint8 = 9
 	RejectCodeDuplicate            uint8 = 10
-	AcceptCodeHeader               uint8 = 11
+	AcceptCodeAddTo                uint8 = 11
 
 	RejectCodeUserUnknown      uint8 = 100
 	RejectCodeUserFull         uint8 = 101
@@ -82,8 +82,8 @@ func responseCodeName(code uint8) string {
 		return "time travel"
 	case RejectCodeDuplicate:
 		return "duplicate"
-	case AcceptCodeHeader:
-		return "accept header"
+	case AcceptCodeAddTo:
+		return "accept add to"
 	case RejectCodeUserUnknown:
 		return "user unknown"
 	case RejectCodeUserFull:
@@ -396,20 +396,21 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 			}
 			return h, r, fmt.Errorf("add to flag set but count is 0")
 		}
+		addToSeen := make(map[string]bool)
 		for addToCount > 0 {
 			addr, err := readAddress(r)
 			if err != nil {
 				return h, r, err
 			}
 			key := strings.ToLower(addr.ToString())
-			if seen[key] {
+			if addToSeen[key] {
 				codes := []byte{RejectCodeInvalid}
 				if err := rejectAccept(c, codes); err != nil {
 					return h, r, err
 				}
 				return h, r, fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
 			}
-			seen[key] = true
+			addToSeen[key] = true
 			h.AddTo = append(h.AddTo, *addr)
 			addToCount--
 		}
@@ -513,8 +514,8 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 			}
 		}
 		if !addToHasOurDomain {
-			// none of the add-to recipients are for our domain — this is an
-			// add-to notification for existing "to" recipients on our domain.
+			// none of the add-to recipients are for our domain — record
+			// the additional recipients and respond code 11.
 
 			// pid must refer to a stored message per "Verifying Message Stored"
 			parentID, err := lookupMsgIdByHash(h.Pid)
@@ -529,23 +530,7 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 				return h, r, fmt.Errorf("add-to notification: parent not found for pid %s", hex.EncodeToString(h.Pid))
 			}
 
-			// at least one "to" recipient must be for our domain
-			toHasOurDomain := false
-			for _, addr := range h.To {
-				if strings.EqualFold(addr.Domain, Domain) {
-					toHasOurDomain = true
-					break
-				}
-			}
-			if !toHasOurDomain {
-				codes := []byte{RejectCodeInvalid}
-				if err := rejectAccept(c, codes); err != nil {
-					return h, r, err
-				}
-				return h, r, fmt.Errorf("add-to notification: no 'to' recipients for our domain %s", Domain)
-			}
-
-			// record this message header and respond accept header (code 11)
+			// record add-to recipients for future hash reconstruction, respond code 11
 			if err := storeMsgHeaderOnly(h); err != nil {
 				codes := []byte{RejectCodeUndisclosed}
 				if err2 := rejectAccept(c, codes); err2 != nil {
@@ -553,11 +538,11 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 				}
 				return h, r, fmt.Errorf("add-to notification: storing header: %w", err)
 			}
-			codes := []byte{AcceptCodeHeader}
+			codes := []byte{AcceptCodeAddTo}
 			if err := rejectAccept(c, codes); err != nil {
 				return h, r, err
 			}
-			log.Printf("INFO: add-to notification accepted (code 11) for pid %s", hex.EncodeToString(h.Pid))
+			log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(h.Pid))
 			return nil, r, nil // nil header signals handled (like challenge)
 		}
 		// else: add-to recipients are for our domain, continue normally
@@ -657,10 +642,6 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err e
 	}
 
 	// check user accepting new
-	// TODO [Spec 3.4.i.d]: When a user is known but not accepting new messages
-	// the spec requires reject code 102 (user not accepting) or 103 (user
-	// undisclosed). Currently RejectCodeUserUnknown (100) is returned which is
-	// incorrect — code 100 means the address is unknown to the host.
 	if !detail.AcceptingNew {
 		return RejectCodeUserNotAccepting, nil
 	}
@@ -777,11 +758,8 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	// the current message's timestamp (reject code 9 = time travel), and the
 	// verification must follow the "Verifying Message Stored" semantics:
 	//  - The digest must match a previously accepted message (code 200) or
-	//    accepted header (code 11).
+	//    accepted add-to (code 11).
 	//  - The message/header must currently exist and be retrievable.
-	//  - pid references a message hash if from was in "to" of parent; references
-	//    the message header hash if from was only in "add to" of parent. Both
-	//    must be checked.
 	if h.Flags&FlagHasPid != 0 {
 		parentID, err := lookupMsgIdByHash(h.Pid)
 		if err != nil {

@@ -270,13 +270,13 @@ returning id`,
 func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	var version, size int
 	var noReply, isImportant, isDeflate bool
-	var pid []byte
+	var pid, msgHash []byte
 	var fromAddr, topic, typ, filepath string
 	var timeSent float64
 	err := tx.QueryRow(`
-		SELECT version, no_reply, is_important, is_deflate, psha256, from_addr, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
 	if err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
 	}
@@ -339,6 +339,14 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	// Compute flags bitfield from stored booleans and loaded data.
 	// has_pid and has_add_to are derived from actual data rather than stored,
 	// so add-to recipients added after the original message are included.
+	//
+	// When add-to recipients exist on a root message (no pid), set pid to the
+	// message's own hash so the wire format is valid: spec requires pid when
+	// add-to is present. This turns the outgoing message into an add-to
+	// notification referencing the original message.
+	if len(allAddTo) > 0 && len(pid) == 0 {
+		pid = msgHash
+	}
 	var flags uint8
 	if len(pid) > 0 {
 		flags |= FlagHasPid

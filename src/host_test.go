@@ -149,7 +149,7 @@ func TestResponseCodeName(t *testing.T) {
 		{RejectCodeFutureTime, "future time"},
 		{RejectCodeTimeTravel, "time travel"},
 		{RejectCodeDuplicate, "duplicate"},
-		{AcceptCodeHeader, "accept header"},
+		{AcceptCodeAddTo, "accept add to"},
 		{RejectCodeUserUnknown, "user unknown"},
 		{RejectCodeUserFull, "user full"},
 		{RejectCodeUserNotAccepting, "user not accepting"},
