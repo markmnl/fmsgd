@@ -124,7 +124,7 @@ referenced by pid." Not currently checked.
 
 ## P2 — Receiving: Challenge (host.go challenge)
 
-### 18. Connection 2 must target same IP as Connection 1
+### ~~18. Connection 2 must target same IP as Connection 1~~ DONE
 **File:** `host.go` `challenge()`
 Spec 2.1: Dial conn.RemoteAddr() IP, not h.From.Domain. Dialling the domain
 may resolve to a different IP.

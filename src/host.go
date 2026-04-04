@@ -600,13 +600,12 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 		}
 	}
 
-	// okay lets give sender a call and confirm they are sending this message
-	// TODO [Spec 2.1]: Connection 2 MUST be initiated to the same IP address as
-	// the incoming Connection 1 (conn.RemoteAddr()), NOT to h.From.Domain.
-	// The spec says: "Host B MUST initiate a separate new connection (Connection 2)
-	// back to Host A using the same incoming IP address of Connection 1."
-	// Dialling h.From.Domain may resolve to a different IP.
-	conn2, err := net.Dial("tcp", net.JoinHostPort(h.From.Domain, fmt.Sprintf("%d", RemotePort)))
+	// Connection 2 MUST target the same IP as Connection 1 (spec 2.1).
+	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return fmt.Errorf("failed to parse remote address for challenge: %w", err)
+	}
+	conn2, err := net.Dial("tcp", net.JoinHostPort(remoteHost, fmt.Sprintf("%d", RemotePort)))
 	if err != nil {
 		return err
 	}
