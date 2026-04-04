@@ -17,6 +17,8 @@ type FMsgAddress struct {
 }
 
 type FMsgAttachmentHeader struct {
+	Flags    uint8
+	Type     string
 	Filename string
 	Size     uint32
 
@@ -35,11 +37,9 @@ type FMsgHeader struct {
 	Type      string
 
 	// Size in bytes of entire message
-	Size uint32
-	// TODO [Spec]: Add Attachments []FMsgAttachmentHeader field to store parsed
-	// attachment headers (flags, type, filename, size) from the wire format.
+	Size        uint32
+	Attachments []FMsgAttachmentHeader
 
-	// Hash up to and including Type
 	HeaderHash []byte
 	// Hash of message from challenge response
 	ChallengeHash [32]byte
@@ -58,16 +58,9 @@ func (addr *FMsgAddress) ToString() string {
 	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
 }
 
-// Encode the header up to and including type field to a []byte. This function will panic on error
-// instead of returning one.
-// TODO [Spec]: The spec defines "message header" as all fields up to and
-// including the attachment headers field. This Encode() is missing:
-//   - The "size" field (uint32).
-//   - The "attachment headers" field (uint8 count + list of attachment headers).
-//
-// The header hash (SHA-256 of the encoded header) will be incorrect without
-// these fields, breaking challenge verification and pid references.
-// Additionally, the topic field should only be encoded when pid is NOT set.
+// Encode the message header to wire format as a []byte. This includes all
+// fields up to and including the attachment headers per spec. This function
+// will panic on error instead of returning one.
 func (h *FMsgHeader) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
@@ -95,10 +88,29 @@ func (h *FMsgHeader) Encode() []byte {
 	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
 		panic(err)
 	}
-	b.WriteByte(byte(len(h.Topic)))
-	b.WriteString(h.Topic)
+	// topic is only present when pid is NOT set
+	if h.Flags&FlagHasPid == 0 {
+		b.WriteByte(byte(len(h.Topic)))
+		b.WriteString(h.Topic)
+	}
 	b.WriteByte(byte(len(h.Type)))
 	b.WriteString(h.Type)
+	// size (uint32 LE)
+	if err := binary.Write(&b, binary.LittleEndian, h.Size); err != nil {
+		panic(err)
+	}
+	// attachment headers
+	b.WriteByte(byte(len(h.Attachments)))
+	for _, att := range h.Attachments {
+		b.WriteByte(att.Flags)
+		b.WriteByte(byte(len(att.Type)))
+		b.WriteString(att.Type)
+		b.WriteByte(byte(len(att.Filename)))
+		b.WriteString(att.Filename)
+		if err := binary.Write(&b, binary.LittleEndian, att.Size); err != nil {
+			panic(err)
+		}
+	}
 	return b.Bytes()
 }
 
@@ -153,17 +165,23 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 			return nil, err
 		}
 
-		// TODO [Spec]: Encode() is missing size, attachment count, and
-		// attachment headers. Once Encode() includes the full message header
-		// per spec, the size and attachment header bytes will automatically be
-		// included in this hash.
-
 		if _, err := io.Copy(hash, f); err != nil {
 			return nil, err
 		}
 
-		// TODO: include attachment data (sequential byte sequences following
-		// the message body, bounded by attachment header sizes) in the hash.
+		// include attachment data (sequential byte sequences following
+		// the message body, bounded by attachment header sizes)
+		for _, att := range h.Attachments {
+			af, err := os.Open(att.Filepath)
+			if err != nil {
+				return nil, fmt.Errorf("open attachment %s: %w", att.Filename, err)
+			}
+			if _, err := io.CopyN(hash, af, int64(att.Size)); err != nil {
+				af.Close()
+				return nil, fmt.Errorf("read attachment %s: %w", att.Filename, err)
+			}
+			af.Close()
+		}
 
 		h.messageHash = hash.Sum(nil)
 	}

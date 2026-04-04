@@ -96,6 +96,19 @@ func TestEncodeMinimalHeader(t *testing.T) {
 		t.Fatalf("type = %q, want %q", string(typeBytes), "text/plain")
 	}
 
+	// size (uint32 LE)
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	if size != 0 {
+		t.Fatalf("size = %d, want 0", size)
+	}
+
+	// attachment count
+	attachCount, _ := r.ReadByte()
+	if attachCount != 0 {
+		t.Fatalf("attach count = %d, want 0", attachCount)
+	}
+
 	// should have consumed entire buffer
 	if r.Len() != 0 {
 		t.Fatalf("unexpected %d trailing bytes", r.Len())
@@ -114,7 +127,7 @@ func TestEncodeWithPid(t *testing.T) {
 		From:      FMsgAddress{User: "a", Domain: "b.com"},
 		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
 		Timestamp: 0,
-		Topic:     "",
+		Topic:     "should be omitted",
 		Type:      "text/plain",
 	}
 	b := h.Encode()
@@ -131,6 +144,44 @@ func TestEncodeWithPid(t *testing.T) {
 	}
 	if !bytes.Equal(pidOut, pid) {
 		t.Fatalf("pid mismatch")
+	}
+
+	// skip from
+	fLen, _ := r.ReadByte()
+	fBuf := make([]byte, fLen)
+	r.Read(fBuf)
+
+	// skip to count + to[0]
+	toCount, _ := r.ReadByte()
+	if toCount != 1 {
+		t.Fatalf("to count = %d, want 1", toCount)
+	}
+	tLen, _ := r.ReadByte()
+	tBuf := make([]byte, tLen)
+	r.Read(tBuf)
+
+	// skip timestamp
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+
+	// topic must NOT be present when pid is set — next byte should be type length
+	typeLen, _ := r.ReadByte()
+	typeBytes := make([]byte, typeLen)
+	r.Read(typeBytes)
+	if string(typeBytes) != "text/plain" {
+		t.Fatalf("expected type field directly after timestamp, got %q", string(typeBytes))
+	}
+
+	// size + attachment count
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	attachCount, _ := r.ReadByte()
+	if attachCount != 0 {
+		t.Fatalf("attach count = %d, want 0", attachCount)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes", r.Len())
 	}
 }
 
@@ -316,5 +367,112 @@ func TestEncodeTimestampEncoding(t *testing.T) {
 	ts := math.Float64frombits(bits)
 	if ts != 1700000000.5 {
 		t.Fatalf("timestamp = %f, want 1700000000.5", ts)
+	}
+
+	// After timestamp: topic(1+0) + type(1+0) + size(4) + attach_count(1) = 7 bytes
+	if r := bytes.NewReader(b[offset+8:]); r.Len() != 7 {
+		t.Fatalf("trailing bytes after timestamp = %d, want 7", r.Len())
+	}
+}
+
+func TestEncodeWithAttachments(t *testing.T) {
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     0,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp: 0,
+		Topic:     "",
+		Type:      "text/plain",
+		Size:      100,
+		Attachments: []FMsgAttachmentHeader{
+			{Flags: 0, Type: "image/png", Filename: "pic.png", Size: 2048},
+			{Flags: 1, Type: "a", Filename: "doc.txt", Size: 512},
+		},
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+
+	// skip from
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	// skip to count + to[0]
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	// skip timestamp
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	// skip topic
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+	// skip type
+	typeLen, _ := r.ReadByte()
+	r.Read(make([]byte, typeLen))
+
+	// size
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	if size != 100 {
+		t.Fatalf("size = %d, want 100", size)
+	}
+
+	// attachment count
+	attachCount, _ := r.ReadByte()
+	if attachCount != 2 {
+		t.Fatalf("attach count = %d, want 2", attachCount)
+	}
+
+	// attachment 0
+	att0Flags, _ := r.ReadByte()
+	if att0Flags != 0 {
+		t.Fatalf("att[0] flags = %d, want 0", att0Flags)
+	}
+	att0TypeLen, _ := r.ReadByte()
+	att0Type := make([]byte, att0TypeLen)
+	r.Read(att0Type)
+	if string(att0Type) != "image/png" {
+		t.Fatalf("att[0] type = %q, want %q", string(att0Type), "image/png")
+	}
+	att0FnLen, _ := r.ReadByte()
+	att0Fn := make([]byte, att0FnLen)
+	r.Read(att0Fn)
+	if string(att0Fn) != "pic.png" {
+		t.Fatalf("att[0] filename = %q, want %q", string(att0Fn), "pic.png")
+	}
+	var att0Size uint32
+	binary.Read(r, binary.LittleEndian, &att0Size)
+	if att0Size != 2048 {
+		t.Fatalf("att[0] size = %d, want 2048", att0Size)
+	}
+
+	// attachment 1
+	att1Flags, _ := r.ReadByte()
+	if att1Flags != 1 {
+		t.Fatalf("att[1] flags = %d, want 1", att1Flags)
+	}
+	att1TypeLen, _ := r.ReadByte()
+	att1Type := make([]byte, att1TypeLen)
+	r.Read(att1Type)
+	if string(att1Type) != "a" {
+		t.Fatalf("att[1] type = %q, want %q", string(att1Type), "a")
+	}
+	att1FnLen, _ := r.ReadByte()
+	att1Fn := make([]byte, att1FnLen)
+	r.Read(att1Fn)
+	if string(att1Fn) != "doc.txt" {
+		t.Fatalf("att[1] filename = %q, want %q", string(att1Fn), "doc.txt")
+	}
+	var att1Size uint32
+	binary.Read(r, binary.LittleEndian, &att1Size)
+	if att1Size != 512 {
+		t.Fatalf("att[1] size = %d, want 512", att1Size)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes", r.Len())
 	}
 }

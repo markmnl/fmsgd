@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -319,33 +318,10 @@ func deliverMessage(target pendingTarget) {
 	}
 	defer conn.Close()
 
-	// Send header (FMsgHeader.Encode writes version through type, including add-to)
-	// TODO [Spec]: Encode() always encodes the topic field even when pid IS set
-	// (spec: topic must be absent when pid is set). It also always encodes the
-	// type as a length-prefixed string, but spec says common-type flag (bit 2)
-	// means type is a single uint8 index.
+	// Send header — Encode() writes all fields through attachment headers per spec
 	headerBytes := h.Encode()
 	if _, err := conn.Write(headerBytes); err != nil {
 		log.Printf("ERROR: sender: writing header: %s", err)
-		return
-	}
-
-	// TODO [Spec]: Encode() should include size and attachment headers as part
-	// of the header (spec defines header as all fields through attachment headers).
-	// Currently size and attachment count are written separately here, which is
-	// correct on the wire but means they are NOT included in the header hash.
-
-	// size (uint32 LE)
-	if err := binary.Write(conn, binary.LittleEndian, h.Size); err != nil {
-		log.Printf("ERROR: sender: writing size: %s", err)
-		return
-	}
-
-	// TODO [Spec]: Write actual attachment headers here. Each attachment header
-	// is: flags (uint8), type (uint8 + [ASCII string]), filename (uint8 + UTF-8),
-	// size (uint32). Currently hardcoded to 0 attachment count.
-	if err := binary.Write(conn, binary.LittleEndian, uint8(0)); err != nil {
-		log.Printf("ERROR: sender: writing attachment count: %s", err)
 		return
 	}
 
@@ -368,9 +344,24 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	// TODO [Spec]: Send attachment bodies — sequential byte sequences following
-	// the message data, with boundaries determined by the attachment header sizes.
-	// Each attachment's data length must match the size declared in its header.
+	// attachment data — sequential byte sequences bounded by header sizes
+	for _, att := range h.Attachments {
+		af, err := os.Open(att.Filepath)
+		if err != nil {
+			log.Printf("ERROR: sender: opening attachment %s: %s", att.Filename, err)
+			return
+		}
+		an, err := io.CopyN(conn, af, int64(att.Size))
+		af.Close()
+		if an != int64(att.Size) {
+			log.Printf("ERROR: sender: attachment %s size mismatch: expected %d, got %d", att.Filename, att.Size, an)
+			return
+		}
+		if err != nil {
+			log.Printf("ERROR: sender: sending attachment %s: %s", att.Filename, err)
+			return
+		}
+	}
 
 	// --- read response ---
 	// A code < 100 is a global rejection (single byte for all recipients).
