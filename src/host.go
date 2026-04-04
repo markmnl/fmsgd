@@ -546,7 +546,7 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 			}
 
 			// record add-to recipients for future hash reconstruction, respond code 11
-			if err := storeMsgHeaderOnly(h); err != nil {
+			if err := storeAddToBatch(parentID, h); err != nil {
 				codes := []byte{RejectCodeUndisclosed}
 				if err2 := rejectAccept(c, codes); err2 != nil {
 					return h, r, err2

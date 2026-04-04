@@ -50,7 +50,7 @@ func testDb() error {
 	log.Printf("INFO: Database connected: %s@%s:%s/%s", user, host, port, dbName)
 
 	// verify required tables exist
-	for _, table := range []string{"msg", "msg_to", "msg_add_to", "msg_attachment"} {
+	for _, table := range []string{"msg", "msg_to", "msg_add_to_batch", "msg_add_to", "msg_attachment"} {
 		var exists bool
 		err = db.QueryRow(`SELECT EXISTS (
 			SELECT FROM information_schema.tables
@@ -67,7 +67,9 @@ func testDb() error {
 }
 
 // lookupMsgIdByHash returns the msg id for a message with the given SHA256 hash,
-// or 0 if no such message exists.
+// or 0 if no such message exists. Checks both msg.sha256 and
+// msg_add_to_batch.sha256 (add-to batches produce distinct hashes that can be
+// referenced as pid by future messages).
 func lookupMsgIdByHash(hash []byte) (int64, error) {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
@@ -77,6 +79,15 @@ func lookupMsgIdByHash(hash []byte) (int64, error) {
 
 	var id int64
 	err = db.QueryRow("SELECT id FROM msg WHERE sha256 = $1", hash).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	// check add-to batch hashes
+	err = db.QueryRow("SELECT msg_id FROM msg_add_to_batch WHERE sha256 = $1", hash).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -154,10 +165,28 @@ values ($1, $2, $3)`)
 		}
 	}
 
-	// insert add-to recipients into msg_add_to
+	// insert add-to batch and recipients
 	if len(msg.AddTo) > 0 {
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, addr, time_delivered)
-values ($1, $2, $3)`)
+		addToHash, err := msg.GetMessageHash()
+		if err != nil {
+			return err
+		}
+
+		// determine next batch_no for this msg
+		var batchNo int
+		err = tx.QueryRow(`SELECT coalesce(max(batch_no), 0) + 1 FROM msg_add_to_batch WHERE msg_id = $1`, msgID).Scan(&batchNo)
+		if err != nil {
+			return err
+		}
+
+		var batchID int64
+		err = tx.QueryRow(`INSERT INTO msg_add_to_batch (msg_id, batch_no, sha256) VALUES ($1, $2, $3) RETURNING id`,
+			msgID, batchNo, addToHash).Scan(&batchID)
+		if err != nil {
+			return err
+		}
+
+		addToStmt, err := tx.Prepare(`INSERT INTO msg_add_to (batch_id, addr, time_delivered) VALUES ($1, $2, $3)`)
 		if err != nil {
 			return err
 		}
@@ -168,18 +197,25 @@ values ($1, $2, $3)`)
 			if addr.Domain == Domain {
 				delivered = now
 			}
-			if _, err := addToStmt.Exec(msgID, addr.ToString(), delivered); err != nil {
+			if _, err := addToStmt.Exec(batchID, addr.ToString(), delivered); err != nil {
 				return err
 			}
 		}
 	}
 
-	// resolve pid from psha256 (parent message hash)
+	// resolve pid from psha256 (parent message hash) — check both msg.sha256
+	// and msg_add_to_batch.sha256 since a reply can reference an add-to batch
 	if len(msg.Pid) > 0 {
 		var parentID sql.NullInt64
 		err = tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", msg.Pid).Scan(&parentID)
 		if err != nil && err != sql.ErrNoRows {
 			return err
+		}
+		if !parentID.Valid {
+			err = tx.QueryRow("SELECT msg_id FROM msg_add_to_batch WHERE sha256 = $1", msg.Pid).Scan(&parentID)
+			if err != nil && err != sql.ErrNoRows {
+				return err
+			}
 		}
 		if parentID.Valid {
 			if _, err = tx.Exec("UPDATE msg SET pid = $1 WHERE id = $2", parentID.Int64, msgID); err != nil {
@@ -192,10 +228,11 @@ values ($1, $2, $3)`)
 
 }
 
-// storeMsgHeaderOnly stores just the message header for add-to notifications
-// (spec code 11). Only the header is recorded so the header hash can be
-// faithfully computed for subsequent messages referencing this one via pid.
-func storeMsgHeaderOnly(msg *FMsgHeader) error {
+// storeAddToBatch stores a batch of add-to recipients for an existing message.
+// Called when we receive an add-to notification (code 11) — the parent message
+// is already stored, we just need to record the new add-to recipients and the
+// header hash so future messages can reference this version via pid.
+func storeAddToBatch(msgID int64, msg *FMsgHeader) error {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
 		return err
@@ -210,76 +247,28 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 
 	headerHash := msg.GetHeaderHash()
 
-	var msgID int64
-	err = tx.QueryRow(`insert into msg (version
-	, no_reply
-	, is_important
-	, is_deflate
-	, time_sent
-	, from_addr
-	, topic
-	, type
-	, common_type
-	, sha256
-	, psha256
-	, size
-	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-returning id`,
-		msg.Version,
-		msg.Flags&FlagNoReply != 0,
-		msg.Flags&FlagImportant != 0,
-		msg.Flags&FlagDeflate != 0,
-		msg.Timestamp,
-		msg.From.ToString(),
-		msg.Topic,
-		typeParam(msg),
-		commonTypeParam(msg),
-		headerHash,
-		msg.Pid,
-		int(msg.Size),
-		"").Scan(&msgID)
+	// determine next batch_no for this msg
+	var batchNo int
+	err = tx.QueryRow(`SELECT coalesce(max(batch_no), 0) + 1 FROM msg_add_to_batch WHERE msg_id = $1`, msgID).Scan(&batchNo)
 	if err != nil {
 		return err
 	}
 
-	// insert to recipients (for record keeping)
-	toStmt, err := tx.Prepare(`insert into msg_to (msg_id, addr) values ($1, $2)`)
+	var batchID int64
+	err = tx.QueryRow(`INSERT INTO msg_add_to_batch (msg_id, batch_no, sha256) VALUES ($1, $2, $3) RETURNING id`,
+		msgID, batchNo, headerHash).Scan(&batchID)
 	if err != nil {
 		return err
 	}
-	defer toStmt.Close()
-	for _, addr := range msg.To {
-		if _, err := toStmt.Exec(msgID, addr.ToString()); err != nil {
-			return err
-		}
-	}
 
-	// insert add-to recipients
-	if len(msg.AddTo) > 0 {
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, addr) values ($1, $2)`)
-		if err != nil {
-			return err
-		}
-		defer addToStmt.Close()
-		for _, addr := range msg.AddTo {
-			if _, err := addToStmt.Exec(msgID, addr.ToString()); err != nil {
-				return err
-			}
-		}
+	addToStmt, err := tx.Prepare(`INSERT INTO msg_add_to (batch_id, addr) VALUES ($1, $2)`)
+	if err != nil {
+		return err
 	}
-
-	// resolve pid from psha256
-	if len(msg.Pid) > 0 {
-		var parentID sql.NullInt64
-		err = tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", msg.Pid).Scan(&parentID)
-		if err != nil && err != sql.ErrNoRows {
+	defer addToStmt.Close()
+	for _, addr := range msg.AddTo {
+		if _, err := addToStmt.Exec(batchID, addr.ToString()); err != nil {
 			return err
-		}
-		if parentID.Valid {
-			if _, err = tx.Exec("UPDATE msg SET pid = $1 WHERE id = $2", parentID.Int64, msgID); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -348,8 +337,11 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 		allTo = append(allTo, *addr)
 	}
 
-	// load add-to recipients from msg_add_to
-	addToRows, err := tx.Query(`SELECT addr FROM msg_add_to WHERE msg_id = $1 ORDER BY id`, msgID)
+	// load all add-to recipients across all batches for this message
+	addToRows, err := tx.Query(`SELECT a.addr FROM msg_add_to a
+		JOIN msg_add_to_batch b ON a.batch_id = b.id
+		WHERE b.msg_id = $1
+		ORDER BY b.batch_no, a.id`, msgID)
 	if err != nil {
 		return nil, fmt.Errorf("load add-to recipients for msg %d: %w", msgID, err)
 	}
