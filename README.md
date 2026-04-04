@@ -35,12 +35,13 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 | FMSG_POLL_INTERVAL         | 10      | Seconds. How often the sender polls the database for pending messages.                                                                                 |
 | FMSG_MAX_CONCURRENT_SEND   | 1024    | Maximum number of concurrent outbound message deliveries.                                                                                              |
 | FMSG_SKIP_DOMAIN_IP_CHECK  | false   | Set to "true" to skip verifying this host's external IP is in the _fmsg DNS authorised IP set on startup.                                              |
+| FMSG_SKIP_AUTHORISED_IPS  | false   | Set to "true" to skip verifying remote hosts IP is in the _fmsg DNS authorised IP set during message exchange. WARNING setting this true is effectivly disables sender verification.                                              |
 
 
 
 ## Running
 
-An up and running [fmsg Id API](https://github.com/markmnl/fmsgid) needs to be reachable by fmsgd to know users and their quotas for this fmsgd service.  
+An up and running [fmsg Id API](https://github.com/markmnl/fmsgid) needs to be reachable by fmsgd to know users and their quotas for this fmsgd service. See also [fmsg-docker](https://github.com/markmnl/fmsg-docker) - a docker compose stack for a fmsg host including fmsgid, fmsg-webpi and fmsgd.
 
 IP address to bind to and listen on is the only argument, `127.0.0.1` is used if argument not supplied. e.g. on Linux:
 

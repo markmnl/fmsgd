@@ -8,20 +8,6 @@ correctness issues, then enhancements.
 ## P0 — Foundational (blocks most other work)
 
 
-### 2. Fix `Encode()` to produce the full message header per spec
-**File:** `defs.go` `Encode()`  
-Currently encodes only version through type. Missing: add-to field, size
-(uint32), attachment headers (uint8 count + headers). Topic is always encoded
-but must be absent when pid is set. Type is always length-prefixed but must be a
-single uint8 index when the common-type flag (bit 2) is set. The header hash
-(SHA-256 of encoded header) is wrong without these fields, breaking challenge
-verification and pid references.
-
-### 3. Add `AddTo` field to `FMsgHeader`
-**File:** `defs.go` struct  
-Add `AddTo []FMsgAddress` field. Required before any add-to parsing, encoding,
-storage, or per-recipient response ordering can work.
-
 ### 4. Add `Attachments` field to `FMsgHeader`
 **File:** `defs.go` struct  
 Add `Attachments []FMsgAttachmentHeader` to store parsed attachment headers
@@ -35,14 +21,6 @@ Add a `ChallengeCompleted bool` to distinguish "challenge was completed and
 hash verification check in `downloadMessage` erroneously fails when the
 challenge was skipped.
 
-### ~~6. Fix response code constants~~
-**File:** `host.go` constants  
-~~`RejectCodeMustChallenge` (11) and `RejectCodeCannotChallenge` (12) do not
-exist in the spec. Code 11 = "accept header" (add-to notification success).
-Add missing per-user codes: 102 (user not accepting), 103 (user undisclosed).~~
-**DONE:** Replaced with `AcceptCodeHeader` (11), added `RejectCodeUserNotAccepting` (102)
-and `RejectCodeUserUndisclosed` (103).
-
 ---
 
 ## P1 — Receiving path (host.go) correctness
@@ -54,11 +32,6 @@ connection's IP is authorised. If not → TERMINATE (no reject code). Currently
 this only happens inside `challenge()` and is skipped when skip-challenge is
 allowed.
 
-### 8. Parse "add to" field when has-add-to flag is set
-**File:** `host.go` `readHeader()`  
-Spec 1.4.v.b: Read uint8 count + addresses. Verify distinct from each other and
-from "to" (case-insensitive). Implement the pid/add-to decision tree (add-to
-requires pid; if no add-to recipients on our domain → accept header code 11).
 
 ### 9. Make topic conditional on pid absence
 **File:** `host.go` `readHeader()`  
@@ -97,16 +70,6 @@ Currently `ChallengeHash` is zero-valued when skipped, causing false mismatch.
 Spec 3.2: Download sequential attachment byte sequences after message body,
 bounded by attachment header sizes. Currently only message body is downloaded.
 
-### 16. Include add-to recipients in per-recipient response codes
-**File:** `host.go` `downloadMessage()`  
-Spec 3.4: Response codes in order of "to" then "add to", excluding other
-domains. Currently only "to" is considered.
-
-### 17. Return correct code for "not accepting" users
-**File:** `host.go` `validateMsgRecvForAddr()`  
-When user is known but not accepting, return code 102 (user not accepting) or
-103 (user undisclosed), not 100 (user unknown).
-
 ### 18. Validate at least one "to" recipient
 **File:** `host.go` `readHeader()`  
 Spec 1.4.i.a: If to count is 0, reject code 1 (invalid).
@@ -125,22 +88,15 @@ Currently only v==255 is handled.
 
 ## P2 — Sending path (sender.go) correctness
 
-### 21. Include add-to recipients in domain recipient list
+### ~~21. Include add-to recipients in domain recipient list~~ DONE
 **File:** `sender.go` `deliverMessage()`  
-`domainRecips` only iterates `h.To`. Per spec, per-recipient codes arrive in
-"to then add to" order. Append add-to recipients on the target domain after to
-recipients.
+`domainRecips` already iterates both `h.To` and `h.AddTo` in order, with
+`isAddTo` flag set appropriately. Implemented as part of the add-to feature.
 
 ### 22. Write attachment headers and attachment bodies
 **File:** `sender.go` `deliverMessage()`  
 Attachment count is hardcoded to 0. Write actual attachment headers (flags,
 type, filename, size) and send attachment data after message body.
-
-### 23. Handle code 11 (accept header) as success
-**File:** `sender.go` `deliverMessage()`  
-Code 11 is < 100 but is NOT a rejection — it means "header received" for
-add-to-only scenarios. Handle separately from the global rejection branch.
-Also treat code 11 as success in per-recipient handling for add-to recipients.
 
 ### 24. Handle missing per-user codes 102 and 103
 **File:** `sender.go` `deliverMessage()`  
@@ -166,21 +122,11 @@ and not part of the spec.
 
 ## P4 — Storage layer
 
-### 27. Distinguish to vs add-to in msg_to table
-**File:** `store.go` `storeMsgDetail()`  
-Need a way (boolean column, separate table, or ordering convention) to tell "to"
-from "add to" recipients so `loadMsg` can reconstruct both slices in order.
-
 ### 28. Store and load attachment metadata
 **File:** `store.go` `storeMsgDetail()` / `loadMsg()`  
 Insert attachment headers into `msg_attachment` and load them back into
 `FMsgHeader.Attachments` so the sender can write them on the wire and hashing is
 correct.
-
-### 29. Load add-to recipients separately in loadMsg
-**File:** `store.go` `loadMsg()`  
-Currently all recipients go into `FMsgHeader.To`. Populate `.To` and `.AddTo`
-separately, preserving wire-format order.
 
 ---
 

@@ -10,12 +10,14 @@ create table if not exists msg (
     id            	bigserial       	primary key,
 	version			int					not null,
     pid           	bigint          	references msg (id),
-	flags		  	int					not null,
+	no_reply		boolean				not null default false,
+	is_important	boolean				not null default false,
+	is_deflate		boolean				not null default false,
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null, 
     type          	varchar(255)    	not null,
-    sha256        	bytea           	unique not null,
+    sha256        	bytea           	unique,
     psha256       	bytea,
 	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
     filepath      	text            	not null
@@ -32,6 +34,17 @@ create table if not exists msg_to (
 	unique (msg_id, addr)
 );
 create index on msg_to ((lower(addr)));
+
+create table if not exists msg_add_to (
+	id				bigserial			primary key,
+	msg_id			bigint				not null references msg (id),
+	addr			varchar(255)		not null,
+    time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
+    time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
+    response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+	unique (msg_id, addr)
+);
+create index on msg_add_to ((lower(addr)));
 
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
@@ -56,4 +69,11 @@ $$ language plpgsql;
 drop trigger if exists trg_msg_to_insert on msg_to;
 create trigger trg_msg_to_insert
     after insert on msg_to
+    for each row execute function notify_msg_to_insert();
+
+-- notify when a new msg_add_to row is inserted with null time_delivered so the
+-- sender can pick it up immediately instead of waiting for the next poll.
+drop trigger if exists trg_msg_add_to_insert on msg_add_to;
+create trigger trg_msg_add_to_insert
+    after insert on msg_add_to
     for each row execute function notify_msg_to_insert();
