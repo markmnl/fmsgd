@@ -39,6 +39,11 @@ const (
 	FlagNoReply    uint8 = 1 << 4
 	FlagDeflate    uint8 = 1 << 5
 
+	// Attachment flag bit assignments per SPEC.md:
+	// bit 0 = common type, bit 1 = deflate, bits 2-7 = reserved.
+	AttachmentFlagCommonType uint8 = 1
+	AttachmentFlagDeflate    uint8 = 1 << 1
+
 	RejectCodeInvalid              uint8 = 1
 	RejectCodeUnsupportedVersion   uint8 = 2
 	RejectCodeUndisclosed          uint8 = 3
@@ -174,7 +179,6 @@ func setIDURL() {
 	if err != nil {
 		log.Panicf("ERROR: FMSG_ID_URL lookup failed, %s: %s", url, err)
 	}
-	// TODO ping URL to verify its up and responding in a timely manner
 	IDURI = rawUrl
 	log.Printf("INFO: ID URL: %s", IDURI)
 }
@@ -448,18 +452,29 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		h.Topic = string(topic)
 	}
 
-	// TODO [Spec 1.4.i.b / flag bit 2]: When the "common type" flag (bit 2) is
-	// set, the type field is a single uint8 that maps to a predefined Media Type
-	// string per the Common Media Types table. If the value has no mapping, reject
-	// with code 1 (invalid). Currently the code always reads type as uint8-prefixed
-	// string, ignoring the common type flag entirely.
-
-	// read type
-	mime, err := ReadUInt8Slice(r)
-	if err != nil {
-		return h, r, err
+	// read type: when common-type flag is set, the field is a single uint8
+	// index into the Common Media Types table; otherwise uint8 length + ASCII string.
+	if flags&FlagCommonType != 0 {
+		typeNum, err := r.ReadByte()
+		if err != nil {
+			return h, r, err
+		}
+		typStr, ok := numberToMediaType[typeNum]
+		if !ok {
+			codes := []byte{RejectCodeInvalid}
+			if err := rejectAccept(c, codes); err != nil {
+				return h, r, err
+			}
+			return h, r, fmt.Errorf("unknown common type number: %d", typeNum)
+		}
+		h.Type = typStr
+	} else {
+		mime, err := ReadUInt8Slice(r)
+		if err != nil {
+			return h, r, err
+		}
+		h.Type = string(mime)
 	}
-	h.Type = string(mime)
 
 	// read message size
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {

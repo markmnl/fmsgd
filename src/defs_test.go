@@ -387,7 +387,7 @@ func TestEncodeWithAttachments(t *testing.T) {
 		Size:      100,
 		Attachments: []FMsgAttachmentHeader{
 			{Flags: 0, Type: "image/png", Filename: "pic.png", Size: 2048},
-			{Flags: 1, Type: "a", Filename: "doc.txt", Size: 512},
+			{Flags: AttachmentFlagCommonType, Type: "application/pdf", Filename: "doc.txt", Size: 512},
 		},
 	}
 	b := h.Encode()
@@ -449,16 +449,14 @@ func TestEncodeWithAttachments(t *testing.T) {
 		t.Fatalf("att[0] size = %d, want 2048", att0Size)
 	}
 
-	// attachment 1
+	// attachment 1 (common type: application/pdf = 6)
 	att1Flags, _ := r.ReadByte()
-	if att1Flags != 1 {
-		t.Fatalf("att[1] flags = %d, want 1", att1Flags)
+	if att1Flags != AttachmentFlagCommonType {
+		t.Fatalf("att[1] flags = %d, want %d", att1Flags, AttachmentFlagCommonType)
 	}
-	att1TypeLen, _ := r.ReadByte()
-	att1Type := make([]byte, att1TypeLen)
-	r.Read(att1Type)
-	if string(att1Type) != "a" {
-		t.Fatalf("att[1] type = %q, want %q", string(att1Type), "a")
+	att1TypeNum, _ := r.ReadByte()
+	if att1TypeNum != 6 {
+		t.Fatalf("att[1] common type number = %d, want 6 (application/pdf)", att1TypeNum)
 	}
 	att1FnLen, _ := r.ReadByte()
 	att1Fn := make([]byte, att1FnLen)
@@ -474,5 +472,72 @@ func TestEncodeWithAttachments(t *testing.T) {
 
 	if r.Len() != 0 {
 		t.Fatalf("unexpected %d trailing bytes", r.Len())
+	}
+}
+
+func TestEncodeCommonType(t *testing.T) {
+	// When FlagCommonType is set, the type field should be a single uint8
+	// index (56 = "text/plain;charset=UTF-8") instead of length+string.
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     FlagCommonType,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp: 0,
+		Topic:     "",
+		Type:      "text/plain;charset=UTF-8",
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+
+	// skip from
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	// skip to count + to[0]
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	// skip timestamp
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	// skip topic (present because no pid)
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+
+	// type: should be single byte = 56
+	typeNum, _ := r.ReadByte()
+	if typeNum != 56 {
+		t.Fatalf("common type number = %d, want 56 (text/plain;charset=UTF-8)", typeNum)
+	}
+
+	// size + attachment count
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	attachCount, _ := r.ReadByte()
+	if attachCount != 0 {
+		t.Fatalf("attach count = %d, want 0", attachCount)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes", r.Len())
+	}
+
+	// Encoding with common type should be shorter than without
+	h2 := &FMsgHeader{
+		Version:   1,
+		Flags:     0,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp: 0,
+		Topic:     "",
+		Type:      "text/plain;charset=UTF-8",
+	}
+	b2 := h2.Encode()
+	// common type: 1 byte vs length-prefixed: 1 + 24 = 25 bytes → 24 bytes shorter
+	if len(b) >= len(b2) {
+		t.Fatalf("common type encoding (%d bytes) should be shorter than length-prefixed (%d bytes)", len(b), len(b2))
 	}
 }

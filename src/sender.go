@@ -419,12 +419,6 @@ func deliverMessage(target pendingTarget) {
 		}
 
 		// global rejection — update all locked recipients
-		//
-		// TODO [Spec]: Permanent failures (1 invalid, 2 unsupported version,
-		// 4 too big, 10 duplicate) should NOT be retried. Currently all global
-		// codes are stored identically; findPendingTargets only retries codes
-		// 3 and 5, which is correct for global codes. But ensure code 10
-		// (duplicate) is explicitly recognised as permanent and not retried.
 		log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 			target.MsgID, target.Domain, responseCodeName(code), code)
 		for _, a := range lockedAddrs {

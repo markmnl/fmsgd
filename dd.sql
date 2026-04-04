@@ -16,7 +16,8 @@ create table if not exists msg (
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null, 
-    type          	varchar(255)    	not null,
+    type          	varchar(255),								-- NULL when common_type is set (full string not needed on wire)
+	common_type		smallint,							-- common media type number when common type flag was set on received message, NULL otherwise; needed to faithfully reconstruct wire bytes for hash computation
     sha256        	bytea           	unique,
     psha256       	bytea,
 	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE

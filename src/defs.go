@@ -93,8 +93,18 @@ func (h *FMsgHeader) Encode() []byte {
 		b.WriteByte(byte(len(h.Topic)))
 		b.WriteString(h.Topic)
 	}
-	b.WriteByte(byte(len(h.Type)))
-	b.WriteString(h.Type)
+	// type: when common-type flag is set, write a single uint8 index;
+	// otherwise write uint8 length + ASCII string.
+	if h.Flags&FlagCommonType != 0 {
+		num, ok := mediaTypeToNumber[h.Type]
+		if !ok {
+			panic(fmt.Sprintf("common type flag set but %q has no mapping", h.Type))
+		}
+		b.WriteByte(num)
+	} else {
+		b.WriteByte(byte(len(h.Type)))
+		b.WriteString(h.Type)
+	}
 	// size (uint32 LE)
 	if err := binary.Write(&b, binary.LittleEndian, h.Size); err != nil {
 		panic(err)
@@ -103,8 +113,17 @@ func (h *FMsgHeader) Encode() []byte {
 	b.WriteByte(byte(len(h.Attachments)))
 	for _, att := range h.Attachments {
 		b.WriteByte(att.Flags)
-		b.WriteByte(byte(len(att.Type)))
-		b.WriteString(att.Type)
+		// attachment type: common-type flag is bit 0 of attachment flags
+		if att.Flags&AttachmentFlagCommonType != 0 {
+			num, ok := mediaTypeToNumber[att.Type]
+			if !ok {
+				panic(fmt.Sprintf("attachment common type flag set but %q has no mapping", att.Type))
+			}
+			b.WriteByte(num)
+		} else {
+			b.WriteByte(byte(len(att.Type)))
+			b.WriteString(att.Type)
+		}
 		b.WriteByte(byte(len(att.Filename)))
 		b.WriteString(att.Filename)
 		if err := binary.Write(&b, binary.LittleEndian, att.Size); err != nil {

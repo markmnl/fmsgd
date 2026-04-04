@@ -10,37 +10,8 @@ These are foundational: the header hash (used for challenge verification and pid
 references) and message hash (used for duplicate detection, challenge response,
 and pid) are both wrong until Encode() is complete.
 
-### ~~1. Encode() must include size and attachment headers~~ DONE
-**File:** `defs.go` `Encode()`
-Spec defines "message header" as all fields through the attachment headers.
-Encode() currently stops after the type field — it omits:
-  - size (uint32 LE)
-  - attachment count (uint8) + attachment headers (flags, type, filename, size)
-
 The header hash (SHA-256 of the encoded header) will be incorrect without these
 fields, which breaks challenge verification and pid references.
-
-### ~~2. Encode() must omit topic when pid is set~~ DONE
-**File:** `defs.go` `Encode()`
-Spec: "When pid exists the entire topic field MUST NOT be included on the wire."
-Encode() always writes the topic. It must only write topic when pid is absent.
-
-### 3. Encode() must support common-type encoding for type field
-**File:** `defs.go` `Encode()`
-When common-type flag (bit 2) is set, type on the wire is a single uint8 index,
-not a length-prefixed string. Encode() always writes length-prefixed.
-
-### ~~4. Add Attachments field to FMsgHeader~~ DONE
-**File:** `defs.go` struct
-Add `Attachments []FMsgAttachmentHeader` to store parsed attachment headers.
-Required before Encode() can include attachment headers, before attachment
-parsing/validation/download, and before hash computation is correct.
-
-### ~~5. Complete FMsgAttachmentHeader struct~~ DONE
-**File:** `defs.go` struct
-Currently only has Filename, Size, Filepath. Missing per-spec fields:
-  - Flags (uint8) — including per-attachment common-type (bit 0) and deflate (bit 1)
-  - Type (string) — the attachment's media type
 
 ### 6. Add ChallengeCompleted flag to FMsgHeader
 **File:** `defs.go` struct
@@ -48,13 +19,6 @@ Add `ChallengeCompleted bool` to distinguish "challenge was completed and
 ChallengeHash is valid" from "challenge was not performed." Without this, the
 hash check in downloadMessage erroneously fails when the challenge was skipped.
 
-### ~~7. GetMessageHash() must include attachment data~~ DONE
-**File:** `defs.go` `GetMessageHash()`
-Spec: message hash is SHA-256 of the entire message — header + data +
-attachment data. Currently attachment data (sequential byte sequences following
-the message body) is not included.
-
----
 
 ## P1 — Receiving: Header Exchange (host.go readHeader)
 
@@ -72,18 +36,7 @@ returns an error without sending any code.
 ### 10. Validate at least one "to" recipient
 **File:** `host.go` `readHeader()`
 Spec 1.4.i.a: If to count is 0, reject code 1 (invalid). Currently no check.
-
-### ~~11. Make topic conditional on pid absence~~ DONE
-**File:** `host.go` `readHeader()`
-Spec: topic field is only present when pid is NOT set. Currently topic is
-read unconditionally regardless of pid.
-
-### 12. Handle common-type flag for type field
-**File:** `host.go` `readHeader()`
-When common-type flag (bit 2) is set, type is a single uint8 index into the
-Common Media Types table. If the value has no mapping → reject code 1.
-Currently always reads type as a length-prefixed string.
-
+\
 ### 13. Parse and validate attachment headers
 **File:** `host.go` `readHeader()`
 Currently rejects any non-zero attachment count. Must:
@@ -123,11 +76,6 @@ referenced by pid." Not currently checked.
 ---
 
 ## P2 — Receiving: Challenge (host.go challenge)
-
-### ~~18. Connection 2 must target same IP as Connection 1~~ DONE
-**File:** `host.go` `challenge()`
-Spec 2.1: Dial conn.RemoteAddr() IP, not h.From.Domain. Dialling the domain
-may resolve to a different IP.
 
 ### 19. Make challenge mode configurable
 **File:** `host.go` `challenge()` / `handleConn()`

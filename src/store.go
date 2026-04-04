@@ -9,6 +9,28 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// commonTypeParam returns the common media type number (as *int16) if the
+// FlagCommonType flag is set on msg, or nil otherwise. Used as the SQL
+// parameter for the nullable common_type column.
+func commonTypeParam(msg *FMsgHeader) interface{} {
+	if msg.Flags&FlagCommonType != 0 {
+		if num, ok := mediaTypeToNumber[msg.Type]; ok {
+			v := int16(num)
+			return &v
+		}
+	}
+	return nil
+}
+
+// typeParam returns the type string when common type flag is NOT set, or nil
+// when common type flag IS set (the number in common_type is sufficient).
+func typeParam(msg *FMsgHeader) interface{} {
+	if msg.Flags&FlagCommonType != 0 {
+		return nil
+	}
+	return msg.Type
+}
+
 func testDb() error {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
@@ -89,11 +111,12 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	, from_addr
 	, topic
 	, type
+	, common_type
 	, sha256
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -102,7 +125,8 @@ returning id`,
 		msg.Timestamp,
 		msg.From.ToString(),
 		msg.Topic,
-		msg.Type,
+		typeParam(msg),
+		commonTypeParam(msg),
 		msgHash,
 		msg.Pid,
 		int(msg.Size),
@@ -195,11 +219,12 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	, from_addr
 	, topic
 	, type
+	, common_type
 	, sha256
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -208,7 +233,8 @@ returning id`,
 		msg.Timestamp,
 		msg.From.ToString(),
 		msg.Topic,
-		msg.Type,
+		typeParam(msg),
+		commonTypeParam(msg),
 		headerHash,
 		msg.Pid,
 		int(msg.Size),
@@ -271,14 +297,24 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	var version, size int
 	var noReply, isImportant, isDeflate bool
 	var pid, msgHash []byte
-	var fromAddr, topic, typ, filepath string
+	var fromAddr, topic, filepath string
+	var typ sql.NullString
+	var commonType sql.NullInt16
 	var timeSent float64
 	err := tx.QueryRow(`
-		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, common_type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &topic, &typ, &commonType, &timeSent, &size, &filepath)
 	if err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
+	}
+
+	// Resolve the type string: prefer the stored string; fall back to common type number.
+	var resolvedType string
+	if typ.Valid {
+		resolvedType = typ.String
+	} else if commonType.Valid {
+		resolvedType = numberToMediaType[uint8(commonType.Int16)]
 	}
 
 	recipRows, err := tx.Query(`SELECT addr FROM msg_to WHERE msg_id = $1 ORDER BY id`, msgID)
@@ -343,7 +379,7 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	// When add-to recipients exist on a root message (no pid), set pid to the
 	// message's own hash so the wire format is valid: spec requires pid when
 	// add-to is present. This turns the outgoing message into an add-to
-	// notification referencing the original message.
+	// notification referencing the original message. TODO FIXME
 	if len(allAddTo) > 0 && len(pid) == 0 {
 		pid = msgHash
 	}
@@ -363,6 +399,9 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	if isDeflate {
 		flags |= FlagDeflate
 	}
+	if commonType.Valid {
+		flags |= FlagCommonType
+	}
 
 	return &FMsgHeader{
 		Version:   uint8(version),
@@ -373,7 +412,7 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 		AddTo:     allAddTo,
 		Timestamp: timeSent,
 		Topic:     topic,
-		Type:      typ,
+		Type:      resolvedType,
 		Size:      uint32(size),
 		Filepath:  filepath,
 	}, nil
