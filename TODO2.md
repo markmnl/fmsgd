@@ -20,7 +20,7 @@ Encode() currently stops after the type field — it omits:
 The header hash (SHA-256 of the encoded header) will be incorrect without these
 fields, which breaks challenge verification and pid references.
 
-### 2. Encode() must omit topic when pid is set
+### ~~2. Encode() must omit topic when pid is set~~ DONE
 **File:** `defs.go` `Encode()`
 Spec: "When pid exists the entire topic field MUST NOT be included on the wire."
 Encode() always writes the topic. It must only write topic when pid is absent.
@@ -73,7 +73,7 @@ returns an error without sending any code.
 **File:** `host.go` `readHeader()`
 Spec 1.4.i.a: If to count is 0, reject code 1 (invalid). Currently no check.
 
-### 11. Make topic conditional on pid absence
+### ~~11. Make topic conditional on pid absence~~ DONE
 **File:** `host.go` `readHeader()`
 Spec: topic field is only present when pid is NOT set. Currently topic is
 read unconditionally regardless of pid.

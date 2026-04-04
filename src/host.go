@@ -437,16 +437,14 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		return h, r, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
 	}
 
-	// TODO [Spec definition]: Topic is only present when pid is NOT set (first
-	// message in a thread). When pid exists the entire topic field MUST NOT be
-	// included on the wire. Currently topic is read unconditionally.
-
-	// read topic
-	topic, err := ReadUInt8Slice(r)
-	if err != nil {
-		return h, r, err
+	// read topic — only present when pid is NOT set (first message in a thread)
+	if flags&FlagHasPid == 0 {
+		topic, err := ReadUInt8Slice(r)
+		if err != nil {
+			return h, r, err
+		}
+		h.Topic = string(topic)
 	}
-	h.Topic = string(topic)
 
 	// TODO [Spec 1.4.i.b / flag bit 2]: When the "common type" flag (bit 2) is
 	// set, the type field is a single uint8 that maps to a predefined Media Type
