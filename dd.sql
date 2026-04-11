@@ -60,12 +60,6 @@ create table if not exists msg_attachment (
     primary key (msg_id, filename)
 );
 
--- migrations for existing databases
-ALTER TABLE msg_attachment ADD COLUMN IF NOT EXISTS position smallint not null default 0;
-ALTER TABLE msg_attachment ADD COLUMN IF NOT EXISTS flags smallint not null default 0;
-ALTER TABLE msg_attachment ADD COLUMN IF NOT EXISTS type varchar(255) not null default 'application/octet-stream';
-ALTER TABLE msg ADD COLUMN IF NOT EXISTS add_to_from varchar(255);
-
 -- notify when a new msg_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
 create or replace function notify_msg_to_insert() returns trigger as $$
