@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"encoding/binary"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -193,6 +197,7 @@ func TestEncodeWithAddTo(t *testing.T) {
 		Pid:       pid,
 		From:      FMsgAddress{User: "a", Domain: "b.com"},
 		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		AddToFrom: &FMsgAddress{User: "a", Domain: "b.com"},
 		AddTo:     []FMsgAddress{{User: "e", Domain: "f.com"}},
 		Timestamp: 0,
 		Topic:     "",
@@ -222,6 +227,14 @@ func TestEncodeWithAddTo(t *testing.T) {
 	tBuf := make([]byte, tLen)
 	r.Read(tBuf)
 
+	// add-to-from
+	addToFromLen, _ := r.ReadByte()
+	addToFrom := make([]byte, addToFromLen)
+	r.Read(addToFrom)
+	if string(addToFrom) != "@a@b.com" {
+		t.Fatalf("add-to-from = %q, want %q", string(addToFrom), "@a@b.com")
+	}
+
 	// add to count
 	addToCount, _ := r.ReadByte()
 	if addToCount != 1 {
@@ -234,6 +247,38 @@ func TestEncodeWithAddTo(t *testing.T) {
 	r.Read(atBuf)
 	if string(atBuf) != "@e@f.com" {
 		t.Fatalf("add to[0] = %q, want %q", string(atBuf), "@e@f.com")
+	}
+}
+
+func TestEncodeWithAddToDefaultsAddToFromToFromAddress(t *testing.T) {
+	pid := make([]byte, 32)
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     FlagHasPid | FlagHasAddTo,
+		Pid:       pid,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		AddTo:     []FMsgAddress{{User: "e", Domain: "f.com"}},
+		Timestamp: 0,
+		Type:      "text/plain",
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+	r.Read(make([]byte, 32))
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	r.ReadByte() // to count
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+
+	addToFromLen, _ := r.ReadByte()
+	addToFrom := make([]byte, addToFromLen)
+	r.Read(addToFrom)
+	if string(addToFrom) != "@a@b.com" {
+		t.Fatalf("default add-to-from = %q, want %q", string(addToFrom), "@a@b.com")
 	}
 }
 
@@ -293,6 +338,24 @@ func TestGetHeaderHash(t *testing.T) {
 	expected := sha256.Sum256(h.Encode())
 	if !bytes.Equal(hash, expected[:]) {
 		t.Fatal("GetHeaderHash does not match sha256(Encode())")
+	}
+}
+
+func TestGetHeaderHashCommonTypeMatchesWireIDEncoding(t *testing.T) {
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     FlagCommonType,
+		From:      FMsgAddress{User: "alice", Domain: "a.com"},
+		To:        []FMsgAddress{{User: "bob", Domain: "b.com"}},
+		Timestamp: 1700000000,
+		Topic:     "x",
+		TypeID:    3,
+		Type:      "application/json",
+	}
+	expected := sha256.Sum256(h.Encode())
+	got := h.GetHeaderHash()
+	if !bytes.Equal(got, expected[:]) {
+		t.Fatalf("GetHeaderHash mismatch for common type ID")
 	}
 }
 
@@ -387,7 +450,7 @@ func TestEncodeWithAttachments(t *testing.T) {
 		Size:      100,
 		Attachments: []FMsgAttachmentHeader{
 			{Flags: 0, Type: "image/png", Filename: "pic.png", Size: 2048},
-			{Flags: 1, Type: "a", Filename: "doc.txt", Size: 512},
+			{Flags: 1, TypeID: 38, Type: "image/png", Filename: "doc.txt", Size: 512},
 		},
 	}
 	b := h.Encode()
@@ -454,11 +517,9 @@ func TestEncodeWithAttachments(t *testing.T) {
 	if att1Flags != 1 {
 		t.Fatalf("att[1] flags = %d, want 1", att1Flags)
 	}
-	att1TypeLen, _ := r.ReadByte()
-	att1Type := make([]byte, att1TypeLen)
-	r.Read(att1Type)
-	if string(att1Type) != "a" {
-		t.Fatalf("att[1] type = %q, want %q", string(att1Type), "a")
+	att1TypeID, _ := r.ReadByte()
+	if att1TypeID != 38 {
+		t.Fatalf("att[1] type ID = %d, want 38", att1TypeID)
 	}
 	att1FnLen, _ := r.ReadByte()
 	att1Fn := make([]byte, att1FnLen)
@@ -474,5 +535,107 @@ func TestEncodeWithAttachments(t *testing.T) {
 
 	if r.Len() != 0 {
 		t.Fatalf("unexpected %d trailing bytes", r.Len())
+	}
+}
+
+func TestEncodeWithCommonMessageType(t *testing.T) {
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     FlagCommonType,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp: 0,
+		Topic:     "",
+		TypeID:    3,
+		Type:      "application/json",
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+
+	// skip from
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	// skip to count + to[0]
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	// skip timestamp
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	// skip topic
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+
+	typeID, _ := r.ReadByte()
+	if typeID != 3 {
+		t.Fatalf("type ID = %d, want 3", typeID)
+	}
+}
+
+func TestGetMessageHashUsesDecompressedPayloads(t *testing.T) {
+	compress := func(data []byte) []byte {
+		var b bytes.Buffer
+		w := zlib.NewWriter(&b)
+		if _, err := w.Write(data); err != nil {
+			t.Fatalf("zlib write: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("zlib close: %v", err)
+		}
+		return b.Bytes()
+	}
+
+	msgPlain := []byte("hello compressed body")
+	attPlain := []byte("hello compressed attachment")
+	msgWire := compress(msgPlain)
+	attWire := compress(attPlain)
+
+	tmpDir := t.TempDir()
+	msgPath := filepath.Join(tmpDir, "msg.bin")
+	if err := os.WriteFile(msgPath, msgWire, 0600); err != nil {
+		t.Fatalf("write msg file: %v", err)
+	}
+	attPath := filepath.Join(tmpDir, "att.bin")
+	if err := os.WriteFile(attPath, attWire, 0600); err != nil {
+		t.Fatalf("write attachment file: %v", err)
+	}
+
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     FlagDeflate,
+		From:      FMsgAddress{User: "alice", Domain: "a.com"},
+		To:        []FMsgAddress{{User: "bob", Domain: "b.com"}},
+		Timestamp: 1700000000,
+		Topic:     "t",
+		Type:      "text/plain",
+		Size:      uint32(len(msgWire)),
+		Attachments: []FMsgAttachmentHeader{
+			{Flags: 1 << 1, Type: "application/octet-stream", Filename: "a.bin", Size: uint32(len(attWire)), Filepath: attPath},
+		},
+		Filepath: msgPath,
+	}
+
+	got, err := h.GetMessageHash()
+	if err != nil {
+		t.Fatalf("GetMessageHash() error: %v", err)
+	}
+
+	manual := sha256.New()
+	if _, err := io.Copy(manual, bytes.NewReader(h.Encode())); err != nil {
+		t.Fatalf("manual header copy: %v", err)
+	}
+	if _, err := manual.Write(msgPlain); err != nil {
+		t.Fatalf("manual msg write: %v", err)
+	}
+	if _, err := manual.Write(attPlain); err != nil {
+		t.Fatalf("manual att write: %v", err)
+	}
+	want := manual.Sum(nil)
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("message hash mismatch: got %x want %x", got, want)
 	}
 }
