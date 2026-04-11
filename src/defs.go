@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -18,6 +19,7 @@ type FMsgAddress struct {
 
 type FMsgAttachmentHeader struct {
 	Flags    uint8
+	TypeID   uint8
 	Type     string
 	Filename string
 	Size     uint32
@@ -31,8 +33,10 @@ type FMsgHeader struct {
 	Pid       []byte
 	From      FMsgAddress
 	To        []FMsgAddress
+	AddToFrom *FMsgAddress // Present when has-add-to flag is set
 	AddTo     []FMsgAddress
 	Timestamp float64
+	TypeID    uint8
 	Topic     string
 	Type      string
 
@@ -40,17 +44,12 @@ type FMsgHeader struct {
 	Size        uint32
 	Attachments []FMsgAttachmentHeader
 
-	HeaderHash []byte
-	// Hash of message from challenge response
-	ChallengeHash [32]byte
-	// TODO [Spec]: Add a ChallengeCompleted bool (or similar sentinel) to
-	// distinguish "challenge was completed and ChallengeHash is valid" from
-	// "challenge was not performed and ChallengeHash is zero-valued".
-	// Absolute filepath set when downloaded
-	Filepath string
-
-	// Actual hash of message data including any attachments
-	messageHash []byte
+	HeaderHash          []byte
+	ChallengeHash       [32]byte
+	ChallengeCompleted  bool  // True if challenge was initiated and completed
+	InitialResponseCode uint8 // Protocol response chosen after header validation (64/65)
+	Filepath            string
+	messageHash         []byte
 }
 
 // Returns a string representation of an address in the form @user@example.com
@@ -78,6 +77,15 @@ func (h *FMsgHeader) Encode() []byte {
 		b.WriteString(str)
 	}
 	if h.Flags&FlagHasAddTo != 0 {
+		// add-to-from address (field 6)
+		addToFrom := h.AddToFrom
+		if addToFrom == nil {
+			addToFrom = &h.From
+		}
+		str := addToFrom.ToString()
+		b.WriteByte(byte(len(str)))
+		b.WriteString(str)
+		// add-to addresses (field 7)
 		b.WriteByte(byte(len(h.AddTo)))
 		for _, addr := range h.AddTo {
 			str = addr.ToString()
@@ -93,8 +101,18 @@ func (h *FMsgHeader) Encode() []byte {
 		b.WriteByte(byte(len(h.Topic)))
 		b.WriteString(h.Topic)
 	}
-	b.WriteByte(byte(len(h.Type)))
-	b.WriteString(h.Type)
+	if h.Flags&FlagCommonType != 0 {
+		typeID := h.TypeID
+		if typeID == 0 {
+			if id, ok := getCommonMediaTypeID(h.Type); ok {
+				typeID = id
+			}
+		}
+		b.WriteByte(typeID)
+	} else {
+		b.WriteByte(byte(len(h.Type)))
+		b.WriteString(h.Type)
+	}
 	// size (uint32 LE)
 	if err := binary.Write(&b, binary.LittleEndian, h.Size); err != nil {
 		panic(err)
@@ -103,8 +121,18 @@ func (h *FMsgHeader) Encode() []byte {
 	b.WriteByte(byte(len(h.Attachments)))
 	for _, att := range h.Attachments {
 		b.WriteByte(att.Flags)
-		b.WriteByte(byte(len(att.Type)))
-		b.WriteString(att.Type)
+		if att.Flags&1 != 0 {
+			typeID := att.TypeID
+			if typeID == 0 {
+				if id, ok := getCommonMediaTypeID(att.Type); ok {
+					typeID = id
+				}
+			}
+			b.WriteByte(typeID)
+		} else {
+			b.WriteByte(byte(len(att.Type)))
+			b.WriteString(att.Type)
+		}
 		b.WriteByte(byte(len(att.Filename)))
 		b.WriteString(att.Filename)
 		if err := binary.Write(&b, binary.LittleEndian, att.Size); err != nil {
@@ -152,12 +180,6 @@ func (h *FMsgHeader) GetHeaderHash() []byte {
 
 func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 	if h.messageHash == nil {
-		f, err := os.Open(h.Filepath)
-		if err != nil {
-			return nil, err
-		}
-		defer f.Close()
-
 		hash := sha256.New()
 
 		headerBytes := h.Encode()
@@ -165,25 +187,45 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 			return nil, err
 		}
 
-		if _, err := io.Copy(hash, f); err != nil {
+		if err := hashPayload(hash, h.Filepath, int64(h.Size), h.Flags&FlagDeflate != 0); err != nil {
 			return nil, err
 		}
 
 		// include attachment data (sequential byte sequences following
 		// the message body, bounded by attachment header sizes)
 		for _, att := range h.Attachments {
-			af, err := os.Open(att.Filepath)
-			if err != nil {
-				return nil, fmt.Errorf("open attachment %s: %w", att.Filename, err)
+			compressed := att.Flags&(1<<1) != 0
+			if err := hashPayload(hash, att.Filepath, int64(att.Size), compressed); err != nil {
+				return nil, fmt.Errorf("hash attachment %s: %w", att.Filename, err)
 			}
-			if _, err := io.CopyN(hash, af, int64(att.Size)); err != nil {
-				af.Close()
-				return nil, fmt.Errorf("read attachment %s: %w", att.Filename, err)
-			}
-			af.Close()
 		}
 
 		h.messageHash = hash.Sum(nil)
 	}
 	return h.messageHash, nil
+}
+
+func hashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool) error {
+	f, err := os.Open(filepath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if deflated {
+		lr := io.LimitReader(f, wireSize)
+		zr, err := zlib.NewReader(lr)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(dst, zr)
+		_ = zr.Close()
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	_, err = io.CopyN(dst, f, wireSize)
+	return err
 }

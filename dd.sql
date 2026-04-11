@@ -15,6 +15,7 @@ create table if not exists msg (
 	is_deflate		boolean				not null default false,
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
+    add_to_from   	varchar(255),
     topic         	varchar(255)    	not null, 
     type          	varchar(255)    	not null,
     sha256        	bytea           	unique,
@@ -31,6 +32,7 @@ create table if not exists msg_to (
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
     response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+    attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
 create index on msg_to ((lower(addr)));
@@ -42,12 +44,16 @@ create table if not exists msg_add_to (
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
     response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+    attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
 create index on msg_add_to ((lower(addr)));
 
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
+    position      	smallint        not null default 0,
+    flags         	smallint        not null default 0,
+    type          	varchar(255)    not null default 'application/octet-stream',
     filename      	varchar(255)    not null,
     filesize      	int             not null, 
     filepath      	text			not null,

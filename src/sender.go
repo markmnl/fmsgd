@@ -37,14 +37,6 @@ type pendingTarget struct {
 // findPendingTargets discovers (msg_id, domain) pairs with undelivered,
 // retryable recipients. This is a lightweight read-only query — row-level
 // locks are acquired per-delivery in deliverMessage.
-//
-// TODO [Spec]: Spec says to retry "with back-off" (e.g. exponential back-off).
-// Currently uses a fixed RetryInterval. Implement an exponential back-off
-// strategy — e.g. double the wait after each failed attempt per (msg, domain).
-//
-// TODO [Spec]: Per-user code 101 (user full = "insufficient resources for
-// specific recipient") is analogous to global code 5 and is likely transient.
-// Consider adding 101 to the retryable set alongside codes 3 and 5.
 func findPendingTargets() ([]pendingTarget, error) {
 	db, err := sql.Open("postgres", "")
 	if err != nil {
@@ -61,8 +53,8 @@ func findPendingTargets() ([]pendingTarget, error) {
 		INNER JOIN msg m ON m.id = mt.msg_id
 		WHERE mt.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5))
-		  AND (mt.time_last_attempt IS NULL OR ($1 - mt.time_last_attempt) > $2)
+		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5, 101))
+		  AND (mt.time_last_attempt IS NULL OR ($1 - mt.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(mt.attempt_count - 1, 0)::float), $3))
 		  AND ($1 - m.time_sent) < $3
 		UNION ALL
 		SELECT mat.msg_id, mat.addr
@@ -70,8 +62,8 @@ func findPendingTargets() ([]pendingTarget, error) {
 		INNER JOIN msg m ON m.id = mat.msg_id
 		WHERE mat.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5))
-		  AND (mat.time_last_attempt IS NULL OR ($1 - mat.time_last_attempt) > $2)
+		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5, 101))
+		  AND (mat.time_last_attempt IS NULL OR ($1 - mat.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $3))
 		  AND ($1 - m.time_sent) < $3
 	`, now, RetryInterval, RetryMaxAge)
 	if err != nil {
@@ -107,6 +99,73 @@ func findPendingTargets() ([]pendingTarget, error) {
 		}
 	}
 	return targets, rows.Err()
+}
+
+// sendMsgData transmits the message body then all attachment payloads on conn.
+func sendMsgData(conn net.Conn, h *FMsgHeader) error {
+	fd, err := os.Open(h.Filepath)
+	if err != nil {
+		return fmt.Errorf("opening data file %s: %w", h.Filepath, err)
+	}
+	defer fd.Close()
+
+	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int(h.Size), MinUploadRate)))
+	if _, err := io.CopyN(conn, fd, int64(h.Size)); err != nil {
+		return fmt.Errorf("sending data: %w", err)
+	}
+	for _, att := range h.Attachments {
+		af, err := os.Open(att.Filepath)
+		if err != nil {
+			return fmt.Errorf("opening attachment %s: %w", att.Filename, err)
+		}
+		_, copyErr := io.CopyN(conn, af, int64(att.Size))
+		af.Close()
+		if copyErr != nil {
+			return fmt.Errorf("sending attachment %s: %w", att.Filename, copyErr)
+		}
+	}
+	return nil
+}
+
+// updateRecipient records a delivery outcome for one address in table.
+// Deliveries set time_delivered; failures set time_last_attempt and increment
+// attempt_count to drive exponential back-off on subsequent retries.
+func updateRecipient(tx *sql.Tx, table, addr string, msgID int64, now float64, code int, delivered bool) {
+	var err error
+	if delivered {
+		_, err = tx.Exec(fmt.Sprintf(`
+			UPDATE %s SET time_delivered = $1, response_code = $2
+			WHERE msg_id = $3 AND addr = $4
+		`, table), now, code, msgID, addr)
+	} else {
+		_, err = tx.Exec(fmt.Sprintf(`
+			UPDATE %s SET time_last_attempt = $1, response_code = $2,
+			              attempt_count = attempt_count + 1
+			WHERE msg_id = $3 AND addr = $4
+		`, table), now, code, msgID, addr)
+	}
+	if err != nil {
+		log.Printf("ERROR: sender: update recipient %s: %s", addr, err)
+	}
+}
+
+// updateAllLocked applies the same outcome to every locked to and add-to address.
+func updateAllLocked(tx *sql.Tx, lockedAddrs, lockedAddToAddrs []string, msgID int64, now float64, code int, delivered bool) {
+	for _, a := range lockedAddrs {
+		updateRecipient(tx, "msg_to", a, msgID, now, code, delivered)
+	}
+	for _, a := range lockedAddToAddrs {
+		updateRecipient(tx, "msg_add_to", a, msgID, now, code, delivered)
+	}
+}
+
+// commitOrLog commits the transaction and marks it as committed.
+func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
+	if err := tx.Commit(); err != nil {
+		log.Printf("ERROR: sender: commit tx for msg %d: %s", msgID, err)
+	} else {
+		*committed = true
+	}
 }
 
 // deliverMessage handles delivery of a single message to a single remote domain.
@@ -168,8 +227,8 @@ func deliverMessage(target pendingTarget) {
 		WHERE mt.msg_id = $1
 		  AND mt.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5))
-		  AND (mt.time_last_attempt IS NULL OR ($2 - mt.time_last_attempt) > $3)
+		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5, 101))
+		  AND (mt.time_last_attempt IS NULL OR ($2 - mt.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mt.attempt_count - 1, 0)::float), $4))
 		  AND ($2 - m.time_sent) < $4
 		FOR UPDATE OF mt SKIP LOCKED
 	`, target.MsgID, now, RetryInterval, RetryMaxAge)
@@ -205,8 +264,8 @@ func deliverMessage(target pendingTarget) {
 		WHERE mat.msg_id = $1
 		  AND mat.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5))
-		  AND (mat.time_last_attempt IS NULL OR ($2 - mat.time_last_attempt) > $3)
+		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5, 101))
+		  AND (mat.time_last_attempt IS NULL OR ($2 - mat.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $4))
 		  AND ($2 - m.time_sent) < $4
 		FOR UPDATE OF mat SKIP LOCKED
 	`, target.MsgID, now, RetryInterval, RetryMaxAge)
@@ -258,19 +317,13 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	// Register in outgoing map so challenge handler can look up this message
+	// Compute header hash now; registerOutgoing with Host B's IP happens after
+	// the connection is established (IP needed for challenge validation §10.5).
 	hash := h.GetHeaderHash()
 	hashArr := *(*[32]byte)(hash)
-	log.Printf("INFO: sender: registering outgoing message %s", hex.EncodeToString(hash[:]))
-	registerOutgoing(hashArr, h)
-	defer deleteOutgoing(hashArr)
 
-	// Build the list of recipients on the target domain (in order) and
-	// note which ones we locked (i.e. are pending delivery this round). Per spec,
-	// response codes arrive per-recipient in to then add-to order excluding other domains.
-	// TODO check retry logic when some recipients on this domain are not locked
-	// (e.g. already delivered or locked by another sender) — do we still get
-	// per-recipient codes for the locked ones?
+	// Build the list of recipients on the target domain in to then add-to order.
+	// Per spec, per-recipient response codes follow the same order.
 	lockedSet := make(map[string]bool)
 	for _, a := range lockedAddrs {
 		lockedSet[strings.ToLower(a)] = true
@@ -307,13 +360,10 @@ func deliverMessage(target pendingTarget) {
 
 	// --- network delivery ---
 
-	// TODO [Spec]: DNSSEC validation SHOULD be performed on the DNS lookup.
-	// If DNSSEC validation fails the connection MUST terminate (no retry).
-	// lookupAuthorisedIPs does not currently perform or report DNSSEC validation.
 	targetIPs, err := lookupAuthorisedIPs(target.Domain)
 	if err != nil {
 		log.Printf("ERROR: sender: DNS lookup for _fmsg.%s failed: %s", target.Domain, err)
-		return // rollback, retry later
+		return
 	}
 
 	var conn net.Conn
@@ -327,177 +377,101 @@ func deliverMessage(target pendingTarget) {
 	}
 	if conn == nil {
 		log.Printf("ERROR: sender: could not connect to any IP for _fmsg.%s", target.Domain)
-		return // rollback, retry later
+		return
 	}
 	defer conn.Close()
 
-	// Send header — Encode() writes all fields through attachment headers per spec
-	headerBytes := h.Encode()
-	if _, err := conn.Write(headerBytes); err != nil {
-		log.Printf("ERROR: sender: writing header: %s", err)
+	// Register in outgoing map with Host B's IP before sending the header so
+	// any incoming challenge can be matched by hash AND IP (§10.2 step 2).
+	connectedIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+	log.Printf("INFO: sender: registering outgoing message %s (%s)", hex.EncodeToString(hashArr[:]), connectedIP)
+	registerOutgoing(hashArr, h, connectedIP)
+	defer removeOutgoingIP(hashArr, connectedIP)
+
+	// Step 3: Transmit message header.
+	if _, err := conn.Write(h.Encode()); err != nil {
+		log.Printf("ERROR: sender: writing header for msg %d: %s", target.MsgID, err)
 		return
 	}
 
-	// message data
-	fd, err := os.Open(h.Filepath)
-	if err != nil {
-		log.Printf("ERROR: sender: opening file %s: %s", h.Filepath, err)
-		return
-	}
-	defer fd.Close()
-
-	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int(h.Size), MinUploadRate)))
-	n, err := io.CopyN(conn, fd, int64(h.Size))
-	if n != int64(h.Size) {
-		log.Printf("ERROR: sender: file size mismatch for msg %d: expected %d, got %d", target.MsgID, h.Size, n)
-		return
-	}
-	if err != nil {
-		log.Printf("ERROR: sender: sending data (%d/%d bytes): %s", n, h.Size, err)
-		return
-	}
-
-	// attachment data — sequential byte sequences bounded by header sizes
-	for _, att := range h.Attachments {
-		af, err := os.Open(att.Filepath)
-		if err != nil {
-			log.Printf("ERROR: sender: opening attachment %s: %s", att.Filename, err)
-			return
-		}
-		an, err := io.CopyN(conn, af, int64(att.Size))
-		af.Close()
-		if an != int64(att.Size) {
-			log.Printf("ERROR: sender: attachment %s size mismatch: expected %d, got %d", att.Filename, att.Size, an)
-			return
-		}
-		if err != nil {
-			log.Printf("ERROR: sender: sending attachment %s: %s", att.Filename, err)
-			return
-		}
-	}
-
-	// --- read response ---
-	// A code < 100 is a global rejection (single byte for all recipients).
-	// Otherwise one code per recipient on this domain, in To-field order.
+	// Step 5: Read the initial response byte before sending any data (§10.2 step 5).
+	// The challenge handler may fire on a separate goroutine during this wait.
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-	firstByte := make([]byte, 1)
-	if _, err := io.ReadFull(conn, firstByte); err != nil {
-		log.Printf("ERROR: sender: reading response: %s", err)
-		return // rollback, retry later
+	initCode := make([]byte, 1)
+	if _, err := io.ReadFull(conn, initCode); err != nil {
+		log.Printf("ERROR: sender: reading initial response for msg %d: %s", target.MsgID, err)
+		return
 	}
-
-	code := firstByte[0]
 	now = timeutil.TimestampNow().Float64()
+	isAddToMsg := h.Flags&FlagHasAddTo != 0
 
-	if code < 100 {
-		// Code 11 (accept add to) — additional recipients received.
-		if code == AcceptCodeAddTo {
-			log.Printf("INFO: sender: msg %d additional recipients received by %s (code 11)", target.MsgID, target.Domain)
-			for _, a := range lockedAddrs {
-				if _, err := tx.Exec(`
-					UPDATE msg_to SET time_delivered = $1, response_code = $2
-					WHERE msg_id = $3 AND addr = $4
-				`, now, int(code), target.MsgID, a); err != nil {
-					log.Printf("ERROR: sender: update delivered for %s: %s", a, err)
-				}
-			}
-			for _, a := range lockedAddToAddrs {
-				if _, err := tx.Exec(`
-					UPDATE msg_add_to SET time_delivered = $1, response_code = $2
-					WHERE msg_id = $3 AND addr = $4
-				`, now, int(code), target.MsgID, a); err != nil {
-					log.Printf("ERROR: sender: update delivered add-to for %s: %s", a, err)
-				}
-			}
-			if err := tx.Commit(); err != nil {
-				log.Printf("ERROR: sender: commit tx for msg %d: %s", target.MsgID, err)
-			} else {
-				committed = true
-			}
+	switch initCode[0] {
+	case AcceptCodeContinue: // 64 — send data + attachments, then per-recipient codes
+		if err := sendMsgData(conn, h); err != nil {
+			log.Printf("ERROR: sender: %s (msg %d)", err, target.MsgID)
 			return
 		}
-
-		// global rejection — update all locked recipients
-		//
-		// TODO [Spec]: Permanent failures (1 invalid, 2 unsupported version,
-		// 4 too big, 10 duplicate) should NOT be retried. Currently all global
-		// codes are stored identically; findPendingTargets only retries codes
-		// 3 and 5, which is correct for global codes. But ensure code 10
-		// (duplicate) is explicitly recognised as permanent and not retried.
-		log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
-			target.MsgID, target.Domain, responseCodeName(code), code)
-		for _, a := range lockedAddrs {
-			if _, err := tx.Exec(`
-				UPDATE msg_to SET time_last_attempt = $1, response_code = $2
-				WHERE msg_id = $3 AND addr = $4
-			`, now, int(code), target.MsgID, a); err != nil {
-				log.Printf("ERROR: sender: update last attempt for %s: %s", a, err)
-			}
+	case AcceptCodeSkipData: // 65 — add-to, parent stored, recipients on this host; skip data
+		if !isAddToMsg {
+			log.Printf("WARN: sender: msg %d received protocol-invalid code 65 from %s for non-add-to message, terminating",
+				target.MsgID, target.Domain)
+			return
 		}
-		for _, a := range lockedAddToAddrs {
-			if _, err := tx.Exec(`
-				UPDATE msg_add_to SET time_last_attempt = $1, response_code = $2
-				WHERE msg_id = $3 AND addr = $4
-			`, now, int(code), target.MsgID, a); err != nil {
-				log.Printf("ERROR: sender: update last attempt add-to for %s: %s", a, err)
-			}
+		// do not transmit data; per-recipient codes follow below
+	case AcceptCodeAddTo: // 11 — add-to accepted, no recipients on this host
+		if !isAddToMsg {
+			log.Printf("WARN: sender: msg %d received protocol-invalid code 11 from %s for non-add-to message, terminating",
+				target.MsgID, target.Domain)
+			return
 		}
-		if err := tx.Commit(); err != nil {
-			log.Printf("ERROR: sender: commit tx for msg %d: %s", target.MsgID, err)
+		log.Printf("INFO: sender: msg %d add-to accepted by %s (code 11)", target.MsgID, target.Domain)
+		updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), true)
+		commitOrLog(tx, &committed, target.MsgID)
+		return
+	default:
+		if initCode[0] >= 1 && initCode[0] <= 10 {
+			// global rejection
+			log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
+				target.MsgID, target.Domain, responseCodeName(initCode[0]), initCode[0])
+			updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), false)
+			commitOrLog(tx, &committed, target.MsgID)
 		} else {
-			committed = true
+			// unexpected code — TERMINATE
+			log.Printf("WARN: sender: msg %d unexpected response code %d from %s, terminating",
+				target.MsgID, initCode[0], target.Domain)
 		}
 		return
 	}
 
-	// per-recipient codes
+	// Step 6: Read one per-recipient code per recipient on this host, in
+	// to-field order then add-to order (§10.2 step 6).
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	codes := make([]byte, len(domainRecips))
-	codes[0] = code
-	if len(domainRecips) > 1 {
-		rest := make([]byte, len(domainRecips)-1)
-		if _, err := io.ReadFull(conn, rest); err != nil {
-			log.Printf("ERROR: sender: reading remaining response codes: %s", err)
-			return // rollback, retry later
-		}
-		copy(codes[1:], rest)
+	if _, err := io.ReadFull(conn, codes); err != nil {
+		log.Printf("ERROR: sender: reading per-recipient codes for msg %d: %s", target.MsgID, err)
+		return
 	}
+	now = timeutil.TimestampNow().Float64()
 
 	for i, dr := range domainRecips {
 		if !dr.isLocked {
-			continue // not our responsibility this round
-			// TODO well receiving host still attempted delivery to this recipient — do we update response code for it? Spec is not clear on this scenario.
+			continue
 		}
 		c := codes[i]
 		table := "msg_to"
 		if dr.isAddTo {
 			table = "msg_add_to"
 		}
-		if c == RejectCodeAccept {
+		delivered := c == RejectCodeAccept
+		if delivered {
 			log.Printf("INFO: sender: delivered msg %d to %s", target.MsgID, dr.addr)
-			if _, err := tx.Exec(fmt.Sprintf(`
-				UPDATE %s SET time_delivered = $1, response_code = 200
-				WHERE msg_id = $2 AND addr = $3
-			`, table), now, target.MsgID, dr.addr); err != nil {
-				log.Printf("ERROR: sender: update delivered for %s: %s", dr.addr, err)
-			}
 		} else {
-			log.Printf("WARN: sender: msg %d to %s rejected: %s (%d)",
-				target.MsgID, dr.addr, responseCodeName(c), c)
-			if _, err := tx.Exec(fmt.Sprintf(`
-				UPDATE %s SET time_last_attempt = $1, response_code = $2
-				WHERE msg_id = $3 AND addr = $4
-			`, table), now, int(c), target.MsgID, dr.addr); err != nil {
-				log.Printf("ERROR: sender: update last attempt for %s: %s", dr.addr, err)
-			}
+			log.Printf("WARN: sender: msg %d to %s: %s (%d)", target.MsgID, dr.addr, responseCodeName(c), c)
 		}
+		updateRecipient(tx, table, dr.addr, target.MsgID, now, int(c), delivered)
 	}
 
-	if err := tx.Commit(); err != nil {
-		log.Printf("ERROR: sender: commit tx for msg %d: %s", target.MsgID, err)
-	} else {
-		committed = true
-	}
+	commitOrLog(tx, &committed, target.MsgID)
 }
 
 // processPendingMessages finds messages needing delivery and dispatches a

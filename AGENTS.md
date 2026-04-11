@@ -9,8 +9,7 @@ All code MUST conform to the specification. When in doubt, re-read SPEC.md and f
 ## Key Rules
 
 - Serialize and parse wire fields in the exact order defined in SPEC.md.
-- Use the flag bit assignments from SPEC.md (bit 0 = has pid, bit 1 = has add to, bit 2 = common type, etc.).
-- Enforce recipient uniqueness across both to and add to (case-insensitive).
+- Use the flag bit assignments from SPEC.md (bit 0 = has pid, bit 1 = has add to, bit 2 = common type, etc.).im
 - Reject/accept response codes must match SPEC.md — do not invent new codes.
 - Resolve `_fmsg.<domain>` using A/AAAA records only (never TXT, MX, or SRV).
 - Validate sender IP before issuing CHALLENGE.

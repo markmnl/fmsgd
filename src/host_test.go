@@ -1,20 +1,41 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/binary"
+	"net"
 	"testing"
 	"time"
 )
 
+type testAddr string
+
+func (a testAddr) Network() string { return "tcp" }
+func (a testAddr) String() string  { return string(a) }
+
+type testConn struct {
+	bytes.Buffer
+}
+
+func (c *testConn) Read(b []byte) (int, error)         { return 0, nil }
+func (c *testConn) Write(b []byte) (int, error)        { return c.Buffer.Write(b) }
+func (c *testConn) Close() error                       { return nil }
+func (c *testConn) LocalAddr() net.Addr                { return testAddr("127.0.0.1:1000") }
+func (c *testConn) RemoteAddr() net.Addr               { return testAddr("127.0.0.1:2000") }
+func (c *testConn) SetDeadline(t time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *testConn) SetWriteDeadline(t time.Time) error { return nil }
+
 func TestIsValidUser(t *testing.T) {
-	valid := []string{"alice", "Bob", "a-b", "a_b", "a.b", "user123", "A"}
+	valid := []string{"alice", "Bob", "a-b", "a_b", "a.b", "user123", "A", "u\u00f1icode", "\u7528\u62371"}
 	for _, u := range valid {
 		if !isValidUser(u) {
 			t.Errorf("isValidUser(%q) = false, want true", u)
 		}
 	}
 
-	invalid := []string{"", " ", "a b", "a@b", "a/b", string(make([]byte, 65))}
+	invalid := []string{"", " ", "a b", "a@b", "a/b", string(make([]byte, 65)), "-alice", "alice-", "a..b", "a-_b"}
 	for _, u := range invalid {
 		if isValidUser(u) {
 			t.Errorf("isValidUser(%q) = true, want false", u)
@@ -153,6 +174,7 @@ func TestResponseCodeName(t *testing.T) {
 		{RejectCodeUserUnknown, "user unknown"},
 		{RejectCodeUserFull, "user full"},
 		{RejectCodeUserNotAccepting, "user not accepting"},
+		{RejectCodeUserDuplicate, "user duplicate"},
 		{RejectCodeUserUndisclosed, "user undisclosed"},
 		{RejectCodeAccept, "accept"},
 		{99, "unknown(99)"},
@@ -162,6 +184,15 @@ func TestResponseCodeName(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("responseCodeName(%d) = %q, want %q", tt.code, got, tt.want)
 		}
+	}
+}
+
+func TestPerRecipientDuplicateAndUndisclosedCodeValues(t *testing.T) {
+	if RejectCodeUserDuplicate != 103 {
+		t.Fatalf("RejectCodeUserDuplicate = %d, want 103", RejectCodeUserDuplicate)
+	}
+	if RejectCodeUserUndisclosed != 105 {
+		t.Fatalf("RejectCodeUserUndisclosed = %d, want 105", RejectCodeUserUndisclosed)
 	}
 }
 
@@ -184,5 +215,324 @@ func TestFlagConstants(t *testing.T) {
 	}
 	if FlagDeflate != 32 {
 		t.Errorf("FlagDeflate = %d, want 32 (bit 5)", FlagDeflate)
+	}
+}
+
+func encodeUInt8String(t *testing.T, s string) []byte {
+	t.Helper()
+	if len(s) > 255 {
+		t.Fatalf("string too long for uint8 prefix: %d", len(s))
+	}
+	b := []byte{byte(len(s))}
+	b = append(b, []byte(s)...)
+	return b
+}
+
+func TestHasDomainRecipient(t *testing.T) {
+	addrs := []FMsgAddress{
+		{User: "alice", Domain: "example.com"},
+		{User: "bob", Domain: "other.org"},
+	}
+	if !hasDomainRecipient(addrs, "EXAMPLE.COM") {
+		t.Fatalf("expected domain match")
+	}
+	if hasDomainRecipient(addrs, "missing.test") {
+		t.Fatalf("did not expect domain match")
+	}
+}
+
+func TestDetermineSenderDomain(t *testing.T) {
+	h := &FMsgHeader{
+		From: FMsgAddress{User: "alice", Domain: "from.example"},
+	}
+	if got := determineSenderDomain(h); got != "from.example" {
+		t.Fatalf("determineSenderDomain() = %q, want %q", got, "from.example")
+	}
+
+	h.AddTo = []FMsgAddress{{User: "new", Domain: "to.example"}}
+	h.AddToFrom = &FMsgAddress{User: "bob", Domain: "sender.example"}
+	if got := determineSenderDomain(h); got != "sender.example" {
+		t.Fatalf("determineSenderDomain() = %q, want %q", got, "sender.example")
+	}
+}
+
+func TestReadToRecipients(t *testing.T) {
+	b := []byte{2}
+	b = append(b, encodeUInt8String(t, "@alice@example.com")...)
+	b = append(b, encodeUInt8String(t, "@bob@example.com")...)
+
+	h := &FMsgHeader{}
+	seen, err := readToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h)
+	if err != nil {
+		t.Fatalf("readToRecipients returned error: %v", err)
+	}
+	if len(h.To) != 2 {
+		t.Fatalf("len(h.To) = %d, want 2", len(h.To))
+	}
+	if !seen["@alice@example.com"] || !seen["@bob@example.com"] {
+		t.Fatalf("seen map missing expected recipients: %#v", seen)
+	}
+}
+
+func TestReadAddToRecipients(t *testing.T) {
+	h := &FMsgHeader{
+		Flags: FlagHasPid | FlagHasAddTo,
+		From:  FMsgAddress{User: "alice", Domain: "example.com"},
+		To:    []FMsgAddress{{User: "bob", Domain: "example.com"}},
+	}
+	seen := map[string]bool{"@bob@example.com": true}
+
+	b := []byte{}
+	b = append(b, encodeUInt8String(t, "@alice@example.com")...) // add-to-from
+	b = append(b, 1)                                             // add-to count
+	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
+
+	err := readAddToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h, seen)
+	if err != nil {
+		t.Fatalf("readAddToRecipients returned error: %v", err)
+	}
+	if h.AddToFrom == nil || h.AddToFrom.ToString() != "@alice@example.com" {
+		t.Fatalf("unexpected AddToFrom: %+v", h.AddToFrom)
+	}
+	if len(h.AddTo) != 1 || h.AddTo[0].ToString() != "@carol@example.com" {
+		t.Fatalf("unexpected AddTo: %+v", h.AddTo)
+	}
+}
+
+func TestReadMessageType(t *testing.T) {
+	hCommon := &FMsgHeader{Flags: FlagCommonType}
+	if err := readMessageType(nil, bufio.NewReader(bytes.NewReader([]byte{3})), hCommon); err != nil {
+		t.Fatalf("readMessageType(common) error: %v", err)
+	}
+	if hCommon.TypeID != 3 {
+		t.Fatalf("common type ID = %d, want 3", hCommon.TypeID)
+	}
+	if hCommon.Type != "application/json" {
+		t.Fatalf("common type = %q, want %q", hCommon.Type, "application/json")
+	}
+
+	hText := &FMsgHeader{Flags: 0}
+	b := encodeUInt8String(t, "text/plain")
+	if err := readMessageType(nil, bufio.NewReader(bytes.NewReader(b)), hText); err != nil {
+		t.Fatalf("readMessageType(string) error: %v", err)
+	}
+	if hText.Type != "text/plain" {
+		t.Fatalf("string type = %q, want %q", hText.Type, "text/plain")
+	}
+}
+
+func TestReadAttachmentHeaders(t *testing.T) {
+	origMax := MaxMessageSize
+	MaxMessageSize = 1024
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+	})
+
+	h := &FMsgHeader{Size: 10}
+	b := []byte{1}   // attachment count
+	b = append(b, 0) // attachment flags (no common type)
+	b = append(b, encodeUInt8String(t, "text/plain")...)
+	b = append(b, encodeUInt8String(t, "file.txt")...)
+
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], 12)
+	b = append(b, sz[:]...)
+
+	err := readAttachmentHeaders(nil, bufio.NewReader(bytes.NewReader(b)), h)
+	if err != nil {
+		t.Fatalf("readAttachmentHeaders returned error: %v", err)
+	}
+	if len(h.Attachments) != 1 {
+		t.Fatalf("len(h.Attachments) = %d, want 1", len(h.Attachments))
+	}
+	att := h.Attachments[0]
+	if att.TypeID != 0 {
+		t.Fatalf("attachment type ID = %d, want 0 for non-common", att.TypeID)
+	}
+	if att.Type != "text/plain" || att.Filename != "file.txt" || att.Size != 12 {
+		t.Fatalf("unexpected attachment parsed: %+v", att)
+	}
+}
+
+func TestReadAddToRecipientsRejectsWhenPidMissing(t *testing.T) {
+	h := &FMsgHeader{Flags: FlagHasAddTo}
+	c := &testConn{}
+
+	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(nil)), h, map[string]bool{})
+	if err == nil {
+		t.Fatalf("expected error when add-to flag is set without pid")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadAddToRecipientsRejectsDuplicateAddTo(t *testing.T) {
+	h := &FMsgHeader{
+		Flags: FlagHasPid | FlagHasAddTo,
+		From:  FMsgAddress{User: "alice", Domain: "example.com"},
+		To:    []FMsgAddress{{User: "bob", Domain: "example.com"}},
+	}
+	c := &testConn{}
+	seen := map[string]bool{"@bob@example.com": true}
+
+	b := []byte{}
+	b = append(b, encodeUInt8String(t, "@alice@example.com")...) // add-to-from
+	b = append(b, 2)                                             // add-to count
+	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
+	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
+
+	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(b)), h, seen)
+	if err == nil {
+		t.Fatalf("expected duplicate add-to error")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadMessageTypeRejectsUnknownCommonType(t *testing.T) {
+	h := &FMsgHeader{Flags: FlagCommonType}
+	c := &testConn{}
+
+	err := readMessageType(c, bufio.NewReader(bytes.NewReader([]byte{200})), h)
+	if err == nil {
+		t.Fatalf("expected error for unknown common type")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadMessageTypeRejectsNonASCIIStringType(t *testing.T) {
+	h := &FMsgHeader{Flags: 0}
+	c := &testConn{}
+
+	b := encodeUInt8String(t, "text/\u03c0lain")
+	err := readMessageType(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatalf("expected error for non-ASCII message type")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadAttachmentTypeRejectsNonASCIIStringType(t *testing.T) {
+	c := &testConn{}
+	b := encodeUInt8String(t, "text/\u03c0lain")
+
+	_, _, err := readAttachmentType(c, bufio.NewReader(bytes.NewReader(b)), 0)
+	if err == nil {
+		t.Fatalf("expected error for non-ASCII attachment type")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadAttachmentHeadersRejectsInvalidFilename(t *testing.T) {
+	origMax := MaxMessageSize
+	MaxMessageSize = 1024
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+	})
+
+	h := &FMsgHeader{Size: 10}
+	c := &testConn{}
+	b := []byte{1}
+	b = append(b, 0)
+	b = append(b, encodeUInt8String(t, "text/plain")...)
+	b = append(b, encodeUInt8String(t, "bad..name")...) // invalid: consecutive special chars
+
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], 12)
+	b = append(b, sz[:]...)
+
+	err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatalf("expected error for invalid attachment filename")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadAttachmentHeadersRejectsTooBig(t *testing.T) {
+	origMax := MaxMessageSize
+	MaxMessageSize = 20
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+	})
+
+	h := &FMsgHeader{Size: 15}
+	c := &testConn{}
+	b := []byte{1}
+	b = append(b, 0)
+	b = append(b, encodeUInt8String(t, "text/plain")...)
+	b = append(b, encodeUInt8String(t, "file.txt")...)
+
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], 10)
+	b = append(b, sz[:]...)
+
+	err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatalf("expected size overflow error")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeTooBig {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeTooBig, got)
+	}
+}
+
+func TestValidateMessageFlagsRejectsReservedBits(t *testing.T) {
+	c := &testConn{}
+	err := validateMessageFlags(c, 1<<6)
+	if err == nil {
+		t.Fatalf("expected error for reserved message flag bit")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestReadAttachmentHeadersRejectsReservedAttachmentBits(t *testing.T) {
+	h := &FMsgHeader{Size: 0}
+	c := &testConn{}
+
+	// attachment count=1, then attachment flags with reserved bit 2 set
+	b := []byte{1, 1 << 2}
+	err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatalf("expected error for reserved attachment flag bits")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestRespondGlobalDuplicateIfNeeded(t *testing.T) {
+	c := &testConn{}
+	handled, err := respondGlobalDuplicateIfNeeded(c, true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !handled {
+		t.Fatalf("expected handled=true")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeDuplicate {
+		t.Fatalf("expected duplicate code %d, got %v", RejectCodeDuplicate, got)
+	}
+
+	c2 := &testConn{}
+	handled, err = respondGlobalDuplicateIfNeeded(c2, true, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handled {
+		t.Fatalf("expected handled=false")
+	}
+	if len(c2.Bytes()) != 0 {
+		t.Fatalf("expected no bytes written, got %v", c2.Bytes())
 	}
 }

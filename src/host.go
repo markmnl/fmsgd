@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	env "github.com/caitlinelfring/go-env-default"
@@ -50,13 +51,19 @@ const (
 	RejectCodeTimeTravel           uint8 = 9
 	RejectCodeDuplicate            uint8 = 10
 	AcceptCodeAddTo                uint8 = 11
+	AcceptCodeContinue             uint8 = 64
+	AcceptCodeSkipData             uint8 = 65
 
 	RejectCodeUserUnknown      uint8 = 100
 	RejectCodeUserFull         uint8 = 101
 	RejectCodeUserNotAccepting uint8 = 102
-	RejectCodeUserUndisclosed  uint8 = 103
+	RejectCodeUserDuplicate    uint8 = 103
+	RejectCodeUserUndisclosed  uint8 = 105
 
 	RejectCodeAccept uint8 = 200
+
+	messageReservedBitsMask    uint8 = 0b11000000
+	attachmentReservedBitsMask uint8 = 0b11111100
 )
 
 // responseCodeName returns the human-friendly name for a response code.
@@ -90,6 +97,8 @@ func responseCodeName(code uint8) string {
 		return "user full"
 	case RejectCodeUserNotAccepting:
 		return "user not accepting"
+	case RejectCodeUserDuplicate:
+		return "user duplicate"
 	case RejectCodeUserUndisclosed:
 		return "user undisclosed"
 	case RejectCodeAccept:
@@ -100,6 +109,45 @@ func responseCodeName(code uint8) string {
 }
 
 var ErrProtocolViolation = errors.New("protocol violation")
+
+// commonMediaTypes maps common type IDs to their MIME strings per SPEC.md §4.
+// IDs 1–64; unmapped IDs must be rejected with code 1 (invalid).
+var commonMediaTypes = map[uint8]string{
+	1: "application/epub+zip", 2: "application/gzip", 3: "application/json", 4: "application/msword",
+	5: "application/octet-stream", 6: "application/pdf", 7: "application/rtf", 8: "application/vnd.amazon.ebook",
+	9: "application/vnd.ms-excel", 10: "application/vnd.ms-powerpoint",
+	11: "application/vnd.oasis.opendocument.presentation", 12: "application/vnd.oasis.opendocument.spreadsheet",
+	13: "application/vnd.oasis.opendocument.text",
+	14: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	15: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	16: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	17: "application/x-tar", 18: "application/xhtml+xml", 19: "application/xml", 20: "application/zip",
+	21: "audio/aac", 22: "audio/midi", 23: "audio/mpeg", 24: "audio/ogg", 25: "audio/opus", 26: "audio/vnd.wave", 27: "audio/webm",
+	28: "font/otf", 29: "font/ttf", 30: "font/woff", 31: "font/woff2",
+	32: "image/apng", 33: "image/avif", 34: "image/bmp", 35: "image/gif", 36: "image/heic", 37: "image/jpeg", 38: "image/png",
+	39: "image/svg+xml", 40: "image/tiff", 41: "image/webp",
+	42: "model/3mf", 43: "model/gltf-binary", 44: "model/obj", 45: "model/step", 46: "model/stl", 47: "model/vnd.usdz+zip",
+	48: "text/calendar", 49: "text/css", 50: "text/csv", 51: "text/html", 52: "text/javascript", 53: "text/markdown",
+	54: "text/plain;charset=US-ASCII", 55: "text/plain;charset=UTF-16", 56: "text/plain;charset=UTF-8", 57: "text/vcard",
+	58: "video/H264", 59: "video/H265", 60: "video/H266", 61: "video/ogg", 62: "video/VP8", 63: "video/VP9", 64: "video/webm",
+}
+
+// getCommonMediaType returns the MIME type string for a common type ID, or
+// empty string + false if the ID is not mapped (should be rejected per spec).
+func getCommonMediaType(id uint8) (string, bool) {
+	s, ok := commonMediaTypes[id]
+	return s, ok
+}
+
+// getCommonMediaTypeID returns the common type ID for a MIME string.
+func getCommonMediaTypeID(mediaType string) (uint8, bool) {
+	for id, mime := range commonMediaTypes {
+		if mime == mediaType {
+			return id, true
+		}
+	}
+	return 0, false
+}
 
 var Port = 4930
 
@@ -189,15 +237,126 @@ func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
 }
 
 func isValidUser(s string) bool {
-	if len(s) == 0 || len(s) > 64 {
+	if !utf8.ValidString(s) || len(s) == 0 || len(s) > 64 {
 		return false
 	}
-	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+
+	isSpecial := func(r rune) bool {
+		return r == '-' || r == '_' || r == '.'
+	}
+
+	runes := []rune(s)
+	if isSpecial(runes[0]) || isSpecial(runes[len(runes)-1]) {
+		return false
+	}
+
+	lastWasSpecial := false
+	for _, c := range runes {
+		if unicode.IsLetter(c) || unicode.IsNumber(c) {
+			lastWasSpecial = false
+			continue
+		}
+		if !isSpecial(c) {
+			return false
+		}
+		if lastWasSpecial {
+			return false
+		}
+		lastWasSpecial = true
+	}
+	return true
+}
+
+func isASCIIBytes(b []byte) bool {
+	for _, c := range b {
+		if c > 127 {
 			return false
 		}
 	}
 	return true
+}
+
+func isValidAttachmentFilename(name string) bool {
+	if !utf8.ValidString(name) || len(name) == 0 || len(name) >= 256 {
+		return false
+	}
+
+	isSpecial := func(r rune) bool {
+		return r == '-' || r == '_' || r == ' ' || r == '.'
+	}
+
+	runes := []rune(name)
+	if isSpecial(runes[0]) || isSpecial(runes[len(runes)-1]) {
+		return false
+	}
+
+	lastWasSpecial := false
+	for _, r := range runes {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			lastWasSpecial = false
+			continue
+		}
+		if !isSpecial(r) {
+			return false
+		}
+		if lastWasSpecial {
+			return false
+		}
+		lastWasSpecial = true
+	}
+
+	return true
+}
+
+func isMessageRetrievable(msg *FMsgHeader) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.Filepath != "" {
+		st, err := os.Stat(msg.Filepath)
+		if err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	if len(msg.Pid) == 0 {
+		return false
+	}
+	parentID, err := lookupMsgIdByHash(msg.Pid)
+	if err != nil || parentID == 0 {
+		return false
+	}
+	parentMsg, err := getMsgByID(parentID)
+	if err != nil {
+		return false
+	}
+	if parentMsg == nil {
+		return false
+	}
+	return isMessageRetrievable(parentMsg)
+}
+
+func isParentParticipant(parent *FMsgHeader, addr *FMsgAddress) bool {
+	if parent == nil || addr == nil {
+		return false
+	}
+	target := strings.ToLower(addr.ToString())
+	if strings.ToLower(parent.From.ToString()) == target {
+		return true
+	}
+	for i := range parent.To {
+		if strings.ToLower(parent.To[i].ToString()) == target {
+			return true
+		}
+	}
+	if parent.AddToFrom != nil && strings.ToLower(parent.AddToFrom.ToString()) == target {
+		return true
+	}
+	for i := range parent.AddTo {
+		if strings.ToLower(parent.AddTo[i].ToString()) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidDomain(s string) bool {
@@ -275,11 +434,15 @@ func handleChallenge(c net.Conn, r *bufio.Reader) error {
 	if err != nil {
 		return err
 	}
-	hash := *(*[32]byte)(hashSlice) // get the underlying array (alternatively we could use hex strings..)
+	hash := *(*[32]byte)(hashSlice)
 	log.Printf("INFO: CHALLENGE <-- %s", hex.EncodeToString(hashSlice))
-	header, exists := lookupOutgoing(hash)
+
+	// Verify the challenger's IP is the Host-B IP registered for this message
+	// (§10.5 step 2). An unrecognised hash OR a mismatched IP both → TERMINATE.
+	remoteIP, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+	header, exists := lookupOutgoing(hash, remoteIP)
 	if !exists {
-		return fmt.Errorf("challenge for unknown message: %s, from: %s\n", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
+		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
 	}
 	msgHash, err := header.GetMessageHash()
 	if err != nil {
@@ -296,35 +459,480 @@ func rejectAccept(c net.Conn, codes []byte) error {
 	return err
 }
 
+func sendCode(c net.Conn, code uint8) error {
+	return rejectAccept(c, []byte{code})
+}
+
+func validateMessageFlags(c net.Conn, flags uint8) error {
+	if flags&messageReservedBitsMask != 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("reserved message flag bits set: %#08b", flags)
+	}
+	return nil
+}
+
+func validateAttachmentFlags(c net.Conn, flags uint8) error {
+	if flags&attachmentReservedBitsMask != 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("reserved attachment flag bits set: %#08b", flags)
+	}
+	return nil
+}
+
+func hasDomainRecipient(addrs []FMsgAddress, domain string) bool {
+	for _, addr := range addrs {
+		if strings.EqualFold(addr.Domain, domain) {
+			return true
+		}
+	}
+	return false
+}
+
+func determineSenderDomain(h *FMsgHeader) string {
+	if len(h.AddTo) > 0 && h.AddToFrom != nil {
+		return h.AddToFrom.Domain
+	}
+	return h.From.Domain
+}
+
+func verifySenderIP(c net.Conn, senderDomain string) error {
+	if SkipAuthorisedIPs {
+		return nil
+	}
+
+	remoteHost, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		log.Printf("WARN: failed to parse remote address for DNS check: %s", err)
+		return fmt.Errorf("DNS verification failed")
+	}
+
+	remoteIP := net.ParseIP(remoteHost)
+	if remoteIP == nil {
+		log.Printf("WARN: failed to parse remote IP: %s", remoteHost)
+		return fmt.Errorf("DNS verification failed")
+	}
+
+	authorisedIPs, err := lookupAuthorisedIPs(senderDomain)
+	if err != nil {
+		log.Printf("WARN: DNS lookup failed for _fmsg.%s: %s", senderDomain, err)
+		return fmt.Errorf("DNS verification failed")
+	}
+
+	for _, ip := range authorisedIPs {
+		if remoteIP.Equal(ip) {
+			return nil
+		}
+	}
+
+	log.Printf("WARN: remote IP %s not in authorised IPs for _fmsg.%s", remoteIP.String(), senderDomain)
+	return fmt.Errorf("DNS verification failed")
+}
+
+func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
+	if len(h.AddTo) == 0 {
+		return h, nil
+	}
+
+	addToHasOurDomain := hasDomainRecipient(h.AddTo, Domain)
+
+	parentID, err := lookupMsgIdByHash(h.Pid)
+	if err != nil {
+		return h, err
+	}
+
+	if parentID == 0 {
+		h.InitialResponseCode = AcceptCodeContinue
+		return h, nil
+	}
+
+	parentMsg, err := getMsgByID(parentID)
+	if err != nil {
+		return h, err
+	}
+	if parentMsg == nil || !isMessageRetrievable(parentMsg) {
+		h.InitialResponseCode = AcceptCodeContinue
+		return h, nil
+	}
+
+	if parentMsg.Timestamp-FutureTimeDelta > h.Timestamp {
+		if err := sendCode(c, RejectCodeTimeTravel); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("add-to: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
+	}
+
+	if addToHasOurDomain {
+		h.InitialResponseCode = AcceptCodeSkipData
+		return h, nil
+	}
+
+	h.Filepath = parentMsg.Filepath
+	for i := range h.Attachments {
+		if i < len(parentMsg.Attachments) {
+			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
+		}
+	}
+	if err := storeMsgHeaderOnly(h); err != nil {
+		if err2 := sendCode(c, RejectCodeUndisclosed); err2 != nil {
+			return h, err2
+		}
+		return h, fmt.Errorf("add-to notification: storing header: %w", err)
+	}
+	if err := sendCode(c, AcceptCodeAddTo); err != nil {
+		return h, err
+	}
+	log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(h.Pid))
+	return nil, nil
+}
+
+func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
+	if len(h.AddTo) != 0 || h.Flags&FlagHasPid == 0 {
+		return nil
+	}
+
+	parentID, err := lookupMsgIdByHash(h.Pid)
+	if err != nil {
+		return err
+	}
+	if parentID == 0 {
+		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: parent not found for pid %s", hex.EncodeToString(h.Pid))
+	}
+
+	parentMsg, err := getMsgByID(parentID)
+	if err != nil {
+		return err
+	}
+	if parentMsg == nil {
+		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: parent message not found by ID %d", parentID)
+	}
+	if !isMessageRetrievable(parentMsg) {
+		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: parent is not retrievable for msg %d", parentID)
+	}
+
+	if parentMsg.Timestamp-FutureTimeDelta > h.Timestamp {
+		if err := sendCode(c, RejectCodeTimeTravel); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
+	}
+	if !isParentParticipant(parentMsg, &h.From) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: sender %s was not a participant of parent", h.From.ToString())
+	}
+
+	return nil
+}
+
+func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, error) {
+	v, err := r.ReadByte()
+	if err != nil {
+		return false, err
+	}
+	if v >= 129 {
+		challengeVersion := 256 - int(v)
+		if challengeVersion == 1 {
+			return true, handleChallenge(c, r)
+		}
+		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
+			log.Printf("WARN: failed to send unsupported version response: %s", err)
+		}
+		return false, fmt.Errorf("unsupported challenge version: %d", challengeVersion)
+	}
+	if v != 1 {
+		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
+			log.Printf("WARN: failed to send unsupported version response: %s", err)
+		}
+		return false, fmt.Errorf("unsupported message version: %d", v)
+	}
+	h.Version = v
+	return false, nil
+}
+
+func readToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) (map[string]bool, error) {
+	num, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if num == 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("to count must be >= 1")
+	}
+	seen := make(map[string]bool)
+	for num > 0 {
+		addr, err := readAddress(r)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.ToLower(addr.ToString())
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
+		}
+		seen[key] = true
+		h.To = append(h.To, *addr)
+		num--
+	}
+	return seen, nil
+}
+
+func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader, seen map[string]bool) error {
+	if h.Flags&FlagHasAddTo == 0 {
+		return nil
+	}
+	if h.Flags&FlagHasPid == 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("add to exists but pid does not")
+	}
+
+	addToFrom, err := readAddress(r)
+	if err != nil {
+		if err2 := sendCode(c, RejectCodeInvalid); err2 != nil {
+			return err2
+		}
+		return fmt.Errorf("reading add-to-from address: %w", err)
+	}
+
+	addToFromKey := strings.ToLower(addToFrom.ToString())
+	fromKey := strings.ToLower(h.From.ToString())
+	inFromOrTo := fromKey == addToFromKey
+	if !inFromOrTo {
+		for _, toAddr := range h.To {
+			if strings.ToLower(toAddr.ToString()) == addToFromKey {
+				inFromOrTo = true
+				break
+			}
+		}
+	}
+	if !inFromOrTo {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("add-to-from (%s) not in from or to", addToFrom.ToString())
+	}
+	h.AddToFrom = addToFrom
+
+	addToCount, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+	if addToCount == 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("add to flag set but count is 0")
+	}
+
+	addToSeen := make(map[string]bool)
+	for addToCount > 0 {
+		addr, err := readAddress(r)
+		if err != nil {
+			return err
+		}
+		key := strings.ToLower(addr.ToString())
+		if addToSeen[key] {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
+			return fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
+		}
+		addToSeen[key] = true
+		if seen[key] {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
+			return fmt.Errorf("add-to address already in to: %s", addr.ToString())
+		}
+		h.AddTo = append(h.AddTo, *addr)
+		addToCount--
+	}
+
+	return nil
+}
+
+func readAndValidateTimestamp(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
+	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
+		return err
+	}
+	now := timeutil.TimestampNow().Float64()
+	delta := now - h.Timestamp
+	if PastTimeDelta > 0 && delta > PastTimeDelta {
+		if err := sendCode(c, RejectCodePastTime); err != nil {
+			return err
+		}
+		return fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
+	}
+	if FutureTimeDelta > 0 && delta < 0 && math.Abs(delta) > FutureTimeDelta {
+		if err := sendCode(c, RejectCodeFutureTime); err != nil {
+			return err
+		}
+		return fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
+	}
+	return nil
+}
+
+func readMessageType(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
+	if h.Flags&FlagCommonType != 0 {
+		typeID, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		mtype, ok := getCommonMediaType(typeID)
+		if !ok {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
+			return fmt.Errorf("unmapped common type ID: %d", typeID)
+		}
+		h.TypeID = typeID
+		h.Type = mtype
+		return nil
+	}
+
+	mime, err := ReadUInt8Slice(r)
+	if err != nil {
+		return err
+	}
+	if !isASCIIBytes(mime) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("message media type must be US-ASCII")
+	}
+	h.Type = string(mime)
+	return nil
+}
+
+func readAttachmentType(c net.Conn, r *bufio.Reader, flags uint8) (string, uint8, error) {
+	if flags&(1<<0) != 0 {
+		typeID, err := r.ReadByte()
+		if err != nil {
+			return "", 0, err
+		}
+		mtype, ok := getCommonMediaType(typeID)
+		if !ok {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return "", 0, err
+			}
+			return "", 0, fmt.Errorf("unmapped attachment common type ID: %d", typeID)
+		}
+		return mtype, typeID, nil
+	}
+
+	typeBytes, err := ReadUInt8Slice(r)
+	if err != nil {
+		return "", 0, err
+	}
+	if !isASCIIBytes(typeBytes) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return "", 0, err
+		}
+		return "", 0, fmt.Errorf("attachment media type must be US-ASCII")
+	}
+	return string(typeBytes), 0, nil
+}
+
+func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
+	var attachCount uint8
+	if err := binary.Read(r, binary.LittleEndian, &attachCount); err != nil {
+		return err
+	}
+
+	totalSize := h.Size
+	filenameSeen := make(map[string]bool)
+	for i := uint8(0); i < attachCount; i++ {
+		attFlags, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		if err := validateAttachmentFlags(c, attFlags); err != nil {
+			return err
+		}
+
+		attType, attTypeID, err := readAttachmentType(c, r, attFlags)
+		if err != nil {
+			return err
+		}
+
+		filenameBytes, err := ReadUInt8Slice(r)
+		if err != nil {
+			return err
+		}
+		filename := string(filenameBytes)
+		if !isValidAttachmentFilename(filename) {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
+			return fmt.Errorf("invalid attachment filename: %s", filename)
+		}
+		filenameKey := strings.ToLower(filename)
+		if filenameSeen[filenameKey] {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
+			return fmt.Errorf("duplicate attachment filename: %s", filename)
+		}
+		filenameSeen[filenameKey] = true
+
+		var attSize uint32
+		if err := binary.Read(r, binary.LittleEndian, &attSize); err != nil {
+			return err
+		}
+
+		h.Attachments = append(h.Attachments, FMsgAttachmentHeader{
+			Flags:    attFlags,
+			TypeID:   attTypeID,
+			Type:     attType,
+			Filename: filename,
+			Size:     attSize,
+		})
+		totalSize += attSize
+	}
+
+	if totalSize > MaxMessageSize {
+		if err := sendCode(c, RejectCodeTooBig); err != nil {
+			return err
+		}
+		return fmt.Errorf("total message size %d exceeds max %d", totalSize, MaxMessageSize)
+	}
+
+	return nil
+}
+
 func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	r := bufio.NewReaderSize(c, ReadBufferSize)
-	var h = &FMsgHeader{}
+	var h = &FMsgHeader{InitialResponseCode: AcceptCodeContinue}
 
 	d := calcNetIODuration(66000, MinDownloadRate) // max possible header size
 	c.SetReadDeadline(time.Now().Add(d))
 
-	// read version
-	v, err := r.ReadByte()
+	handled, err := readVersionOrChallenge(c, r, h)
 	if err != nil {
+		if handled {
+			return nil, r, err
+		}
 		return h, r, err
 	}
-	// TODO [Spec 1.3]: Per spec step 1.3, the first byte determines the message type:
-	//  - 1..127: fmsg version (currently only version 1 supported).
-	//  - 128..255: incoming CHALLENGE; the fmsg version is (256 - value).
-	//    E.g. 255 = challenge for version 1, 254 = challenge for version 2, etc.
-	//  Currently only v==255 is handled as a challenge. This should be generalised
-	//  to handle any value > 128 where (256 - value) is a supported version.
-	//  For unsupported versions or invalid first-byte values, Host B MUST send
-	//  REJECT code 2 (unsupported version) on the connection before closing.
-	if v == 255 {
-		return nil, r, handleChallenge(c, r)
+	if handled {
+		return nil, r, nil
 	}
-	if v != 1 {
-		// TODO [Spec 1.3.iii]: Send REJECT code 2 (unsupported version) on the
-		// connection before returning/closing, per spec step 1.3.iii.
-		return h, r, fmt.Errorf("unsupported version: %d", v)
-	}
-	h.Version = v
 
 	// read flags
 	flags, err := r.ReadByte()
@@ -332,6 +940,9 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		return h, r, err
 	}
 	h.Flags = flags
+	if err := validateMessageFlags(c, flags); err != nil {
+		return h, r, err
+	}
 
 	// read pid if any
 	if flags&FlagHasPid == 1 {
@@ -341,9 +952,6 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		}
 		h.Pid = make([]byte, 32)
 		copy(h.Pid, pid)
-		// TODO [Spec 1.4.v]: pid verification depends on the add-to field and must
-		// be performed here (during header exchange), not deferred to downloadMessage.
-		// See step 1.4.v for the full decision tree.
 	}
 
 	// read from address
@@ -354,89 +962,17 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 
 	h.From = *from
 
-	// read to addresses
-	num, err := r.ReadByte()
+	seen, err := readToRecipients(c, r, h)
 	if err != nil {
 		return h, r, err
 	}
-	// TODO [Spec 1.4.i.a]: Spec requires at least one address in "to". If num == 0,
-	// reject with code 1 (invalid).
-	seen := make(map[string]bool)
-	for num > 0 {
-		addr, err := readAddress(r)
-		if err != nil {
-			return h, r, err
-		}
-		key := strings.ToLower(addr.ToString())
-		if seen[key] {
-			return h, r, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
-		}
-		seen[key] = true
-		h.To = append(h.To, *addr)
-		num--
-	}
 
-	// parse "add to" field when has-add-to flag (bit 1) is set
-	if flags&FlagHasAddTo != 0 {
-		// add to requires pid per spec 1.4.v.b.a
-		if flags&FlagHasPid == 0 {
-			codes := []byte{RejectCodeInvalid}
-			if err := rejectAccept(c, codes); err != nil {
-				return h, r, err
-			}
-			return h, r, fmt.Errorf("add to exists but pid does not")
-		}
-
-		addToCount, err := r.ReadByte()
-		if err != nil {
-			return h, r, err
-		}
-		if addToCount == 0 {
-			codes := []byte{RejectCodeInvalid}
-			if err := rejectAccept(c, codes); err != nil {
-				return h, r, err
-			}
-			return h, r, fmt.Errorf("add to flag set but count is 0")
-		}
-		addToSeen := make(map[string]bool)
-		for addToCount > 0 {
-			addr, err := readAddress(r)
-			if err != nil {
-				return h, r, err
-			}
-			key := strings.ToLower(addr.ToString())
-			if addToSeen[key] {
-				codes := []byte{RejectCodeInvalid}
-				if err := rejectAccept(c, codes); err != nil {
-					return h, r, err
-				}
-				return h, r, fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
-			}
-			addToSeen[key] = true
-			h.AddTo = append(h.AddTo, *addr)
-			addToCount--
-		}
-	}
-
-	// read timestamp
-	if err := binary.Read(r, binary.LittleEndian, &h.Timestamp); err != nil {
+	if err := readAddToRecipients(c, r, h, seen); err != nil {
 		return h, r, err
 	}
-	now := timeutil.TimestampNow().Float64()
-	delta := now - h.Timestamp
-	if PastTimeDelta > 0 && delta > PastTimeDelta {
-		codes := []byte{RejectCodePastTime}
-		if err := rejectAccept(c, codes); err != nil {
-			return h, r, err
-		}
-		return h, r, fmt.Errorf("message timestamp: %f too far in past, delta: %fs", h.Timestamp, delta)
-	}
-	if FutureTimeDelta > 0 && delta < 0 && math.Abs(delta) > FutureTimeDelta {
-		codes := []byte{RejectCodeFutureTime}
-		if err := rejectAccept(c, codes); err != nil {
-			return h, r, err
-		}
-		return h, r, fmt.Errorf("message timestamp: %f too far in future, delta: %fs", h.Timestamp, delta)
+
+	if err := readAndValidateTimestamp(c, r, h); err != nil {
+		return h, r, err
 	}
 
 	// read topic — only present when pid is NOT set (first message in a thread)
@@ -448,157 +984,54 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 		h.Topic = string(topic)
 	}
 
-	// TODO [Spec 1.4.i.b / flag bit 2]: When the "common type" flag (bit 2) is
-	// set, the type field is a single uint8 that maps to a predefined Media Type
-	// string per the Common Media Types table. If the value has no mapping, reject
-	// with code 1 (invalid). Currently the code always reads type as uint8-prefixed
-	// string, ignoring the common type flag entirely.
-
-	// read type
-	mime, err := ReadUInt8Slice(r)
-	if err != nil {
+	if err := readMessageType(c, r, h); err != nil {
 		return h, r, err
 	}
-	h.Type = string(mime)
 
 	// read message size
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
 		return h, r, err
 	}
-	// TODO [Spec 1.4.iii]: Size check must be total of data size PLUS all
-	// attachment sizes, not just data size alone. Currently only h.Size (data)
-	// is checked against MaxMessageSize.
-	if h.Size > MaxMessageSize {
-		codes := []byte{RejectCodeTooBig}
-		if err := rejectAccept(c, codes); err != nil {
-			return h, r, err
-		}
-		return h, r, fmt.Errorf("message size: %d exceeds max: %d", h.Size, MaxMessageSize)
-	}
+	// Size check is deferred until attachment headers are parsed (see below)
 
-	// read attachment count
-	var attachCount uint8
-	if err := binary.Read(r, binary.LittleEndian, &attachCount); err != nil {
+	if err := readAttachmentHeaders(c, r, h); err != nil {
 		return h, r, err
-	}
-	// TODO [Spec 1.4.i.c / attachments]: Parse attachment headers (flags, type,
-	// filename, size) for each attachment. Validate:
-	//  - Each attachment's type when its own common-type flag is set exists in
-	//    Common Media Type mapping; else reject code 1 (invalid).
-	//  - Filename is valid UTF-8 per spec (Unicode letters/numbers, limited
-	//    special chars, unique case-insensitive, < 256 bytes).
-	//  - Incorporate attachment sizes into the MAX_SIZE check above.
-	//  - Store parsed attachment headers on FMsgHeader.
-	if attachCount > 0 {
-		return h, r, fmt.Errorf("attachments not yet supported (count: %d)", attachCount)
 	}
 
 	log.Printf("INFO: <-- MSG\n%s", h)
 
-	// TODO [Spec 1.4.ii]: DNS verification of sender's IP address MUST be
-	// performed here during header exchange (not deferred to the challenge
-	// step). Host B must resolve _fmsg.<from-domain> and verify the incoming
-	// connection's IP is in the authorised set. If not authorised, Host B MUST
-	// TERMINATE the message exchange (abort connection, no reject code sent).
-	// Currently this check only happens inside challenge() and is skipped
-	// entirely when skip-challenge is allowed.
-
-	// add-to pid decision tree per spec 1.4.v.b
-	if len(h.AddTo) > 0 {
-		// check if any add-to recipients are for our domain
-		addToHasOurDomain := false
-		for _, addr := range h.AddTo {
-			if strings.EqualFold(addr.Domain, Domain) {
-				addToHasOurDomain = true
-				break
-			}
+	if !hasDomainRecipient(h.To, Domain) && !hasDomainRecipient(h.AddTo, Domain) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return h, r, err
 		}
-		if !addToHasOurDomain {
-			// none of the add-to recipients are for our domain — record
-			// the additional recipients and respond code 11.
-
-			// pid must refer to a stored message per "Verifying Message Stored"
-			parentID, err := lookupMsgIdByHash(h.Pid)
-			if err != nil {
-				return h, r, err
-			}
-			if parentID == 0 {
-				codes := []byte{RejectCodeParentNotFound}
-				if err := rejectAccept(c, codes); err != nil {
-					return h, r, err
-				}
-				return h, r, fmt.Errorf("add-to notification: parent not found for pid %s", hex.EncodeToString(h.Pid))
-			}
-
-			// record add-to recipients for future hash reconstruction, respond code 11
-			if err := storeMsgHeaderOnly(h); err != nil {
-				codes := []byte{RejectCodeUndisclosed}
-				if err2 := rejectAccept(c, codes); err2 != nil {
-					return h, r, err2
-				}
-				return h, r, fmt.Errorf("add-to notification: storing header: %w", err)
-			}
-			codes := []byte{AcceptCodeAddTo}
-			if err := rejectAccept(c, codes); err != nil {
-				return h, r, err
-			}
-			log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(h.Pid))
-			return nil, r, nil // nil header signals handled (like challenge)
-		}
-		// else: add-to recipients are for our domain, continue normally
-		// (pid message does NOT have to be already stored per spec 1.4.v.b.b)
+		return h, r, fmt.Errorf("no recipients for domain %s", Domain)
 	}
 
-	// TODO [Spec 1.4.v.c]: When pid exists and add-to does not:
-	//  a. The message or message header pid refers to MUST be verified as stored
-	//     per "Verifying Message Stored"; else reject code 6 (parent not found).
-	//     "Verifying Message Stored" means: the digest matches a previously
-	//     accepted message (code 200) or accepted header (code 11), AND the
-	//     corresponding data currently exists on the host.
-	//  b. The stored parent's time MUST be before the incoming message's time;
-	//     else reject code 9 (time travel).
-	//  Both checks should be here (step 1), not deferred to downloadMessage.
+	if err := verifySenderIP(c, determineSenderDomain(h)); err != nil {
+		return nil, r, err
+	}
+
+	h, err = handleAddToPath(c, h)
+	if err != nil {
+		return h, r, err
+	}
+	if h == nil {
+		return nil, r, nil
+	}
+
+	if err := validatePidReplyPath(c, h); err != nil {
+		return h, r, err
+	}
 
 	return h, r, nil
 }
 
-// Sends CHALLENGE request to sender domain first checking if domain is indeed located
-// at address in connection supplied by verifying the remote IP is in the
-// sender's _fmsg.<sender-domain> authorised IP set.
+// Sends CHALLENGE request to sender, receiving and storing the challenge hash.
+// DNS verification of the remote IP is performed during header exchange (readHeader).
 // TODO [Spec step 2]: The spec defines challenge modes (NEVER, ALWAYS,
 // HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices.
 // Currently defaults to ALWAYS. Implement configurable challenge mode.
 func challenge(conn net.Conn, h *FMsgHeader) error {
-
-	// verify remote IP is authorised by sender's _fmsg DNS record
-	if SkipAuthorisedIPs {
-		log.Println("WARN: skipping authorised IP check (FMSG_SKIP_AUTHORISED_IPS=true)")
-	} else {
-		remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		if err != nil {
-			return fmt.Errorf("failed to parse remote address: %w", err)
-		}
-		remoteIP := net.ParseIP(remoteHost)
-		if remoteIP == nil {
-			return fmt.Errorf("failed to parse remote IP: %s", remoteHost)
-		}
-
-		authorisedIPs, err := lookupAuthorisedIPs(h.From.Domain)
-		if err != nil {
-			return err
-		}
-
-		found := false
-		for _, ip := range authorisedIPs {
-			if remoteIP.Equal(ip) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("remote address %s not in _fmsg.%s authorised IPs", remoteIP.String(), h.From.Domain)
-		}
-	}
 
 	// Connection 2 MUST target the same IP as Connection 1 (spec 2.1).
 	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
@@ -624,7 +1057,11 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	if err != nil {
 		return err
 	}
+	if len(resp) != 32 {
+		return fmt.Errorf("challenge response size %d, expected 32", len(resp))
+	}
 	copy(h.ChallengeHash[:], resp)
+	h.ChallengeCompleted = true
 	log.Printf("INFO: <-- CHALLENGE RESP\t%s\n", hex.EncodeToString(resp))
 
 	// gracefully close 2nd connection
@@ -635,10 +1072,18 @@ func challenge(conn net.Conn, h *FMsgHeader) error {
 	return nil
 }
 
-func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress) (code uint8, err error) {
+func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress, msgHash []byte) (code uint8, err error) {
+	duplicate, err := hasAddrReceivedMsgHash(msgHash, addr)
+	if err != nil {
+		return RejectCodeUserUndisclosed, err
+	}
+	if duplicate {
+		return RejectCodeUserDuplicate, nil
+	}
+
 	detail, err := getAddressDetail(addr)
 	if err != nil {
-		return RejectCodeUndisclosed, err
+		return RejectCodeUserUndisclosed, err
 	}
 	if detail == nil {
 		return RejectCodeUserUnknown, nil
@@ -682,17 +1127,8 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 	}
 }
 
-func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
-
-	// TODO [Spec 3.1]: Per spec step 3.1, BEFORE downloading the remaining
-	// message data, if the CHALLENGE/CHALLENGE-RESP exchange was completed the
-	// message hash from the CHALLENGE-RESP SHOULD be used to check if the
-	// message is already stored (duplicate check). If found, respond REJECT
-	// code 10 (duplicate) and close. Currently the duplicate check happens
-	// AFTER downloading all data, wasting bandwidth on duplicates.
-
-	// filter to our domain recipients in "to" then "add to" order per spec 3.4.i
-	addrs := []FMsgAddress{}
+func localRecipients(h *FMsgHeader) []FMsgAddress {
+	addrs := make([]FMsgAddress, 0, len(h.To)+len(h.AddTo))
 	for _, addr := range h.To {
 		if strings.EqualFold(addr.Domain, Domain) {
 			addrs = append(addrs, addr)
@@ -703,78 +1139,257 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 			addrs = append(addrs, addr)
 		}
 	}
+	return addrs
+}
+
+func allLocalRecipientsHaveMessageHash(msgHash []byte, addrs []FMsgAddress) (bool, error) {
+	if len(addrs) == 0 {
+		return false, nil
+	}
+	for i := range addrs {
+		duplicate, err := hasAddrReceivedMsgHash(msgHash, &addrs[i])
+		if err != nil {
+			return false, err
+		}
+		if !duplicate {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func markAllCodes(codes []byte, code uint8) {
+	for i := range codes {
+		codes[i] = code
+	}
+}
+
+func prepareMessageData(r io.Reader, h *FMsgHeader, skipData bool) ([]string, error) {
+	if skipData {
+		parentID, err := lookupMsgIdByHash(h.Pid)
+		if err != nil {
+			return nil, err
+		}
+		if parentID == 0 {
+			return nil, fmt.Errorf("%w code 65 requires stored parent for pid %s", ErrProtocolViolation, hex.EncodeToString(h.Pid))
+		}
+		parentMsg, err := getMsgByID(parentID)
+		if err != nil {
+			return nil, err
+		}
+		if parentMsg == nil || parentMsg.Filepath == "" {
+			return nil, fmt.Errorf("%w code 65 parent data unavailable for msg %d", ErrProtocolViolation, parentID)
+		}
+		h.Filepath = parentMsg.Filepath
+		return nil, nil
+	}
+
+	createdPaths := make([]string, 0, 1+len(h.Attachments))
+
+	fd, err := os.CreateTemp("", "fmsg-download-*")
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := io.CopyN(fd, r, int64(h.Size)); err != nil {
+		fd.Close()
+		_ = os.Remove(fd.Name())
+		return nil, err
+	}
+	if err := fd.Close(); err != nil {
+		_ = os.Remove(fd.Name())
+		return nil, err
+	}
+
+	h.Filepath = fd.Name()
+	createdPaths = append(createdPaths, fd.Name())
+
+	for i := range h.Attachments {
+		afd, err := os.CreateTemp("", "fmsg-attachment-*")
+		if err != nil {
+			for _, path := range createdPaths {
+				_ = os.Remove(path)
+			}
+			return nil, err
+		}
+
+		if _, err := io.CopyN(afd, r, int64(h.Attachments[i].Size)); err != nil {
+			afd.Close()
+			_ = os.Remove(afd.Name())
+			for _, path := range createdPaths {
+				_ = os.Remove(path)
+			}
+			return nil, err
+		}
+		if err := afd.Close(); err != nil {
+			_ = os.Remove(afd.Name())
+			for _, path := range createdPaths {
+				_ = os.Remove(path)
+			}
+			return nil, err
+		}
+		h.Attachments[i].Filepath = afd.Name()
+		createdPaths = append(createdPaths, afd.Name())
+	}
+
+	return createdPaths, nil
+}
+
+func cleanupFiles(paths []string) {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
+func copyMessagePayload(src *os.File, dstPath string, compressed bool, wireSize uint32) error {
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	fd2, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+
+	var copyErr error
+	if compressed {
+		lr := io.LimitReader(src, int64(wireSize))
+		zr, err := zlib.NewReader(lr)
+		if err != nil {
+			fd2.Close()
+			_ = os.Remove(dstPath)
+			return err
+		}
+		_, copyErr = io.Copy(fd2, zr)
+		_ = zr.Close()
+	} else {
+		_, copyErr = io.CopyN(fd2, src, int64(wireSize))
+	}
+	if err := fd2.Close(); err != nil {
+		return err
+	}
+
+	if copyErr != nil {
+		_ = os.Remove(dstPath)
+		return copyErr
+	}
+	return nil
+}
+
+func uniqueAttachmentPath(dir string, timestamp uint32, idx int, filename string) string {
+	ext := filepath.Ext(filename)
+	base := fmt.Sprintf("%d_att_%d", timestamp, idx)
+	p := filepath.Join(dir, base+ext)
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		return p
+	}
+	for n := 1; ; n++ {
+		p = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, n, ext))
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			return p
+		}
+	}
+}
+
+func persistAttachmentPayloads(h *FMsgHeader, dirpath string) error {
+	for i := range h.Attachments {
+		a := &h.Attachments[i]
+		src, err := os.Open(a.Filepath)
+		if err != nil {
+			return err
+		}
+		dstPath := uniqueAttachmentPath(dirpath, uint32(h.Timestamp), i, a.Filename)
+		compressed := a.Flags&(1<<1) != 0
+		err = copyMessagePayload(src, dstPath, compressed, a.Size)
+		src.Close()
+		if err != nil {
+			return err
+		}
+		a.Filepath = dstPath
+	}
+	return nil
+}
+
+func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress, acceptedAddTo []FMsgAddress, primaryFilepath string) bool {
+	if len(acceptedTo) == 0 && len(acceptedAddTo) == 0 {
+		return false
+	}
+
+	origTo := h.To
+	origAddTo := h.AddTo
+	h.To = acceptedTo
+	h.AddTo = acceptedAddTo
+	h.Filepath = primaryFilepath
+	if err := storeMsgDetail(h); err != nil {
+		log.Printf("ERROR: storing message: %s", err)
+		h.To = origTo
+		h.AddTo = origAddTo
+		for i := range codes {
+			if codes[i] == RejectCodeAccept {
+				codes[i] = RejectCodeUndisclosed
+			}
+		}
+		return false
+	}
+
+	h.To = origTo
+	h.AddTo = origAddTo
+	allAccepted := append(acceptedTo, acceptedAddTo...)
+	for i := range allAccepted {
+		if err := postMsgStatRecv(&allAccepted[i], h.Timestamp, int(h.Size)); err != nil {
+			log.Printf("WARN: Failed to post msg recv stat: %s", err)
+		}
+	}
+	return true
+}
+
+func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) error {
+	addrs := localRecipients(h)
 	if len(addrs) == 0 {
 		return fmt.Errorf("%w our domain: %s, not in recipient list", ErrProtocolViolation, Domain)
 	}
 	codes := make([]byte, len(addrs))
 
-	// download to temp file
-	fd, err := os.CreateTemp("", "fmsg-download-*")
+	if h.ChallengeCompleted {
+		allDup, err := allLocalRecipientsHaveMessageHash(h.ChallengeHash[:], addrs)
+		if err != nil {
+			return err
+		}
+		handled, err := respondGlobalDuplicateIfNeeded(c, h.ChallengeCompleted, allDup)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	createdPaths, err := prepareMessageData(r, h, skipData)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(fd.Name())
-	defer fd.Close()
+	cleanupOnReturn := !skipData
+	defer func() {
+		if cleanupOnReturn {
+			cleanupFiles(createdPaths)
+		}
+	}()
 
-	_, err = io.CopyN(fd, r, int64(h.Size))
-	if err != nil {
-		return err
-	}
-
-	// TODO [Spec 3.2]: Also download attachment data (sequential byte sequences
-	// whose boundaries are defined by attachment header sizes). Currently only
-	// message body data is downloaded; attachment bodies are not handled.
-
-	// verify hash matches challenge response
-	// TODO [Spec 3.3]: This verification MUST only be performed when the
-	// CHALLENGE/CHALLENGE-RESP exchange was actually completed. If the challenge
-	// was skipped (or not issued), ChallengeHash will be zero-valued and this
-	// comparison will erroneously fail for every message. Guard this check behind
-	// a flag or sentinel indicating whether the challenge exchange occurred.
-	h.Filepath = fd.Name()
+	// verify hash matches challenge response when challenge was completed
 	msgHash, err := h.GetMessageHash()
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(h.ChallengeHash[:], msgHash) {
+	if h.ChallengeCompleted && !bytes.Equal(h.ChallengeHash[:], msgHash) {
 		challengeHashStr := hex.EncodeToString(h.ChallengeHash[:])
 		actualHashStr := hex.EncodeToString(msgHash)
 		return fmt.Errorf("%w actual hash: %s mismatch challenge response: %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
 	}
 
-	// check for duplicate message
-	dupID, err := lookupMsgIdByHash(msgHash)
-	if err != nil {
-		return err
-	}
-	if dupID > 0 {
-		for i := range codes {
-			codes[i] = RejectCodeDuplicate
-		}
-		return rejectAccept(c, codes)
-	}
-
-	// verify parent exists if pid is set
-	// TODO [Spec 1.4.v.c]: This pid verification should happen during header
-	// exchange (readHeader / step 1.4.v), not after downloading the message.
-	// Additionally, the spec requires checking the parent's timestamp is before
-	// the current message's timestamp (reject code 9 = time travel), and the
-	// verification must follow the "Verifying Message Stored" semantics:
-	//  - The digest must match a previously accepted message (code 200) or
-	//    accepted add-to (code 11).
-	//  - The message/header must currently exist and be retrievable.
-	if h.Flags&FlagHasPid != 0 {
-		parentID, err := lookupMsgIdByHash(h.Pid)
-		if err != nil {
-			return err
-		}
-		if parentID == 0 {
-			for i := range codes {
-				codes[i] = RejectCodeParentNotFound
-			}
-			return rejectAccept(c, codes)
-		}
-	}
+	// pid/add-to validation is handled during header exchange in readHeader().
 
 	// determine file extension from MIME type
 	exts, _ := mime.ExtensionsByType(h.Type)
@@ -784,6 +1399,12 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	} else {
 		ext = exts[0]
 	}
+
+	src, err := os.Open(h.Filepath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
 
 	// validate each recipient and copy message for accepted ones
 	// Build a set of add-to addresses for later classification
@@ -795,7 +1416,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 	acceptedAddTo := []FMsgAddress{}
 	var primaryFilepath string
 	for i, addr := range addrs {
-		code, err := validateMsgRecvForAddr(h, &addr)
+		code, err := validateMsgRecvForAddr(h, &addr, msgHash)
 		if err != nil {
 			return err
 		}
@@ -812,28 +1433,8 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 		}
 
 		fp := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
-		if _, err := fd.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-
-		fd2, err := os.Create(fp)
-		if err != nil {
-			return err
-		}
-
-		var copyErr error
-		if h.Flags&FlagDeflate != 0 {
-			fr := flate.NewReader(fd)
-			_, copyErr = io.Copy(fd2, fr)
-			fr.Close()
-		} else {
-			_, copyErr = io.Copy(fd2, fd)
-		}
-		fd2.Close()
-
-		if copyErr != nil {
-			log.Printf("ERROR: copying downloaded message from: %s, to: %s", fd.Name(), fp)
-			os.Remove(fp)
+		if err := copyMessagePayload(src, fp, h.Flags&FlagDeflate != 0, h.Size); err != nil {
+			log.Printf("ERROR: copying downloaded message from: %s, to: %s", h.Filepath, fp)
 			codes[i] = RejectCodeUndisclosed
 			continue
 		}
@@ -846,38 +1447,33 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader) error {
 		}
 		if primaryFilepath == "" {
 			primaryFilepath = fp
+			if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
+				log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
+				codes[i] = RejectCodeUndisclosed
+				primaryFilepath = ""
+				acceptedTo = acceptedTo[:0]
+				acceptedAddTo = acceptedAddTo[:0]
+				continue
+			}
 		}
 	}
 
-	// store message details once for all accepted recipients
-	if len(acceptedTo) > 0 || len(acceptedAddTo) > 0 {
-		origTo := h.To
-		origAddTo := h.AddTo
-		h.To = acceptedTo
-		h.AddTo = acceptedAddTo
-		h.Filepath = primaryFilepath
-		if err := storeMsgDetail(h); err != nil {
-			log.Printf("ERROR: storing message: %s", err)
-			h.To = origTo
-			h.AddTo = origAddTo
-			for i := range codes {
-				if codes[i] == RejectCodeAccept {
-					codes[i] = RejectCodeUndisclosed
-				}
-			}
-		} else {
-			h.To = origTo
-			h.AddTo = origAddTo
-			allAccepted := append(acceptedTo, acceptedAddTo...)
-			for i := range allAccepted {
-				if err := postMsgStatRecv(&allAccepted[i], h.Timestamp, int(h.Size)); err != nil {
-					log.Printf("WARN: Failed to post msg recv stat: %s", err)
-				}
-			}
-		}
+	stored := storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, primaryFilepath)
+	if stored {
+		cleanupOnReturn = false
 	}
 
 	return rejectAccept(c, codes)
+}
+
+func respondGlobalDuplicateIfNeeded(c net.Conn, challengeCompleted, allDup bool) (bool, error) {
+	if !challengeCompleted || !allDup {
+		return false, nil
+	}
+	if err := sendCode(c, RejectCodeDuplicate); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func abortConn(c net.Conn) {
@@ -910,25 +1506,40 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	// challenge
-	err = challenge(c, header)
-	if err != nil {
+	if err := challenge(c, header); err != nil {
 		log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
 		return
 	}
 
+	// Send post-header response code (64 continue / 65 skip data).
+	if err := rejectAccept(c, []byte{header.InitialResponseCode}); err != nil {
+		log.Printf("ERROR: failed sending initial response to %s: %s", c.RemoteAddr().String(), err)
+		abortConn(c)
+		return
+	}
+
+	skipData := header.InitialResponseCode == AcceptCodeSkipData
+
+	if skipData {
+		log.Printf("INFO: sent code 65 (skip data) to %s", c.RemoteAddr().String())
+	} else {
+		log.Printf("INFO: sent code 64 (continue) to %s", c.RemoteAddr().String())
+	}
+
 	// store message
-	d := calcNetIODuration(int(header.Size), MinDownloadRate)
-	c.SetReadDeadline(time.Now().Add(d))
-	err = downloadMessage(c, r, header)
-	if err != nil {
+	deadlineBytes := int(header.Size)
+	if skipData {
+		deadlineBytes = 1
+	}
+	c.SetReadDeadline(time.Now().Add(calcNetIODuration(deadlineBytes, MinDownloadRate)))
+	if err := downloadMessage(c, r, header, skipData); err != nil {
 		// if error was a protocal violation, abort; otherise let sender know there was an internal error
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
 		if errors.Is(err, ErrProtocolViolation) {
 			return
 		} else {
-			rejectAccept(c, []byte{RejectCodeUndisclosed})
+			_ = sendCode(c, RejectCodeUndisclosed)
 		}
 	}
 

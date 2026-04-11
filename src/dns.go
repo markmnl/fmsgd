@@ -9,7 +9,49 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 )
+
+func dnssecRequired() bool {
+	return os.Getenv("FMSG_REQUIRE_DNSSEC") == "true"
+}
+
+func resolverAuthenticatedData(name string, qtype uint16) (bool, error) {
+	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		return false, err
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(name), qtype)
+	msg.SetEdns0(4096, true)
+
+	client := &dns.Client{Timeout: 5 * time.Second}
+	var lastErr error
+	for _, server := range cfg.Servers {
+		addr := net.JoinHostPort(server, cfg.Port)
+		resp, _, err := client.Exchange(msg, addr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp == nil {
+			lastErr = fmt.Errorf("nil DNS response from %s", addr)
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess && resp.Rcode != dns.RcodeNameError {
+			lastErr = fmt.Errorf("dns rcode %d from %s", resp.Rcode, addr)
+			continue
+		}
+		return resp.AuthenticatedData, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no DNS resolvers configured")
+	}
+	return false, lastErr
+}
 
 // lookupAuthorisedIPs resolves _fmsg.<domain> for A and AAAA records
 func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
@@ -21,6 +63,18 @@ func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no A/AAAA records found for %s", fmsgDomain)
 	}
+
+	if dnssecRequired() {
+		adA, errA := resolverAuthenticatedData(fmsgDomain, dns.TypeA)
+		adAAAA, errAAAA := resolverAuthenticatedData(fmsgDomain, dns.TypeAAAA)
+		if !adA && !adAAAA {
+			if errA != nil && errAAAA != nil {
+				return nil, fmt.Errorf("dnssec validation failed for %s: A=%v AAAA=%v", fmsgDomain, errA, errAAAA)
+			}
+			return nil, fmt.Errorf("dnssec validation failed for %s: resolver did not set AD bit", fmsgDomain)
+		}
+	}
+
 	return ips, nil
 }
 
