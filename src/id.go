@@ -32,7 +32,7 @@ type AddressDetail struct {
 // Returns pointer to an AddressDetail populated by querying fmsg Id standard at FMSG_ID_URL for
 // address supplied. If the address is not found returns nil, nil.
 func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
-	uri := IDURI + "/addr/" + url.PathEscape(addr.ToString())
+	uri := IDURI + "/fmsgid/" + url.PathEscape(addr.ToString())
 	resp, err := http.Get(uri)
 	if err != nil {
 		return nil, err
@@ -67,7 +67,7 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool)
 	} else {
 		part = "recv"
 	}
-	uri := fmt.Sprintf("%s/addr/%s", IDURI, part)
+	uri := fmt.Sprintf("%s/fmsgid/%s", IDURI, part)
 
 	payload := map[string]interface{}{
 		"address": addr.ToString(),
