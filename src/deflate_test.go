@@ -40,8 +40,8 @@ func TestShouldDeflate_TextTypes(t *testing.T) {
 		"model/stl",
 	}
 	for _, mt := range compressible {
-		if !shouldDeflate(mt, 1024) {
-			t.Errorf("shouldDeflate(%q, 1024) = false, want true", mt)
+		if !shouldCompress(mt, 1024) {
+			t.Errorf("shouldCompress(%q, 1024) = false, want true", mt)
 		}
 	}
 }
@@ -86,8 +86,8 @@ func TestShouldDeflate_IncompressibleTypes(t *testing.T) {
 		"model/vnd.usdz+zip",
 	}
 	for _, mt := range skip {
-		if shouldDeflate(mt, 1024) {
-			t.Errorf("shouldDeflate(%q, 1024) = true, want false", mt)
+		if shouldCompress(mt, 1024) {
+			t.Errorf("shouldCompress(%q, 1024) = true, want false", mt)
 		}
 	}
 }
@@ -95,27 +95,27 @@ func TestShouldDeflate_IncompressibleTypes(t *testing.T) {
 func TestShouldDeflate_SmallPayload(t *testing.T) {
 	sizes := []uint32{0, 1, 100, 511}
 	for _, sz := range sizes {
-		if shouldDeflate("text/plain;charset=UTF-8", sz) {
-			t.Errorf("shouldDeflate(text/plain, %d) = true, want false", sz)
+		if shouldCompress("text/plain;charset=UTF-8", sz) {
+			t.Errorf("shouldCompress(text/plain, %d) = true, want false", sz)
 		}
 	}
 }
 
 func TestShouldDeflate_EdgeCases(t *testing.T) {
 	// Exactly at threshold: should attempt
-	if !shouldDeflate("text/plain;charset=UTF-8", 512) {
+	if !shouldCompress("text/plain;charset=UTF-8", 512) {
 		t.Error("shouldDeflate at threshold 512 should return true")
 	}
 	// Unknown type: default to try compression
-	if !shouldDeflate("application/x-custom", 1024) {
+	if !shouldCompress("application/x-custom", 1024) {
 		t.Error("shouldDeflate for unknown type should return true")
 	}
 	// Type with parameters should match base type
-	if shouldDeflate("application/pdf; charset=utf-8", 1024) {
+	if shouldCompress("application/pdf; charset=utf-8", 1024) {
 		t.Error("shouldDeflate should strip parameters and match application/pdf")
 	}
 	// Case insensitive
-	if shouldDeflate("VIDEO/H264", 1024) {
+	if shouldCompress("VIDEO/H264", 1024) {
 		t.Error("shouldDeflate should be case-insensitive")
 	}
 }
@@ -142,7 +142,7 @@ func TestTryDeflate_CompressibleData(t *testing.T) {
 	srcPath := writeTempFile(t, original)
 	defer os.Remove(srcPath)
 
-	dstPath, cSize, worthwhile, err := tryDeflate(srcPath, uint32(len(original)))
+	dstPath, cSize, worthwhile, err := tryCompress(srcPath, uint32(len(original)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +151,8 @@ func TestTryDeflate_CompressibleData(t *testing.T) {
 	}
 	defer os.Remove(dstPath)
 
-	if cSize >= uint32(len(original))*9/10 {
-		t.Errorf("compressed size %d not < 90%% of original %d", cSize, len(original))
+	if cSize >= uint32(len(original))*8/10 {
+		t.Errorf("compressed size %d not < 80%% of original %d", cSize, len(original))
 	}
 
 	// Verify the compressed file decompresses to the original data
@@ -185,7 +185,7 @@ func TestTryDeflate_IncompressibleData(t *testing.T) {
 	srcPath := writeTempFile(t, data)
 	defer os.Remove(srcPath)
 
-	_, _, worthwhile, err := tryDeflate(srcPath, uint32(len(data)))
+	_, _, worthwhile, err := tryCompress(srcPath, uint32(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestTryDeflate_RoundTrip(t *testing.T) {
 	srcPath := writeTempFile(t, original)
 	defer os.Remove(srcPath)
 
-	dstPath, cSize, worthwhile, err := tryDeflate(srcPath, uint32(len(original)))
+	dstPath, cSize, worthwhile, err := tryCompress(srcPath, uint32(len(original)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestTryDeflate_CleanupOnNotWorthwhile(t *testing.T) {
 	srcPath := writeTempFile(t, data)
 	defer os.Remove(srcPath)
 
-	dstPath, _, worthwhile, err := tryDeflate(srcPath, uint32(len(data)))
+	dstPath, _, worthwhile, err := tryCompress(srcPath, uint32(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +255,68 @@ func TestTryDeflate_CleanupOnNotWorthwhile(t *testing.T) {
 	}
 }
 
+func TestTryDeflate_ProbeRejectsLargeIncompressible(t *testing.T) {
+	// A file larger than deflateSampleSize filled with random bytes should be
+	// rejected by the sample probe without writing a full compressed file.
+	data := make([]byte, deflateSampleSize+4096)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := writeTempFile(t, data)
+	defer os.Remove(srcPath)
+
+	_, _, worthwhile, err := tryCompress(srcPath, uint32(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worthwhile {
+		t.Error("expected probe to reject large random data")
+	}
+}
+
+func TestTryDeflate_ProbeAcceptsLargeCompressible(t *testing.T) {
+	// A file larger than deflateSampleSize filled with repetitive text should
+	// pass the probe and compress the full file successfully.
+	data := []byte(strings.Repeat("probe compressible test data! ", 1000))
+	if len(data) <= deflateSampleSize {
+		t.Fatalf("test data %d bytes not larger than sample size %d", len(data), deflateSampleSize)
+	}
+	srcPath := writeTempFile(t, data)
+	defer os.Remove(srcPath)
+
+	dstPath, cSize, worthwhile, err := tryCompress(srcPath, uint32(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !worthwhile {
+		t.Fatal("expected large compressible data to be worthwhile")
+	}
+	defer os.Remove(dstPath)
+
+	if cSize >= uint32(len(data))*8/10 {
+		t.Errorf("compressed size %d not < 80%% of original %d", cSize, len(data))
+	}
+
+	// Verify round-trip
+	f, err := os.Open(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := zlib.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decompressed, err := io.ReadAll(zr)
+	zr.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decompressed, data) {
+		t.Error("decompressed data does not match original")
+	}
+}
+
 // --- Hash determinism tests ---
 
 func TestGetMessageHash_WithDeflate(t *testing.T) {
@@ -264,7 +326,7 @@ func TestGetMessageHash_WithDeflate(t *testing.T) {
 	defer os.Remove(srcPath)
 
 	// Compress it
-	dstPath, cSize, worthwhile, err := tryDeflate(srcPath, uint32(len(original)))
+	dstPath, cSize, worthwhile, err := tryCompress(srcPath, uint32(len(original)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +401,7 @@ func TestGetMessageHash_DeflateChangesHash(t *testing.T) {
 	srcPath := writeTempFile(t, original)
 	defer os.Remove(srcPath)
 
-	dstPath, cSize, worthwhile, err := tryDeflate(srcPath, uint32(len(original)))
+	dstPath, cSize, worthwhile, err := tryCompress(srcPath, uint32(len(original)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +452,7 @@ func TestGetMessageHash_AttachmentDeflate(t *testing.T) {
 	attSrcPath := writeTempFile(t, attOriginal)
 	defer os.Remove(attSrcPath)
 
-	attDstPath, attCSize, worthwhile, err := tryDeflate(attSrcPath, uint32(len(attOriginal)))
+	attDstPath, attCSize, worthwhile, err := tryCompress(attSrcPath, uint32(len(attOriginal)))
 	if err != nil {
 		t.Fatal(err)
 	}

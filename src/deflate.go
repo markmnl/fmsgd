@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/zlib"
 	"io"
 	"os"
@@ -46,10 +47,10 @@ var incompressibleTypes = map[string]bool{
 	"model/vnd.usdz+zip": true,
 }
 
-// shouldDeflate reports whether compression should be attempted for a payload
+// shouldCompress reports whether compression should be attempted for a payload
 // with the given media type and size. It returns false for payloads that are
 // too small or use a media type known to be already compressed.
-func shouldDeflate(mediaType string, dataSize uint32) bool {
+func shouldCompress(mediaType string, dataSize uint32) bool {
 	if dataSize < minDeflateSize {
 		return false
 	}
@@ -60,16 +61,62 @@ func shouldDeflate(mediaType string, dataSize uint32) bool {
 	return !incompressibleTypes[t]
 }
 
-// tryDeflate compresses the file at srcPath using zlib-deflate and writes the
-// result to a temporary file. It returns worthwhile=true only when the
-// compressed output is less than 90% of the original size (at least a 10%
-// reduction). When not worthwhile the temporary file is removed.
-func tryDeflate(srcPath string, srcSize uint32) (dstPath string, compressedSize uint32, worthwhile bool, err error) {
+// deflateSampleSize is the number of bytes sampled from the start of a file
+// to estimate compressibility before committing to a full-file compression
+// pass. Chosen large enough for zlib to find patterns but small enough to be
+// fast even on very large files.
+const deflateSampleSize = 8192
+
+// probeSample compresses up to deflateSampleSize bytes from the start of src
+// and reports whether the ratio looks promising (compressed < 80% of input).
+// src is seeked back to the start on return.
+func probeSample(src *os.File, srcSize uint32) (bool, error) {
+	sampleLen := int64(deflateSampleSize)
+	if int64(srcSize) < sampleLen {
+		sampleLen = int64(srcSize)
+	}
+
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := io.CopyN(zw, src, sampleLen); err != nil {
+		_ = zw.Close()
+		return false, err
+	}
+	if err := zw.Close(); err != nil {
+		return false, err
+	}
+
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+
+	return int64(buf.Len()) < sampleLen*8/10, nil
+}
+
+// tryCompress compresses the file at srcPath using zlib-deflate and writes the
+// result to a temporary file. For files larger than deflateSampleSize it first
+// compresses a prefix sample to estimate compressibility, avoiding a full pass
+// over files that won't compress well. It returns worthwhile=true only when
+// the compressed output is less than 80% of the original size (at least a 20%
+// reduction). When not worthwhile the temporary file is removed. When
+// worthwhile the caller is responsible for removing the file at dstPath.
+func tryCompress(srcPath string, srcSize uint32) (dstPath string, compressedSize uint32, worthwhile bool, err error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return "", 0, false, err
 	}
 	defer src.Close()
+
+	// For files larger than the sample size, probe a prefix first.
+	if srcSize > deflateSampleSize {
+		promising, err := probeSample(src, srcSize)
+		if err != nil {
+			return "", 0, false, err
+		}
+		if !promising {
+			return "", 0, false, nil
+		}
+	}
 
 	dst, err := os.CreateTemp("", "fmsg-deflate-*")
 	if err != nil {
@@ -101,7 +148,7 @@ func tryDeflate(srcPath string, srcSize uint32) (dstPath string, compressedSize 
 	}
 
 	cSize := uint32(fi.Size())
-	if cSize >= srcSize*9/10 {
+	if cSize >= srcSize*8/10 {
 		_ = os.Remove(dstName)
 		return "", 0, false, nil
 	}

@@ -312,12 +312,12 @@ func deliverMessage(target pendingTarget) {
 			_ = os.Remove(p)
 		}
 	}()
-	if shouldDeflate(h.Type, h.Size) {
-		dp, cs, ok, derr := tryDeflate(h.Filepath, h.Size)
+	if shouldCompress(h.Type, h.Size) {
+		dp, cs, ok, derr := tryCompress(h.Filepath, h.Size)
 		if derr != nil {
-			log.Printf("WARN: sender: deflate msg data for msg %d: %s", target.MsgID, derr)
+			log.Printf("WARN: sender: compress msg data for msg %d: %s", target.MsgID, derr)
 		} else if ok {
-			log.Printf("INFO: sender: deflated msg %d data: %d -> %d bytes", target.MsgID, h.Size, cs)
+			log.Printf("INFO: sender: compressed msg %d data: %d -> %d bytes", target.MsgID, h.Size, cs)
 			deflateCleanup = append(deflateCleanup, dp)
 			h.Filepath = dp
 			h.Size = cs
@@ -326,12 +326,12 @@ func deliverMessage(target pendingTarget) {
 	}
 	for i := range h.Attachments {
 		att := &h.Attachments[i]
-		if shouldDeflate(att.Type, att.Size) {
-			dp, cs, ok, derr := tryDeflate(att.Filepath, att.Size)
+		if shouldCompress(att.Type, att.Size) {
+			dp, cs, ok, derr := tryCompress(att.Filepath, att.Size)
 			if derr != nil {
-				log.Printf("WARN: sender: deflate attachment %s for msg %d: %s", att.Filename, target.MsgID, derr)
+				log.Printf("WARN: sender: compress attachment %s for msg %d: %s", att.Filename, target.MsgID, derr)
 			} else if ok {
-				log.Printf("INFO: sender: deflated msg %d attachment %s: %d -> %d bytes", target.MsgID, att.Filename, att.Size, cs)
+				log.Printf("INFO: sender: compressed msg %d attachment %s: %d -> %d bytes", target.MsgID, att.Filename, att.Size, cs)
 				deflateCleanup = append(deflateCleanup, dp)
 				att.Filepath = dp
 				att.Size = cs
