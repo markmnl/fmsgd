@@ -8,7 +8,7 @@ import (
 )
 
 // minDeflateSize is the minimum payload size in bytes before compression is
-// attempted. Below this, zlib framing overhead likely outweighs savings.
+// attempted.
 const minDeflateSize uint32 = 512
 
 // incompressibleTypes lists media types (lowercased, without parameters) that
