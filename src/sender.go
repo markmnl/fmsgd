@@ -304,6 +304,42 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
+	// Try zlib-deflate compression for message data and attachment data.
+	// Compressed temp files are cleaned up after delivery completes.
+	var deflateCleanup []string
+	defer func() {
+		for _, p := range deflateCleanup {
+			_ = os.Remove(p)
+		}
+	}()
+	if shouldDeflate(h.Type, h.Size) {
+		dp, cs, ok, derr := tryDeflate(h.Filepath, h.Size)
+		if derr != nil {
+			log.Printf("WARN: sender: deflate msg data for msg %d: %s", target.MsgID, derr)
+		} else if ok {
+			log.Printf("INFO: sender: deflated msg %d data: %d -> %d bytes", target.MsgID, h.Size, cs)
+			deflateCleanup = append(deflateCleanup, dp)
+			h.Filepath = dp
+			h.Size = cs
+			h.Flags |= FlagDeflate
+		}
+	}
+	for i := range h.Attachments {
+		att := &h.Attachments[i]
+		if shouldDeflate(att.Type, att.Size) {
+			dp, cs, ok, derr := tryDeflate(att.Filepath, att.Size)
+			if derr != nil {
+				log.Printf("WARN: sender: deflate attachment %s for msg %d: %s", att.Filename, target.MsgID, derr)
+			} else if ok {
+				log.Printf("INFO: sender: deflated msg %d attachment %s: %d -> %d bytes", target.MsgID, att.Filename, att.Size, cs)
+				deflateCleanup = append(deflateCleanup, dp)
+				att.Filepath = dp
+				att.Size = cs
+				att.Flags |= 1 << 1
+			}
+		}
+	}
+
 	// Ensure sha256 is populated for outgoing messages so future pid lookups
 	// (e.g. add-to notifications referencing this message) can find it.
 	msgHash, err := h.GetMessageHash()
