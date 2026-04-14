@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -160,11 +161,44 @@ var MinUploadRate float64 = 5000
 var ReadBufferSize = 1600
 var MaxMessageSize = uint32(1024 * 10)
 var SkipAuthorisedIPs = false
+var TLSInsecureSkipVerify = false
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
 var AtRune, _ = utf8.DecodeRuneInString("@")
 var MinNetIODeadline = 6 * time.Second
+
+var serverTLSConfig *tls.Config
+
+func buildServerTLSConfig() *tls.Config {
+	certFile := os.Getenv("FMSG_TLS_CERT")
+	keyFile := os.Getenv("FMSG_TLS_KEY")
+	if certFile == "" || keyFile == "" {
+		log.Fatalf("ERROR: FMSG_TLS_CERT and FMSG_TLS_KEY must be set")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("ERROR: loading TLS certificate: %s", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		},
+		NextProtos: []string{"fmsg/1"},
+	}
+}
+
+func buildClientTLSConfig(serverName string) *tls.Config {
+	return &tls.Config{
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: TLSInsecureSkipVerify,
+		NextProtos:         []string{"fmsg/1"},
+	}
+}
 
 // loadEnvConfig reads env vars (after godotenv.Load so .env is picked up).
 func loadEnvConfig() {
@@ -177,6 +211,7 @@ func loadEnvConfig() {
 	ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 	MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
 	SkipAuthorisedIPs = os.Getenv("FMSG_SKIP_AUTHORISED_IPS") == "true"
+	TLSInsecureSkipVerify = os.Getenv("FMSG_TLS_INSECURE_SKIP_VERIFY") == "true"
 }
 
 // Updates DataDir from environment, panics if not a valid directory.
@@ -204,7 +239,7 @@ func setDomain() {
 	}
 	Domain = domain
 
-	// verify our external IP is in the _fmsg authorised IP set
+	// verify our external IP is in the fmsg authorised IP set
 	checkDomainIP(domain)
 }
 
@@ -518,7 +553,7 @@ func verifySenderIP(c net.Conn, senderDomain string) error {
 
 	authorisedIPs, err := lookupAuthorisedIPs(senderDomain)
 	if err != nil {
-		log.Printf("WARN: DNS lookup failed for _fmsg.%s: %s", senderDomain, err)
+		log.Printf("WARN: DNS lookup failed for fmsg.%s: %s", senderDomain, err)
 		return fmt.Errorf("DNS verification failed")
 	}
 
@@ -528,7 +563,7 @@ func verifySenderIP(c net.Conn, senderDomain string) error {
 		}
 	}
 
-	log.Printf("WARN: remote IP %s not in authorised IPs for _fmsg.%s", remoteIP.String(), senderDomain)
+	log.Printf("WARN: remote IP %s not in authorised IPs for fmsg.%s", remoteIP.String(), senderDomain)
 	return fmt.Errorf("DNS verification failed")
 }
 
@@ -1031,14 +1066,14 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 // TODO [Spec step 2]: The spec defines challenge modes (NEVER, ALWAYS,
 // HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices.
 // Currently defaults to ALWAYS. Implement configurable challenge mode.
-func challenge(conn net.Conn, h *FMsgHeader) error {
+func challenge(conn net.Conn, h *FMsgHeader, senderDomain string) error {
 
 	// Connection 2 MUST target the same IP as Connection 1 (spec 2.1).
 	remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
 		return fmt.Errorf("failed to parse remote address for challenge: %w", err)
 	}
-	conn2, err := net.Dial("tcp", net.JoinHostPort(remoteHost, fmt.Sprintf("%d", RemotePort)))
+	conn2, err := tls.Dial("tcp", net.JoinHostPort(remoteHost, fmt.Sprintf("%d", RemotePort)), buildClientTLSConfig("fmsg."+senderDomain))
 	if err != nil {
 		return err
 	}
@@ -1506,7 +1541,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	if err := challenge(c, header); err != nil {
+	if err := challenge(c, header, determineSenderDomain(header)); err != nil {
 		log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
 		return
@@ -1576,6 +1611,9 @@ func main() {
 	setDomain()
 	setIDURL()
 
+	// load TLS configuration (must be after loadEnvConfig for FMSG_TLS_INSECURE_SKIP_VERIFY)
+	serverTLSConfig = buildServerTLSConfig()
+
 	// start sender in background (small delay so listener is ready first)
 	go func() {
 		time.Sleep(1 * time.Second)
@@ -1584,7 +1622,7 @@ func main() {
 
 	// start listening
 	addr := fmt.Sprintf("%s:%d", listenAddress, Port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := tls.Listen("tcp", addr, serverTLSConfig)
 	if err != nil {
 		log.Fatal(err)
 	}

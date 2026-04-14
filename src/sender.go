@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -398,21 +399,23 @@ func deliverMessage(target pendingTarget) {
 
 	targetIPs, err := lookupAuthorisedIPs(target.Domain)
 	if err != nil {
-		log.Printf("ERROR: sender: DNS lookup for _fmsg.%s failed: %s", target.Domain, err)
+		log.Printf("ERROR: sender: DNS lookup for fmsg.%s failed: %s", target.Domain, err)
 		return
 	}
 
 	var conn net.Conn
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	tlsConf := buildClientTLSConfig("fmsg." + target.Domain)
 	for _, ip := range targetIPs {
 		addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", RemotePort))
-		conn, err = net.DialTimeout("tcp", addr, 10*time.Second)
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
 		if err == nil {
 			break
 		}
 		log.Printf("WARN: sender: connect to %s failed: %s", addr, err)
 	}
 	if conn == nil {
-		log.Printf("ERROR: sender: could not connect to any IP for _fmsg.%s", target.Domain)
+		log.Printf("ERROR: sender: could not connect to any IP for fmsg.%s", target.Domain)
 		return
 	}
 	defer conn.Close()

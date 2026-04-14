@@ -3,7 +3,7 @@
 [![Go 1.25](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml/badge.svg)](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml)
 
 
-Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in Go! Uses local filesystem and PostgreSQL database to store messages per the [fmsg-store-postgres standard](https://github.com/markmnl/fmsg/blob/main/STANDARDS.md).
+Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in Go! Uses local filesystem and PostgreSQL database to store messages.
 
 ## Building from source
 
@@ -16,13 +16,16 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 ## Environment
 
-`FMSG_DATA_DIR`, `FMSG_DOMAIN` and `FMSG_ID_URL` are required to be set and valid; otherwise fmsgd will abort on startup. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
+`FMSG_DATA_DIR`, `FMSG_DOMAIN`, `FMSG_ID_URL`, `FMSG_TLS_CERT` and `FMSG_TLS_KEY` are required to be set and valid; otherwise fmsgd will abort on startup. In addition to these `FMSG_` varibles, `PG` variables need to be set for the PostgreSQL database to use, refer to: https://www.postgresql.org/docs/current/libpq-envars.html
 
 | Variable                   | Default | Description                                                                                                                                             |
 |----------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | FMSG_DATA_DIR              |         | Path where messages will be stored. e.g. /opt/fmsg/data                                                                                                 |
 | FMSG_DOMAIN                |         | Domain name this host is located. e.g. example.com                                                                                                      |
 | FMSG_ID_URL                |         | Base HTTP URL for fmsg Id API, e.g. http://localhost:5000                                                                                                    |
+| FMSG_TLS_CERT              |         | Path to TLS certificate file (PEM). Certificate must match `fmsg.<FMSG_DOMAIN>`.                                                                       |
+| FMSG_TLS_KEY               |         | Path to TLS private key file (PEM).                                                                                                                     |
+| FMSG_TLS_INSECURE_SKIP_VERIFY | false | Set to "true" to skip TLS certificate verification on outgoing connections. For development/testing only.                                               |
 | FMSG_MAX_MSG_SIZE          | 10240   | Bytes. Maximum size above which to reject messages greater than before downloading them.                                                                |
 | FMSG_PORT                  | 4930    | TCP port to listen on                                                                                                                                   |
 | FMSG_MAX_PAST_TIME_DELTA   | 604800  | Seconds. Duration since message timestamp to reject if greater than. Note sending host could have been holding messages waiting for us to be reachable. |
@@ -34,8 +37,8 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 | FMSG_RETRY_MAX_AGE         | 86400   | Seconds. Maximum age of a message since creation before giving up on delivery retries (default 1 day).                                                 |
 | FMSG_POLL_INTERVAL         | 10      | Seconds. How often the sender polls the database for pending messages.                                                                                 |
 | FMSG_MAX_CONCURRENT_SEND   | 1024    | Maximum number of concurrent outbound message deliveries.                                                                                              |
-| FMSG_SKIP_DOMAIN_IP_CHECK  | false   | Set to "true" to skip verifying this host's external IP is in the _fmsg DNS authorised IP set on startup.                                              |
-| FMSG_SKIP_AUTHORISED_IPS  | false   | Set to "true" to skip verifying remote hosts IP is in the _fmsg DNS authorised IP set during message exchange. WARNING setting this true is effectivly disables sender verification.                                              |
+| FMSG_SKIP_DOMAIN_IP_CHECK  | false   | Set to "true" to skip verifying this host's external IP is in the fmsg DNS authorised IP set on startup.                                               |
+| FMSG_SKIP_AUTHORISED_IPS  | false   | Set to "true" to skip verifying remote hosts IP is in the fmsg DNS authorised IP set during message exchange. WARNING setting this true effectively disables sender verification. |
 
 
 

@@ -53,9 +53,9 @@ func resolverAuthenticatedData(name string, qtype uint16) (bool, error) {
 	return false, lastErr
 }
 
-// lookupAuthorisedIPs resolves _fmsg.<domain> for A and AAAA records
+// lookupAuthorisedIPs resolves fmsg.<domain> for A and AAAA records
 func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
-	fmsgDomain := "_fmsg." + domain
+	fmsgDomain := "fmsg." + domain
 	ips, err := net.LookupIP(fmsgDomain)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup for %s failed: %w", fmsgDomain, err)
@@ -114,7 +114,7 @@ func getExternalIP() (net.IP, error) {
 }
 
 // verifyDomainIP checks that this host's external IP is present in the
-// _fmsg.<domain> authorised IP set. Panics if not found.
+// fmsg.<domain> authorised IP set. Panics if not found.
 func verifyDomainIP(domain string) {
 	externalIP, err := getExternalIP()
 	if err != nil {
@@ -124,17 +124,17 @@ func verifyDomainIP(domain string) {
 
 	authorisedIPs, err := lookupAuthorisedIPs(domain)
 	if err != nil {
-		log.Panicf("ERROR: failed to lookup _fmsg.%s: %s", domain, err)
+		log.Panicf("ERROR: failed to lookup fmsg.%s: %s", domain, err)
 	}
 
 	for _, ip := range authorisedIPs {
 		if externalIP.Equal(ip) {
-			log.Printf("INFO: external IP %s found in _fmsg.%s authorised IPs", externalIP, domain)
+			log.Printf("INFO: external IP %s found in fmsg.%s authorised IPs", externalIP, domain)
 			return
 		}
 	}
 
-	log.Panicf("ERROR: external IP %s not found in _fmsg.%s authorised IPs %v", externalIP, domain, authorisedIPs)
+	log.Panicf("ERROR: external IP %s not found in fmsg.%s authorised IPs %v", externalIP, domain, authorisedIPs)
 }
 
 // checkDomainIP verifies the external IP is authorised unless
