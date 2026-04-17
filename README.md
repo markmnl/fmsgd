@@ -67,7 +67,10 @@ ASSUMES:
 * User `fmsg` has been created and has
     - read and execute permissions to `/opt/fmsgd/`, e.g. with `chown -R fmsg:fmsg /opt/fmsgd` after `mkdir /opt/fmsgd`
     - write permissions to FMSG_DATA_DIR
+    - read permissions to /var/lib/fmsgd/tls
 * Directory `/var/lib/fmsgd` has been created and owned by fmsg
+* 
+
 
 `/etc/systemd/system/fmsgd.service`
 
@@ -91,7 +94,8 @@ WorkingDirectory=/opt/fmsgd
 Restart=on-failure
 RestartSec=3
 
-# --- Filesystem access ---
+# --- Filesystem access NOTE location of certs /var/lib/fmsgd/tls---
+ReadOnlyPaths=/var/lib/fmsgd/tls
 ReadWritePaths=/opt/fmsgd
 ReadWritePaths=/var/lib/fmsgd
 PrivateTmp=true
@@ -115,6 +119,8 @@ FMSG_DATA_DIR=/var/lib/fmsgd/
 FMSG_DOMAIN=example.com
 FMSG_ID_URL=http://127.0.0.1:8080
 
+FMSG_TLS_CERT=/var/lib/fmsgd/tls/fullchain.pem
+FMSG_TLS_KEY=/var/lib/fmsgd/tls/privkey.pem
 
 FMSG_MAX_MSG_SIZE=10240
 FMSG_MAX_PAST_TIME_DELTA=604800
