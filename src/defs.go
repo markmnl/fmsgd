@@ -47,7 +47,7 @@ type FMsgHeader struct {
 	HeaderHash          []byte
 	ChallengeHash       [32]byte
 	ChallengeCompleted  bool  // True if challenge was initiated and completed
-	InitialResponseCode uint8 // Protocol response chosen after header validation (64/65)
+	InitialResponseCode uint8 // Protocol response chosen after header validation (11/64/65)
 	Filepath            string
 	messageHash         []byte
 }

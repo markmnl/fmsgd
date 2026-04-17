@@ -510,29 +510,3 @@ func TestReadAttachmentHeadersRejectsReservedAttachmentBits(t *testing.T) {
 		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
 	}
 }
-
-func TestRespondGlobalDuplicateIfNeeded(t *testing.T) {
-	c := &testConn{}
-	handled, err := respondGlobalDuplicateIfNeeded(c, true, true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !handled {
-		t.Fatalf("expected handled=true")
-	}
-	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeDuplicate {
-		t.Fatalf("expected duplicate code %d, got %v", RejectCodeDuplicate, got)
-	}
-
-	c2 := &testConn{}
-	handled, err = respondGlobalDuplicateIfNeeded(c2, true, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if handled {
-		t.Fatalf("expected handled=false")
-	}
-	if len(c2.Bytes()) != 0 {
-		t.Fatalf("expected no bytes written, got %v", c2.Bytes())
-	}
-}

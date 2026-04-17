@@ -611,17 +611,8 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
 		}
 	}
-	if err := storeMsgHeaderOnly(h); err != nil {
-		if err2 := sendCode(c, RejectCodeUndisclosed); err2 != nil {
-			return h, err2
-		}
-		return h, fmt.Errorf("add-to notification: storing header: %w", err)
-	}
-	if err := sendCode(c, AcceptCodeAddTo); err != nil {
-		return h, err
-	}
-	log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(h.Pid))
-	return nil, nil
+	h.InitialResponseCode = AcceptCodeAddTo
+	return h, nil
 }
 
 func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
@@ -1388,20 +1379,6 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	}
 	codes := make([]byte, len(addrs))
 
-	if h.ChallengeCompleted {
-		allDup, err := allLocalRecipientsHaveMessageHash(h.ChallengeHash[:], addrs)
-		if err != nil {
-			return err
-		}
-		handled, err := respondGlobalDuplicateIfNeeded(c, h.ChallengeCompleted, allDup)
-		if err != nil {
-			return err
-		}
-		if handled {
-			return nil
-		}
-	}
-
 	createdPaths, err := prepareMessageData(r, h, skipData)
 	if err != nil {
 		return err
@@ -1501,16 +1478,6 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	return rejectAccept(c, codes)
 }
 
-func respondGlobalDuplicateIfNeeded(c net.Conn, challengeCompleted, allDup bool) (bool, error) {
-	if !challengeCompleted || !allDup {
-		return false, nil
-	}
-	if err := sendCode(c, RejectCodeDuplicate); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 func abortConn(c net.Conn) {
 	if tcp, ok := c.(*net.TCPConn); ok {
 		tcp.SetLinger(0)
@@ -1547,18 +1514,60 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	// Send post-header response code (64 continue / 65 skip data).
-	if err := rejectAccept(c, []byte{header.InitialResponseCode}); err != nil {
-		log.Printf("ERROR: failed sending initial response to %s: %s", c.RemoteAddr().String(), err)
-		abortConn(c)
+	// §10.4 Step 1: Add-to handling (only when add-to set and parent verified stored)
+	skipData := false
+	switch header.InitialResponseCode {
+	case AcceptCodeAddTo:
+		// No local add-to recipients; store header and respond code 11, close.
+		if err := storeMsgHeaderOnly(header); err != nil {
+			log.Printf("ERROR: storing add-to header: %s", err)
+			_ = sendCode(c, RejectCodeUndisclosed)
+			abortConn(c)
+			return
+		}
+		if err := sendCode(c, AcceptCodeAddTo); err != nil {
+			log.Printf("ERROR: failed sending code 11 to %s: %s", c.RemoteAddr().String(), err)
+			abortConn(c)
+			return
+		}
+		log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(header.Pid))
+		c.Close()
 		return
-	}
-
-	skipData := header.InitialResponseCode == AcceptCodeSkipData
-
-	if skipData {
+	case AcceptCodeSkipData:
+		// Local add-to recipients exist; parent stored; skip data.
+		if err := sendCode(c, AcceptCodeSkipData); err != nil {
+			log.Printf("ERROR: failed sending code 65 to %s: %s", c.RemoteAddr().String(), err)
+			abortConn(c)
+			return
+		}
+		skipData = true
 		log.Printf("INFO: sent code 65 (skip data) to %s", c.RemoteAddr().String())
-	} else {
+	default:
+		// §10.4 Step 2: Duplicate check (before sending continue)
+		if header.ChallengeCompleted {
+			addrs := localRecipients(header)
+			allDup, err := allLocalRecipientsHaveMessageHash(header.ChallengeHash[:], addrs)
+			if err != nil {
+				log.Printf("ERROR: duplicate check failed for %s: %s", c.RemoteAddr().String(), err)
+				_ = sendCode(c, RejectCodeUndisclosed)
+				abortConn(c)
+				return
+			}
+			if allDup {
+				if err := sendCode(c, RejectCodeDuplicate); err != nil {
+					log.Printf("ERROR: failed sending code 10 to %s: %s", c.RemoteAddr().String(), err)
+				}
+				c.Close()
+				return
+			}
+		}
+
+		// §10.4 Step 3: Continue
+		if err := sendCode(c, AcceptCodeContinue); err != nil {
+			log.Printf("ERROR: failed sending code 64 to %s: %s", c.RemoteAddr().String(), err)
+			abortConn(c)
+			return
+		}
 		log.Printf("INFO: sent code 64 (continue) to %s", c.RemoteAddr().String())
 	}
 
