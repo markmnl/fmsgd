@@ -94,6 +94,7 @@ RestartSec=3
 # --- Filesystem access ---
 ReadWritePaths=/opt/fmsgd
 ReadWritePaths=/var/lib/fmsgd
+PrivateTmp=true
 
 # --- Hardening ---
 NoNewPrivileges=true
