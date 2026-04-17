@@ -233,7 +233,7 @@ func setDomain() {
 	if !hasValue {
 		log.Panicln("ERROR: FMSG_DOMAIN not set")
 	}
-	_, err := net.LookupHost(domain)
+	_, err := net.LookupHost("fmsg." + domain)
 	if err != nil {
 		log.Panicf("ERROR: FMSG_DOMAIN, %s: %s\n", domain, err)
 	}
