@@ -153,7 +153,7 @@ Per-recipient codes (one byte per recipient on this host, in message order):
 
 ## 9. Domain Resolution
 
-Resolve `fmsg.<domain>` for A/AAAA records. The sender's domain is:
+Resolve ``fmsg.<domain>`` for A/AAAA records. The sender's domain is:
 - The domain of _add to from_ when _has add to_ is set.
 - The domain of _from_ otherwise.
 
@@ -175,7 +175,7 @@ One message per connection. Two TCP connections used: Connection 1 (message tran
 
 Host A delivers iff _from_ or _add to from_ belongs to Host A's domain. For each unique recipient domain:
 
-1. Resolve recipient domain IPs via `fmsg.<domain>`. Connect to first responsive IP (Connection 1). Retry with backoff if unreachable.
+1. Resolve recipient domain IPs via ``fmsg.<domain>``. Connect to first responsive IP (Connection 1). Retry with backoff if unreachable.
 2. Register the message header hash and Host B's IP in an outgoing record (for matching challenges).
 3. Transmit the message header on Connection 1.
 4. Wait for response. During this wait, be ready to handle a CHALLENGE on Connection 2 (see §10.5).
@@ -206,32 +206,34 @@ Host A delivers iff _from_ or _add to from_ belongs to Host A's domain. For each
    - DELTA > MAX_MESSAGE_AGE → respond code 7, close.
    - DELTA < −MAX_TIME_SKEW → respond code 8, close.
 7. Evaluate pid / add-to:
-   - **No pid, no add-to** (new thread): respond 64 (continue).
+   - **No pid, no add-to** (new thread): proceed.
    - **pid set, no add-to** (reply):
      - Verify parent stored (§11). Not found → respond code 6, close.
      - Parent time − MAX_TIME_SKEW must be before incoming time. Fail → respond code 9, close.
      - _from_ must be a participant of the parent. Fail → respond code 1, close.
-     - Respond 64 (continue).
    - **add-to set** (adding recipients):
      - pid MUST also be set. Fail → respond code 1, close.
      - Check if parent stored (§11):
        - **Stored**: check time travel (code 9 if fail).
-         - If any _add to_ recipient belongs to Host B's domain → respond 65 (skip data), then per-recipient codes per §10.4.
-         - Otherwise → record add-to fields, respond 11 (accept add to), close.
-       - **Not stored**: respond 64 (continue) — treat as full message delivery.
+       - **Not stored**: treat as full message delivery.
+8. Optionally issue a CHALLENGE on Connection 2 (see §10.5).
 
-### 10.4 Receiving — Data Download and Per-Recipient Response
+### 10.4 Receiving — ACCEPT Response, Data Download and Per-Recipient Response
 
-1. If challenge was completed, use the message hash from the challenge response to check for duplicates across all recipients on Host B. If duplicate for all → respond code 10, close.
-2. If code 65 was sent, skip to step 4 (data already stored). Otherwise download data + attachments (exactly declared sizes).
-3. If challenge was completed, verify computed message hash matches the challenge response hash. For code 65, compute from received header + stored data. Mismatch → TERMINATE.
-4. For each recipient on Host B's domain (in _to_ order, then _add to_ order), send one response byte:
+1. If _add to_ set and parent verified stored in step 7:
+   - If any _add to_ recipient belongs to Host B's domain → respond 65 (skip data).
+   - Otherwise → record add-to fields, respond 11 (accept add to), close.
+2. If challenge was completed, use the message hash from the challenge response to check for duplicates across all recipients on Host B. If duplicate for all → respond code 10, close.
+3. Otherwise → respond 64 (continue).
+4. If code 65 was sent, skip to step 6 (data already stored). Otherwise download data + attachments (exactly declared sizes).
+5. If challenge was completed, verify computed message hash matches the challenge response hash. For code 65, compute from received header + stored data. Mismatch → TERMINATE.
+6. For each recipient on Host B's domain (in _to_ order, then _add to_ order), send one response byte:
    - Already received → 103 (or 105).
    - Unknown address → 100 (or 105).
    - Quota exceeded → 101 (or 105).
    - Not accepting → 102 (or 105).
    - Otherwise → 200 (accept).
-5. Close Connection 1.
+7. Close Connection 1.
 
 ### 10.5 Challenge Flow
 

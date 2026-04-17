@@ -511,28 +511,37 @@ func TestReadAttachmentHeadersRejectsReservedAttachmentBits(t *testing.T) {
 	}
 }
 
-func TestRespondGlobalDuplicateIfNeeded(t *testing.T) {
-	c := &testConn{}
-	handled, err := respondGlobalDuplicateIfNeeded(c, true, true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !handled {
-		t.Fatalf("expected handled=true")
-	}
-	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeDuplicate {
-		t.Fatalf("expected duplicate code %d, got %v", RejectCodeDuplicate, got)
-	}
+func TestResolvePostChallengeCode(t *testing.T) {
+	tests := []struct {
+		name               string
+		initialCode        uint8
+		challengeCompleted bool
+		allLocalDup        bool
+		want               uint8
+	}{
+		// Add-to (code 11) path — never overridden by dup check.
+		{"add-to no challenge", AcceptCodeAddTo, false, false, AcceptCodeAddTo},
+		{"add-to challenge no dup", AcceptCodeAddTo, true, false, AcceptCodeAddTo},
+		{"add-to challenge all dup", AcceptCodeAddTo, true, true, AcceptCodeAddTo},
 
-	c2 := &testConn{}
-	handled, err = respondGlobalDuplicateIfNeeded(c2, true, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		// Continue (code 64) path — dup check yields code 10 when all dup.
+		{"continue no challenge", AcceptCodeContinue, false, false, AcceptCodeContinue},
+		{"continue challenge no dup", AcceptCodeContinue, true, false, AcceptCodeContinue},
+		{"continue challenge all dup", AcceptCodeContinue, true, true, RejectCodeDuplicate},
+
+		// Skip-data (code 65) path — dup check yields code 10 when all dup.
+		{"skip-data no challenge", AcceptCodeSkipData, false, false, AcceptCodeSkipData},
+		{"skip-data challenge no dup", AcceptCodeSkipData, true, false, AcceptCodeSkipData},
+		{"skip-data challenge all dup", AcceptCodeSkipData, true, true, RejectCodeDuplicate},
 	}
-	if handled {
-		t.Fatalf("expected handled=false")
-	}
-	if len(c2.Bytes()) != 0 {
-		t.Fatalf("expected no bytes written, got %v", c2.Bytes())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvePostChallengeCode(tt.initialCode, tt.challengeCompleted, tt.allLocalDup)
+			if got != tt.want {
+				t.Errorf("resolvePostChallengeCode(%d, %v, %v) = %d (%s), want %d (%s)",
+					tt.initialCode, tt.challengeCompleted, tt.allLocalDup,
+					got, responseCodeName(got), tt.want, responseCodeName(tt.want))
+			}
+		})
 	}
 }
