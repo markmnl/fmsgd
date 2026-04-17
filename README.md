@@ -63,26 +63,70 @@ An example systemd service to run fmsgd as a service on startup
 
 ASSUMES: 
 * Directory `/opt/fmsgd` has been created and contains built executable: `fmsgd`
-* Text file `/opt/fmsgd/env` exists containing environment variables
+* Text file `/opt/fmsgd/env` exists containing environment variables (example below)
 * User `fmsg` has been created and has
     - read and execute permissions to `/opt/fmsgd/`, e.g. with `chown -R fmsg:fmsg /opt/fmsgd` after `mkdir /opt/fmsgd`
     - write permissions to FMSG_DATA_DIR
+* Directory `/var/lib/fmsgd` has been created and owned by fmsg
 
 `/etc/systemd/system/fmsgd.service`
 
 ```
 [Unit]
 Description=fmsg Host
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-EnvironmentFile=/opt/fmsgd/env
-ExecStart=/opt/fmsgd/fmsgd "0.0.0.0"
+Type=simple
+
 User=fmsg
 Group=fmsg
 
+EnvironmentFile=/opt/fmsgd/env
+
+ExecStart=/opt/fmsgd/fmsgd 0.0.0.0
+WorkingDirectory=/opt/fmsgd
+
+Restart=on-failure
+RestartSec=3
+
+# --- Filesystem access ---
+ReadWritePaths=/opt/fmsgd
+ReadWritePaths=/var/lib/fmsgd
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+
 [Install]
 WantedBy=multi-user.target
+```
+
+```
+FMSG_DATA_DIR=/var/lib/fmsgd/
+FMSG_DOMAIN=example.com
+FMSG_ID_URL=http://127.0.0.1:8080
+
+
+FMSG_MAX_MSG_SIZE=10240
+FMSG_MAX_PAST_TIME_DELTA=604800
+FMSG_MAX_FUTURE_TIME_DELTA=300
+FMSG_MIN_DOWNLOAD_RATE=5000
+FMSG_MIN_UPLOAD_RATE=5000
+FMSG_READ_BUFFER_SIZE=1600
+
+PGHOST=127.0.0.1
+PGPORT=5432
+PGUSER=
+PGPASSWORD=
+PGDATABASE=fmsgd
 ```
 
 ```
