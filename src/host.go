@@ -1478,6 +1478,24 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	return rejectAccept(c, codes)
 }
 
+// resolvePostChallengeCode determines the initial response code to send after
+// the optional challenge (§10.4). Code 11 (accept add-to) is returned as-is
+// since it has no local recipients to duplicate-check. For the skip-data (65)
+// and continue (64) paths, a completed challenge with all-local-duplicate
+// produces code 10 (duplicate) instead.
+func resolvePostChallengeCode(initialCode uint8, challengeCompleted bool, allLocalDup bool) uint8 {
+	if initialCode == AcceptCodeAddTo {
+		return AcceptCodeAddTo
+	}
+	if challengeCompleted && allLocalDup {
+		return RejectCodeDuplicate
+	}
+	if initialCode == AcceptCodeSkipData {
+		return AcceptCodeSkipData
+	}
+	return AcceptCodeContinue
+}
+
 func abortConn(c net.Conn) {
 	if tcp, ok := c.(*net.TCPConn); ok {
 		tcp.SetLinger(0)
@@ -1514,9 +1532,26 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	// §10.4 Step 1: Add-to handling (only when add-to set and parent verified stored)
+	// §10.4: Determine initial response code after optional challenge.
+	// Code 11 (add-to, no local recipients) does not need a dup check.
+	// Codes 65 and 64 both require a dup check when challenge was completed.
+	allLocalDup := false
+	if header.ChallengeCompleted && header.InitialResponseCode != AcceptCodeAddTo {
+		addrs := localRecipients(header)
+		var err error
+		allLocalDup, err = allLocalRecipientsHaveMessageHash(header.ChallengeHash[:], addrs)
+		if err != nil {
+			log.Printf("ERROR: duplicate check failed for %s: %s", c.RemoteAddr().String(), err)
+			_ = sendCode(c, RejectCodeUndisclosed)
+			abortConn(c)
+			return
+		}
+	}
+
+	code := resolvePostChallengeCode(header.InitialResponseCode, header.ChallengeCompleted, allLocalDup)
 	skipData := false
-	switch header.InitialResponseCode {
+
+	switch code {
 	case AcceptCodeAddTo:
 		// No local add-to recipients; store header and respond code 11, close.
 		if err := storeMsgHeaderOnly(header); err != nil {
@@ -1533,8 +1568,13 @@ func handleConn(c net.Conn) {
 		log.Printf("INFO: additional recipients received (code 11) for pid %s", hex.EncodeToString(header.Pid))
 		c.Close()
 		return
+	case RejectCodeDuplicate:
+		if err := sendCode(c, RejectCodeDuplicate); err != nil {
+			log.Printf("ERROR: failed sending code 10 to %s: %s", c.RemoteAddr().String(), err)
+		}
+		c.Close()
+		return
 	case AcceptCodeSkipData:
-		// Local add-to recipients exist; parent stored; skip data.
 		if err := sendCode(c, AcceptCodeSkipData); err != nil {
 			log.Printf("ERROR: failed sending code 65 to %s: %s", c.RemoteAddr().String(), err)
 			abortConn(c)
@@ -1543,26 +1583,6 @@ func handleConn(c net.Conn) {
 		skipData = true
 		log.Printf("INFO: sent code 65 (skip data) to %s", c.RemoteAddr().String())
 	default:
-		// §10.4 Step 2: Duplicate check (before sending continue)
-		if header.ChallengeCompleted {
-			addrs := localRecipients(header)
-			allDup, err := allLocalRecipientsHaveMessageHash(header.ChallengeHash[:], addrs)
-			if err != nil {
-				log.Printf("ERROR: duplicate check failed for %s: %s", c.RemoteAddr().String(), err)
-				_ = sendCode(c, RejectCodeUndisclosed)
-				abortConn(c)
-				return
-			}
-			if allDup {
-				if err := sendCode(c, RejectCodeDuplicate); err != nil {
-					log.Printf("ERROR: failed sending code 10 to %s: %s", c.RemoteAddr().String(), err)
-				}
-				c.Close()
-				return
-			}
-		}
-
-		// §10.4 Step 3: Continue
 		if err := sendCode(c, AcceptCodeContinue); err != nil {
 			log.Printf("ERROR: failed sending code 64 to %s: %s", c.RemoteAddr().String(), err)
 			abortConn(c)

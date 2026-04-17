@@ -510,3 +510,38 @@ func TestReadAttachmentHeadersRejectsReservedAttachmentBits(t *testing.T) {
 		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
 	}
 }
+
+func TestResolvePostChallengeCode(t *testing.T) {
+	tests := []struct {
+		name               string
+		initialCode        uint8
+		challengeCompleted bool
+		allLocalDup        bool
+		want               uint8
+	}{
+		// Add-to (code 11) path — never overridden by dup check.
+		{"add-to no challenge", AcceptCodeAddTo, false, false, AcceptCodeAddTo},
+		{"add-to challenge no dup", AcceptCodeAddTo, true, false, AcceptCodeAddTo},
+		{"add-to challenge all dup", AcceptCodeAddTo, true, true, AcceptCodeAddTo},
+
+		// Continue (code 64) path — dup check yields code 10 when all dup.
+		{"continue no challenge", AcceptCodeContinue, false, false, AcceptCodeContinue},
+		{"continue challenge no dup", AcceptCodeContinue, true, false, AcceptCodeContinue},
+		{"continue challenge all dup", AcceptCodeContinue, true, true, RejectCodeDuplicate},
+
+		// Skip-data (code 65) path — dup check yields code 10 when all dup.
+		{"skip-data no challenge", AcceptCodeSkipData, false, false, AcceptCodeSkipData},
+		{"skip-data challenge no dup", AcceptCodeSkipData, true, false, AcceptCodeSkipData},
+		{"skip-data challenge all dup", AcceptCodeSkipData, true, true, RejectCodeDuplicate},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvePostChallengeCode(tt.initialCode, tt.challengeCompleted, tt.allLocalDup)
+			if got != tt.want {
+				t.Errorf("resolvePostChallengeCode(%d, %v, %v) = %d (%s), want %d (%s)",
+					tt.initialCode, tt.challengeCompleted, tt.allLocalDup,
+					got, responseCodeName(got), tt.want, responseCodeName(tt.want))
+			}
+		})
+	}
+}
