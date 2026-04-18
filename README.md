@@ -69,7 +69,7 @@ ASSUMES:
     - write permissions to FMSG_DATA_DIR
     - read permissions to /var/lib/fmsgd/tls
 * Directory `/var/lib/fmsgd` has been created and owned by fmsg
-* 
+* Valid TLS certs (see: [FMSG-001 TCP+TLS Transport and Binding Standard](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-001-transport-and-binding.md#fmsg-001-tcptls-transport-and-binding-standard)) at paths /var/lib/fmsgd/tls/fullchain.pem and /var/lib/fmsgd/tls/privkey.pem
 
 
 `/etc/systemd/system/fmsgd.service`
