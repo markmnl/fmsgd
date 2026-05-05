@@ -884,7 +884,14 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 	}
 
 	totalSize := h.Size
-	totalExpandedSize := h.ExpandedSize
+	// When message is compressed, expanded size comes from the header field.
+	// When uncompressed, the wire size IS the expanded size.
+	var totalExpandedSize uint32
+	if h.Flags&FlagDeflate != 0 {
+		totalExpandedSize = h.ExpandedSize
+	} else {
+		totalExpandedSize = h.Size
+	}
 	filenameSeen := make(map[string]bool)
 	for i := uint8(0); i < attachCount; i++ {
 		attFlags, err := r.ReadByte()
@@ -932,6 +939,9 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 				return err
 			}
 			totalExpandedSize += attExpandedSize
+		} else {
+			// uncompressed: expanded size equals wire size
+			totalExpandedSize += attSize
 		}
 
 		h.Attachments = append(h.Attachments, FMsgAttachmentHeader{
