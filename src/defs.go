@@ -237,7 +237,7 @@ func hashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool, 
 		if err != nil {
 			return err
 		}
-		if expandedSize > 0 && uint32(written) != expandedSize {
+		if uint32(written) != expandedSize {
 			return fmt.Errorf("decompressed size %d does not match declared expanded size %d", written, expandedSize)
 		}
 		return nil
