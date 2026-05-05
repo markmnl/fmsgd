@@ -545,3 +545,78 @@ func TestResolvePostChallengeCode(t *testing.T) {
 		})
 	}
 }
+
+func TestReadAttachmentHeadersReadsExpandedSizeForCompressedAttachment(t *testing.T) {
+	origMax := MaxMessageSize
+	origExpanded := MaxExpandedSize
+	MaxMessageSize = 1024
+	MaxExpandedSize = 1024
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+		MaxExpandedSize = origExpanded
+	})
+
+	h := &FMsgHeader{Size: 0}
+	b := []byte{1}                      // 1 attachment
+	b = append(b, 1<<1)                 // attachment flags: zlib-deflate (bit 1)
+	b = append(b, encodeUInt8String(t, "text/plain")...)
+	b = append(b, encodeUInt8String(t, "file.txt")...)
+
+	var wireSize [4]byte
+	binary.LittleEndian.PutUint32(wireSize[:], 50)
+	b = append(b, wireSize[:]...)
+
+	var expandedSize [4]byte
+	binary.LittleEndian.PutUint32(expandedSize[:], 200)
+	b = append(b, expandedSize[:]...)
+
+	err := readAttachmentHeaders(nil, bufio.NewReader(bytes.NewReader(b)), h)
+	if err != nil {
+		t.Fatalf("readAttachmentHeaders returned error: %v", err)
+	}
+	if len(h.Attachments) != 1 {
+		t.Fatalf("len(h.Attachments) = %d, want 1", len(h.Attachments))
+	}
+	att := h.Attachments[0]
+	if att.Size != 50 {
+		t.Fatalf("att.Size = %d, want 50", att.Size)
+	}
+	if att.ExpandedSize != 200 {
+		t.Fatalf("att.ExpandedSize = %d, want 200", att.ExpandedSize)
+	}
+}
+
+func TestReadAttachmentHeadersRejectsExpandedSizeExceedsMax(t *testing.T) {
+	origMax := MaxMessageSize
+	origExpanded := MaxExpandedSize
+	MaxMessageSize = 1024
+	MaxExpandedSize = 100
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+		MaxExpandedSize = origExpanded
+	})
+
+	h := &FMsgHeader{Size: 0}
+	c := &testConn{}
+	b := []byte{1}      // 1 attachment
+	b = append(b, 1<<1) // attachment flags: zlib-deflate (bit 1)
+	b = append(b, encodeUInt8String(t, "text/plain")...)
+	b = append(b, encodeUInt8String(t, "file.txt")...)
+
+	var wireSize [4]byte
+	binary.LittleEndian.PutUint32(wireSize[:], 50)
+	b = append(b, wireSize[:]...)
+
+	// expanded size exceeds MaxExpandedSize=100
+	var expandedSize [4]byte
+	binary.LittleEndian.PutUint32(expandedSize[:], 200)
+	b = append(b, expandedSize[:]...)
+
+	err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatalf("expected error when expanded size exceeds max")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeTooBig {
+		t.Fatalf("expected reject code %d, got %v", RejectCodeTooBig, got)
+	}
+}

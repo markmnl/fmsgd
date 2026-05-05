@@ -604,16 +604,17 @@ func TestGetMessageHashUsesDecompressedPayloads(t *testing.T) {
 	}
 
 	h := &FMsgHeader{
-		Version:   1,
-		Flags:     FlagDeflate,
-		From:      FMsgAddress{User: "alice", Domain: "a.com"},
-		To:        []FMsgAddress{{User: "bob", Domain: "b.com"}},
-		Timestamp: 1700000000,
-		Topic:     "t",
-		Type:      "text/plain",
-		Size:      uint32(len(msgWire)),
+		Version:      1,
+		Flags:        FlagDeflate,
+		From:         FMsgAddress{User: "alice", Domain: "a.com"},
+		To:           []FMsgAddress{{User: "bob", Domain: "b.com"}},
+		Timestamp:    1700000000,
+		Topic:        "t",
+		Type:         "text/plain",
+		Size:         uint32(len(msgWire)),
+		ExpandedSize: uint32(len(msgPlain)),
 		Attachments: []FMsgAttachmentHeader{
-			{Flags: 1 << 1, Type: "application/octet-stream", Filename: "a.bin", Size: uint32(len(attWire)), Filepath: attPath},
+			{Flags: 1 << 1, Type: "application/octet-stream", Filename: "a.bin", Size: uint32(len(attWire)), ExpandedSize: uint32(len(attPlain)), Filepath: attPath},
 		},
 		Filepath: msgPath,
 	}
@@ -637,5 +638,217 @@ func TestGetMessageHashUsesDecompressedPayloads(t *testing.T) {
 
 	if !bytes.Equal(got, want) {
 		t.Fatalf("message hash mismatch: got %x want %x", got, want)
+	}
+}
+
+func TestEncodeExpandedSizePresentWhenDeflateSet(t *testing.T) {
+	h := &FMsgHeader{
+		Version:      1,
+		Flags:        FlagDeflate,
+		From:         FMsgAddress{User: "a", Domain: "b.com"},
+		To:           []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp:    0,
+		Topic:        "",
+		Type:         "text/plain",
+		Size:         50,
+		ExpandedSize: 200,
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+
+	// skip from
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	// skip to count + to[0]
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	// skip timestamp
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	// skip topic
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+	// skip type
+	typeLen, _ := r.ReadByte()
+	r.Read(make([]byte, typeLen))
+
+	// size
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	if size != 50 {
+		t.Fatalf("size = %d, want 50", size)
+	}
+
+	// expanded size must be present because FlagDeflate is set
+	var expandedSize uint32
+	if err := binary.Read(r, binary.LittleEndian, &expandedSize); err != nil {
+		t.Fatalf("reading expanded size: %v", err)
+	}
+	if expandedSize != 200 {
+		t.Fatalf("expanded size = %d, want 200", expandedSize)
+	}
+
+	// attachment count
+	attachCount, _ := r.ReadByte()
+	if attachCount != 0 {
+		t.Fatalf("attach count = %d, want 0", attachCount)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes", r.Len())
+	}
+}
+
+func TestEncodeNoExpandedSizeWhenDeflateUnset(t *testing.T) {
+	h := &FMsgHeader{
+		Version:      1,
+		Flags:        0,
+		From:         FMsgAddress{User: "a", Domain: "b.com"},
+		To:           []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp:    0,
+		Topic:        "",
+		Type:         "text/plain",
+		Size:         100,
+		ExpandedSize: 999, // must NOT appear on wire
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+	typeLen, _ := r.ReadByte()
+	r.Read(make([]byte, typeLen))
+
+	var size uint32
+	binary.Read(r, binary.LittleEndian, &size)
+	if size != 100 {
+		t.Fatalf("size = %d, want 100", size)
+	}
+
+	// No expanded size field; next byte should be attachment count = 0
+	attachCount, _ := r.ReadByte()
+	if attachCount != 0 {
+		t.Fatalf("attach count = %d, want 0", attachCount)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes (expanded size should not be present when deflate unset)", r.Len())
+	}
+}
+
+func TestEncodeAttachmentExpandedSizePresentWhenDeflateSet(t *testing.T) {
+	h := &FMsgHeader{
+		Version:   1,
+		Flags:     0,
+		From:      FMsgAddress{User: "a", Domain: "b.com"},
+		To:        []FMsgAddress{{User: "c", Domain: "d.com"}},
+		Timestamp: 0,
+		Topic:     "",
+		Type:      "text/plain",
+		Size:      0,
+		Attachments: []FMsgAttachmentHeader{
+			// attachment with zlib-deflate flag (bit 1 = 0b00000010)
+			{Flags: 1 << 1, Type: "text/plain", Filename: "doc.txt", Size: 60, ExpandedSize: 300},
+		},
+	}
+	b := h.Encode()
+	r := bytes.NewReader(b)
+
+	r.ReadByte() // version
+	r.ReadByte() // flags
+	fLen, _ := r.ReadByte()
+	r.Read(make([]byte, fLen))
+	r.ReadByte()
+	tLen, _ := r.ReadByte()
+	r.Read(make([]byte, tLen))
+	var ts float64
+	binary.Read(r, binary.LittleEndian, &ts)
+	topicLen, _ := r.ReadByte()
+	r.Read(make([]byte, topicLen))
+	typeLen, _ := r.ReadByte()
+	r.Read(make([]byte, typeLen))
+	var msgSize uint32
+	binary.Read(r, binary.LittleEndian, &msgSize)
+
+	// attachment count
+	attachCount, _ := r.ReadByte()
+	if attachCount != 1 {
+		t.Fatalf("attach count = %d, want 1", attachCount)
+	}
+
+	// attachment flags
+	attFlags, _ := r.ReadByte()
+	if attFlags != 1<<1 {
+		t.Fatalf("att flags = %d, want %d", attFlags, 1<<1)
+	}
+	// type (length-prefixed)
+	attTypeLen, _ := r.ReadByte()
+	r.Read(make([]byte, attTypeLen))
+	// filename
+	attFnLen, _ := r.ReadByte()
+	r.Read(make([]byte, attFnLen))
+	// wire size
+	var attSize uint32
+	binary.Read(r, binary.LittleEndian, &attSize)
+	if attSize != 60 {
+		t.Fatalf("att size = %d, want 60", attSize)
+	}
+	// expanded size must be present
+	var attExpandedSize uint32
+	if err := binary.Read(r, binary.LittleEndian, &attExpandedSize); err != nil {
+		t.Fatalf("reading att expanded size: %v", err)
+	}
+	if attExpandedSize != 300 {
+		t.Fatalf("att expanded size = %d, want 300", attExpandedSize)
+	}
+
+	if r.Len() != 0 {
+		t.Fatalf("unexpected %d trailing bytes", r.Len())
+	}
+}
+
+func TestHashPayloadRejectsExpandedSizeMismatch(t *testing.T) {
+	compress := func(data []byte) []byte {
+		var b bytes.Buffer
+		w := zlib.NewWriter(&b)
+		w.Write(data)
+		w.Close()
+		return b.Bytes()
+	}
+
+	plain := []byte("hello world this is test data")
+	wire := compress(plain)
+
+	tmpDir := t.TempDir()
+	p := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(p, wire, 0600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	// Correct expanded size should succeed
+	var dst bytes.Buffer
+	if err := hashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))); err != nil {
+		t.Fatalf("hashPayload with correct expanded size: %v", err)
+	}
+
+	// Wrong expanded size should fail
+	dst.Reset()
+	err := hashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))+1)
+	if err == nil {
+		t.Fatal("hashPayload with wrong expanded size: expected error, got nil")
 	}
 }

@@ -18,11 +18,12 @@ type FMsgAddress struct {
 }
 
 type FMsgAttachmentHeader struct {
-	Flags    uint8
-	TypeID   uint8
-	Type     string
-	Filename string
-	Size     uint32
+	Flags        uint8
+	TypeID       uint8
+	Type         string
+	Filename     string
+	Size         uint32
+	ExpandedSize uint32
 
 	Filepath string
 }
@@ -41,8 +42,9 @@ type FMsgHeader struct {
 	Type      string
 
 	// Size in bytes of entire message
-	Size        uint32
-	Attachments []FMsgAttachmentHeader
+	Size         uint32
+	ExpandedSize uint32 // Decompressed size; present on wire iff FlagDeflate set
+	Attachments  []FMsgAttachmentHeader
 
 	HeaderHash          []byte
 	ChallengeHash       [32]byte
@@ -117,6 +119,12 @@ func (h *FMsgHeader) Encode() []byte {
 	if err := binary.Write(&b, binary.LittleEndian, h.Size); err != nil {
 		panic(err)
 	}
+	// expanded size (uint32 LE) — present iff zlib-deflate flag set
+	if h.Flags&FlagDeflate != 0 {
+		if err := binary.Write(&b, binary.LittleEndian, h.ExpandedSize); err != nil {
+			panic(err)
+		}
+	}
 	// attachment headers
 	b.WriteByte(byte(len(h.Attachments)))
 	for _, att := range h.Attachments {
@@ -137,6 +145,12 @@ func (h *FMsgHeader) Encode() []byte {
 		b.WriteString(att.Filename)
 		if err := binary.Write(&b, binary.LittleEndian, att.Size); err != nil {
 			panic(err)
+		}
+		// attachment expanded size — present iff attachment zlib-deflate flag set
+		if att.Flags&(1<<1) != 0 {
+			if err := binary.Write(&b, binary.LittleEndian, att.ExpandedSize); err != nil {
+				panic(err)
+			}
 		}
 	}
 	return b.Bytes()
@@ -187,7 +201,7 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 			return nil, err
 		}
 
-		if err := hashPayload(hash, h.Filepath, int64(h.Size), h.Flags&FlagDeflate != 0); err != nil {
+		if err := hashPayload(hash, h.Filepath, int64(h.Size), h.Flags&FlagDeflate != 0, h.ExpandedSize); err != nil {
 			return nil, err
 		}
 
@@ -195,7 +209,7 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 		// the message body, bounded by attachment header sizes)
 		for _, att := range h.Attachments {
 			compressed := att.Flags&(1<<1) != 0
-			if err := hashPayload(hash, att.Filepath, int64(att.Size), compressed); err != nil {
+			if err := hashPayload(hash, att.Filepath, int64(att.Size), compressed, att.ExpandedSize); err != nil {
 				return nil, fmt.Errorf("hash attachment %s: %w", att.Filename, err)
 			}
 		}
@@ -205,7 +219,7 @@ func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
 	return h.messageHash, nil
 }
 
-func hashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool) error {
+func hashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool, expandedSize uint32) error {
 	f, err := os.Open(filepath)
 	if err != nil {
 		return err
@@ -218,10 +232,13 @@ func hashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool) 
 		if err != nil {
 			return err
 		}
-		_, err = io.Copy(dst, zr)
+		written, err := io.Copy(dst, zr)
 		_ = zr.Close()
 		if err != nil {
 			return err
+		}
+		if expandedSize > 0 && uint32(written) != expandedSize {
+			return fmt.Errorf("decompressed size %d does not match declared expanded size %d", written, expandedSize)
 		}
 		return nil
 	}
