@@ -160,6 +160,7 @@ var MinDownloadRate float64 = 5000
 var MinUploadRate float64 = 5000
 var ReadBufferSize = 1600
 var MaxMessageSize = uint32(1024 * 10)
+var MaxExpandedSize = uint32(1024 * 10)
 var SkipAuthorisedIPs = false
 var TLSInsecureSkipVerify = false
 var DataDir = "got on startup"
@@ -210,6 +211,7 @@ func loadEnvConfig() {
 	MinUploadRate = env.GetFloatDefault("FMSG_MIN_UPLOAD_RATE", 5000)
 	ReadBufferSize = env.GetIntDefault("FMSG_READ_BUFFER_SIZE", 1600)
 	MaxMessageSize = uint32(env.GetIntDefault("FMSG_MAX_MSG_SIZE", 1024*10))
+	MaxExpandedSize = uint32(env.GetIntDefault("FMSG_MAX_EXPANDED_SIZE", int(MaxMessageSize)))
 	SkipAuthorisedIPs = os.Getenv("FMSG_SKIP_AUTHORISED_IPS") == "true"
 	TLSInsecureSkipVerify = os.Getenv("FMSG_TLS_INSECURE_SKIP_VERIFY") == "true"
 }
@@ -882,6 +884,14 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 	}
 
 	totalSize := h.Size
+	// When message is compressed, expanded size comes from the header field.
+	// When uncompressed, the wire size IS the expanded size.
+	var totalExpandedSize uint32
+	if h.Flags&FlagDeflate != 0 {
+		totalExpandedSize = h.ExpandedSize
+	} else {
+		totalExpandedSize = h.Size
+	}
 	filenameSeen := make(map[string]bool)
 	for i := uint8(0); i < attachCount; i++ {
 		attFlags, err := r.ReadByte()
@@ -922,12 +932,25 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 			return err
 		}
 
+		// read attachment expanded size — present iff attachment zlib-deflate flag set (§5)
+		var attExpandedSize uint32
+		if attFlags&(1<<1) != 0 {
+			if err := binary.Read(r, binary.LittleEndian, &attExpandedSize); err != nil {
+				return err
+			}
+			totalExpandedSize += attExpandedSize
+		} else {
+			// uncompressed: expanded size equals wire size
+			totalExpandedSize += attSize
+		}
+
 		h.Attachments = append(h.Attachments, FMsgAttachmentHeader{
-			Flags:    attFlags,
-			TypeID:   attTypeID,
-			Type:     attType,
-			Filename: filename,
-			Size:     attSize,
+			Flags:        attFlags,
+			TypeID:       attTypeID,
+			Type:         attType,
+			Filename:     filename,
+			Size:         attSize,
+			ExpandedSize: attExpandedSize,
 		})
 		totalSize += attSize
 	}
@@ -937,6 +960,13 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 			return err
 		}
 		return fmt.Errorf("total message size %d exceeds max %d", totalSize, MaxMessageSize)
+	}
+
+	if totalExpandedSize > MaxExpandedSize {
+		if err := sendCode(c, RejectCodeTooBig); err != nil {
+			return err
+		}
+		return fmt.Errorf("total expanded size %d exceeds MAX_EXPANDED_SIZE %d", totalExpandedSize, MaxExpandedSize)
 	}
 
 	return nil
@@ -1017,6 +1047,18 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	// read message size
 	if err := binary.Read(r, binary.LittleEndian, &h.Size); err != nil {
 		return h, r, err
+	}
+	// read expanded size — present iff zlib-deflate flag is set (§2 field 12)
+	if h.Flags&FlagDeflate != 0 {
+		if err := binary.Read(r, binary.LittleEndian, &h.ExpandedSize); err != nil {
+			return h, r, err
+		}
+		if h.ExpandedSize > MaxExpandedSize {
+			if err := sendCode(c, RejectCodeTooBig); err != nil {
+				return h, r, err
+			}
+			return h, r, fmt.Errorf("expanded size %d exceeds MAX_EXPANDED_SIZE %d", h.ExpandedSize, MaxExpandedSize)
+		}
 	}
 	// Size check is deferred until attachment headers are parsed (see below)
 

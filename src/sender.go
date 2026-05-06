@@ -321,6 +321,7 @@ func deliverMessage(target pendingTarget) {
 			log.Printf("INFO: sender: compressed msg %d data: %d -> %d bytes", target.MsgID, h.Size, cs)
 			deflateCleanup = append(deflateCleanup, dp)
 			h.Filepath = dp
+			h.ExpandedSize = h.Size
 			h.Size = cs
 			h.Flags |= FlagDeflate
 		}
@@ -335,6 +336,7 @@ func deliverMessage(target pendingTarget) {
 				log.Printf("INFO: sender: compressed msg %d attachment %s: %d -> %d bytes", target.MsgID, att.Filename, att.Size, cs)
 				deflateCleanup = append(deflateCleanup, dp)
 				att.Filepath = dp
+				att.ExpandedSize = att.Size
 				att.Size = cs
 				att.Flags |= 1 << 1
 			}

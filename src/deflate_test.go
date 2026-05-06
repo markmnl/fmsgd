@@ -337,14 +337,15 @@ func TestGetMessageHash_WithDeflate(t *testing.T) {
 
 	// Build header with deflate flag pointing at compressed file
 	h := &FMsgHeader{
-		Version:  1,
-		Flags:    FlagDeflate,
-		From:     FMsgAddress{User: "alice", Domain: "example.com"},
-		To:       []FMsgAddress{{User: "bob", Domain: "other.com"}},
-		Topic:    "test",
-		Type:     "text/plain;charset=UTF-8",
-		Size:     cSize,
-		Filepath: dstPath,
+		Version:      1,
+		Flags:        FlagDeflate,
+		From:         FMsgAddress{User: "alice", Domain: "example.com"},
+		To:           []FMsgAddress{{User: "bob", Domain: "other.com"}},
+		Topic:        "test",
+		Type:         "text/plain;charset=UTF-8",
+		Size:         cSize,
+		ExpandedSize: uint32(len(original)),
+		Filepath:     dstPath,
 	}
 
 	msgHash, err := h.GetMessageHash()
@@ -432,6 +433,7 @@ func TestGetMessageHash_DeflateChangesHash(t *testing.T) {
 	deflated := base
 	deflated.Flags = FlagDeflate
 	deflated.Size = cSize
+	deflated.ExpandedSize = uint32(len(original))
 	deflated.Filepath = dstPath
 	hashDeflated, err := deflated.GetMessageHash()
 	if err != nil {
@@ -472,11 +474,12 @@ func TestGetMessageHash_AttachmentDeflate(t *testing.T) {
 		Filepath: msgPath,
 		Attachments: []FMsgAttachmentHeader{
 			{
-				Flags:    1 << 1, // attachment deflate bit
-				Type:     "text/csv",
-				Filename: "data.csv",
-				Size:     attCSize,
-				Filepath: attDstPath,
+				Flags:        1 << 1, // attachment deflate bit
+				Type:         "text/csv",
+				Filename:     "data.csv",
+				Size:         attCSize,
+				ExpandedSize: uint32(len(attOriginal)),
+				Filepath:     attDstPath,
 			},
 		},
 	}
