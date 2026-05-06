@@ -31,6 +31,7 @@ create table if not exists msg_to (
 	addr			varchar(255)		not null,
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
+    time_read       double precision,   -- time recipient read the message; null if unread
     response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
@@ -43,6 +44,7 @@ create table if not exists msg_add_to (
 	addr			varchar(255)		not null,
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
+    time_read       double precision,   -- time recipient read the message; null if unread
     response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
