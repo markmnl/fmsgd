@@ -355,6 +355,10 @@ func deliverMessage(target pendingTarget) {
 		log.Printf("ERROR: sender: storing sha256 for msg %d: %s", target.MsgID, err)
 		return
 	}
+	if err := resolvePendingChildLinks(txParentLinkStore{tx: tx}, target.MsgID, msgHash); err != nil {
+		log.Printf("ERROR: sender: resolving child pids for msg %d: %s", target.MsgID, err)
+		return
+	}
 
 	// Compute header hash now; registerOutgoing with Host B's IP happens after
 	// the connection is established (IP needed for challenge validation §10.5).

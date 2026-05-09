@@ -102,6 +102,73 @@ func hasAddrReceivedMsgHash(hash []byte, addr *FMsgAddress) (bool, error) {
 	return exists, nil
 }
 
+type parentLinkStore interface {
+	lookupParentID(parentHash []byte) (int64, error)
+	setParentID(msgID int64, parentID int64) error
+	setPendingChildrenParentID(parentID int64, parentHash []byte) error
+}
+
+type txParentLinkStore struct {
+	tx *sql.Tx
+}
+
+func (s txParentLinkStore) lookupParentID(parentHash []byte) (int64, error) {
+	var id int64
+	err := s.tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", parentHash).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}
+
+func (s txParentLinkStore) setParentID(msgID int64, parentID int64) error {
+	_, err := s.tx.Exec("UPDATE msg SET pid = $1 WHERE id = $2", parentID, msgID)
+	return err
+}
+
+func (s txParentLinkStore) setPendingChildrenParentID(parentID int64, parentHash []byte) error {
+	_, err := s.tx.Exec("UPDATE msg SET pid = $1 WHERE psha256 = $2 AND pid IS NULL", parentID, parentHash)
+	return err
+}
+
+func resolveStoredParent(store parentLinkStore, msgID int64, parentHash []byte, requireParent bool) error {
+	if len(parentHash) == 0 {
+		return nil
+	}
+
+	parentID, err := store.lookupParentID(parentHash)
+	if err != nil {
+		return err
+	}
+	if parentID == 0 {
+		if requireParent {
+			return fmt.Errorf("parent message not found for psha256 %x", parentHash)
+		}
+		return nil
+	}
+
+	return store.setParentID(msgID, parentID)
+}
+
+func resolvePendingChildLinks(store parentLinkStore, parentID int64, parentHash []byte) error {
+	if len(parentHash) == 0 {
+		return nil
+	}
+	return store.setPendingChildrenParentID(parentID, parentHash)
+}
+
+func resolveMsgParentLinks(tx *sql.Tx, msgID int64, msgHash []byte, parentHash []byte, requireParent bool) error {
+	store := txParentLinkStore{tx: tx}
+	if err := resolveStoredParent(store, msgID, parentHash, requireParent); err != nil {
+		return err
+	}
+	return resolvePendingChildLinks(store, msgID, msgHash)
+}
+
+func requiresStoredParent(msg *FMsgHeader) bool {
+	return len(msg.Pid) > 0 && msg.Flags&FlagHasAddTo == 0
+}
+
 // getMsgByID loads a message and all its recipients from the database by msg ID.
 // Returns the full FMsgHeader or nil if the message doesn't exist.
 func getMsgByID(msgID int64) (*FMsgHeader, error) {
@@ -242,18 +309,8 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 		}
 	}
 
-	// resolve pid from psha256 (parent message hash)
-	if len(msg.Pid) > 0 {
-		var parentID sql.NullInt64
-		err = tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", msg.Pid).Scan(&parentID)
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		if parentID.Valid {
-			if _, err = tx.Exec("UPDATE msg SET pid = $1 WHERE id = $2", parentID.Int64, msgID); err != nil {
-				return err
-			}
-		}
+	if err := resolveMsgParentLinks(tx, msgID, msgHash, msg.Pid, requiresStoredParent(msg)); err != nil {
+		return err
 	}
 
 	return tx.Commit()
@@ -361,18 +418,8 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 		}
 	}
 
-	// resolve pid from psha256
-	if len(msg.Pid) > 0 {
-		var parentID sql.NullInt64
-		err = tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", msg.Pid).Scan(&parentID)
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		if parentID.Valid {
-			if _, err = tx.Exec("UPDATE msg SET pid = $1 WHERE id = $2", parentID.Int64, msgID); err != nil {
-				return err
-			}
-		}
+	if err := resolveMsgParentLinks(tx, msgID, msgHash, msg.Pid, requiresStoredParent(msg)); err != nil {
+		return err
 	}
 
 	return tx.Commit()
