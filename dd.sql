@@ -95,10 +95,6 @@ create trigger trg_msg_resolve_pid_after_hash
     after insert or update of sha256 on msg
     for each row execute function resolve_msg_pid_after_hash();
 
-update msg child set pid = parent.id
-from msg parent
-where child.psha256 = parent.sha256 and child.pid is null;
-
 -- notify when a new msg_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
 create or replace function notify_msg_to_insert() returns trigger as $$
