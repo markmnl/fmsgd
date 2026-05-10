@@ -22,6 +22,16 @@ var RetryMaxAge float64 = 86400
 var PollInterval = 10
 var MaxConcurrentSend = 1024
 
+// localResponseCodeNoResponse is stored only in the database; it is not an fmsg protocol response code.
+const localResponseCodeNoResponse = -1
+
+var retryableResponseCodes = []int16{
+	int16(localResponseCodeNoResponse),
+	int16(RejectCodeUndisclosed),
+	int16(RejectCodeInsufficentResources),
+	int16(RejectCodeUserFull),
+}
+
 func loadSenderEnvConfig() {
 	RetryInterval = env.GetFloatDefault("FMSG_RETRY_INTERVAL", 20)
 	RetryMaxAge = env.GetFloatDefault("FMSG_RETRY_MAX_AGE", 86400)
@@ -54,7 +64,7 @@ func findPendingTargets() ([]pendingTarget, error) {
 		INNER JOIN msg m ON m.id = mt.msg_id
 		WHERE mt.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5, 101))
+		  AND (mt.response_code IS NULL OR mt.response_code = ANY($4))
 		  AND (mt.time_last_attempt IS NULL OR ($1 - mt.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(mt.attempt_count - 1, 0)::float), $3))
 		  AND ($1 - m.time_sent) < $3
 		UNION ALL
@@ -63,10 +73,10 @@ func findPendingTargets() ([]pendingTarget, error) {
 		INNER JOIN msg m ON m.id = mat.msg_id
 		WHERE mat.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5, 101))
+		  AND (mat.response_code IS NULL OR mat.response_code = ANY($4))
 		  AND (mat.time_last_attempt IS NULL OR ($1 - mat.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $3))
 		  AND ($1 - m.time_sent) < $3
-	`, now, RetryInterval, RetryMaxAge)
+	`, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +179,12 @@ func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
 	}
 }
 
+func recordRetryableFailure(tx *sql.Tx, committed *bool, lockedAddrs, lockedAddToAddrs []string, msgID int64) {
+	now := timeutil.TimestampNow().Float64()
+	updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, msgID, now, localResponseCodeNoResponse, false)
+	commitOrLog(tx, committed, msgID)
+}
+
 // deliverMessage handles delivery of a single message to a single remote domain.
 //
 // It manages its own database transaction with the following lifecycle:
@@ -177,7 +193,7 @@ func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
 //   - Sends the complete original message to the remote host.
 //   - On success: updates time_delivered + response_code, commits.
 //   - On rejection (got response code): updates response_code + time_last_attempt, commits.
-//   - On error (no response): logs error, rolls back — delivery retried in future.
+//   - On early delivery error: records a retryable failure, commits, and backs off.
 func deliverMessage(target pendingTarget) {
 	if strings.EqualFold(target.Domain, Domain) {
 		// local domain — mark as delivered rather than sending remotely
@@ -228,11 +244,11 @@ func deliverMessage(target pendingTarget) {
 		WHERE mt.msg_id = $1
 		  AND mt.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mt.response_code IS NULL OR mt.response_code IN (3, 5, 101))
+		  AND (mt.response_code IS NULL OR mt.response_code = ANY($5))
 		  AND (mt.time_last_attempt IS NULL OR ($2 - mt.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mt.attempt_count - 1, 0)::float), $4))
 		  AND ($2 - m.time_sent) < $4
 		FOR UPDATE OF mt SKIP LOCKED
-	`, target.MsgID, now, RetryInterval, RetryMaxAge)
+	`, target.MsgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
 	if err != nil {
 		log.Printf("ERROR: sender: lock rows for msg %d: %s", target.MsgID, err)
 		return
@@ -265,11 +281,11 @@ func deliverMessage(target pendingTarget) {
 		WHERE mat.msg_id = $1
 		  AND mat.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
-		  AND (mat.response_code IS NULL OR mat.response_code IN (3, 5, 101))
+		  AND (mat.response_code IS NULL OR mat.response_code = ANY($5))
 		  AND (mat.time_last_attempt IS NULL OR ($2 - mat.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $4))
 		  AND ($2 - m.time_sent) < $4
 		FOR UPDATE OF mat SKIP LOCKED
-	`, target.MsgID, now, RetryInterval, RetryMaxAge)
+	`, target.MsgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
 	if err != nil {
 		log.Printf("ERROR: sender: lock add-to rows for msg %d: %s", target.MsgID, err)
 		return
@@ -297,6 +313,13 @@ func deliverMessage(target pendingTarget) {
 	if len(lockedAddrs) == 0 && len(lockedAddToAddrs) == 0 {
 		return // already locked by another sender or no longer eligible
 	}
+
+	deferRetry := true
+	defer func() {
+		if deferRetry && !committed {
+			recordRetryableFailure(tx, &committed, lockedAddrs, lockedAddToAddrs, target.MsgID)
+		}
+	}()
 
 	// Load the full message from msg table
 	h, err := loadMsg(tx, target.MsgID)
@@ -353,6 +376,10 @@ func deliverMessage(target pendingTarget) {
 	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`,
 		msgHash, target.MsgID); err != nil {
 		log.Printf("ERROR: sender: storing sha256 for msg %d: %s", target.MsgID, err)
+		return
+	}
+	if err := resolvePendingChildLinks(txParentLinkStore{tx: tx}, target.MsgID, msgHash); err != nil {
+		log.Printf("ERROR: sender: resolving child pids for msg %d: %s", target.MsgID, err)
 		return
 	}
 
@@ -467,6 +494,7 @@ func deliverMessage(target pendingTarget) {
 		}
 		log.Printf("INFO: sender: msg %d add-to accepted by %s (code 11)", target.MsgID, target.Domain)
 		updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), true)
+		deferRetry = false
 		commitOrLog(tx, &committed, target.MsgID)
 		return
 	default:
@@ -475,6 +503,7 @@ func deliverMessage(target pendingTarget) {
 			log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 				target.MsgID, target.Domain, responseCodeName(initCode[0]), initCode[0])
 			updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), false)
+			deferRetry = false
 			commitOrLog(tx, &committed, target.MsgID)
 		} else {
 			// unexpected code — TERMINATE
@@ -512,6 +541,7 @@ func deliverMessage(target pendingTarget) {
 		updateRecipient(tx, table, dr.addr, target.MsgID, now, int(c), delivered)
 	}
 
+	deferRetry = false
 	commitOrLog(tx, &committed, target.MsgID)
 }
 

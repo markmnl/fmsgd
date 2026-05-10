@@ -62,7 +62,7 @@ An example systemd service to run fmsgd as a service on startup
 
 ASSUMES: 
 * Directory `/opt/fmsgd` has been created and contains built executable: `fmsgd`
-* Text file `/opt/fmsgd/env` exists containing environment variables (example below)
+* Text file `/etc/fmsgd/env` exists containing environment variables (example below)
 * User `fmsg` has been created and has
     - read and execute permissions to `/opt/fmsgd/`, e.g. with `chown -R fmsg:fmsg /opt/fmsgd` after `mkdir /opt/fmsgd`
     - write permissions to FMSG_DATA_DIR
@@ -85,7 +85,7 @@ Type=simple
 User=fmsg
 Group=fmsg
 
-EnvironmentFile=/opt/fmsgd/env
+EnvironmentFile=/etc/fmsgd/env
 
 ExecStart=/opt/fmsgd/fmsgd 0.0.0.0
 WorkingDirectory=/opt/fmsgd

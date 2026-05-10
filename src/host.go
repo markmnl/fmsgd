@@ -1545,6 +1545,19 @@ func abortConn(c net.Conn) {
 	_ = c.Close()
 }
 
+type responseTrackingConn struct {
+	net.Conn
+	wroteResponse bool
+}
+
+func (c *responseTrackingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.wroteResponse = true
+	}
+	return n, err
+}
+
 func handleConn(c net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1553,11 +1566,16 @@ func handleConn(c net.Conn) {
 	}()
 
 	log.Printf("INFO: Connection from: %s\n", c.RemoteAddr().String())
+	tc := &responseTrackingConn{Conn: c}
 
 	// read header
-	header, r, err := readHeader(c)
+	header, r, err := readHeader(tc)
 	if err != nil {
 		log.Printf("WARN: reading header from, %s: %s", c.RemoteAddr().String(), err)
+		if tc.wroteResponse {
+			_ = c.Close()
+			return
+		}
 		abortConn(c)
 		return
 	}
@@ -1568,7 +1586,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	if err := challenge(c, header, determineSenderDomain(header)); err != nil {
+	if err := challenge(tc, header, determineSenderDomain(header)); err != nil {
 		log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
 		return
@@ -1584,8 +1602,11 @@ func handleConn(c net.Conn) {
 		allLocalDup, err = allLocalRecipientsHaveMessageHash(header.ChallengeHash[:], addrs)
 		if err != nil {
 			log.Printf("ERROR: duplicate check failed for %s: %s", c.RemoteAddr().String(), err)
-			_ = sendCode(c, RejectCodeUndisclosed)
-			abortConn(c)
+			if err := sendCode(c, RejectCodeUndisclosed); err != nil {
+				abortConn(c)
+				return
+			}
+			_ = c.Close()
 			return
 		}
 	}
@@ -1598,8 +1619,11 @@ func handleConn(c net.Conn) {
 		// No local add-to recipients; store header and respond code 11, close.
 		if err := storeMsgHeaderOnly(header); err != nil {
 			log.Printf("ERROR: storing add-to header: %s", err)
-			_ = sendCode(c, RejectCodeUndisclosed)
-			abortConn(c)
+			if err := sendCode(c, RejectCodeUndisclosed); err != nil {
+				abortConn(c)
+				return
+			}
+			_ = c.Close()
 			return
 		}
 		if err := sendCode(c, AcceptCodeAddTo); err != nil {
@@ -1643,6 +1667,7 @@ func handleConn(c net.Conn) {
 		// if error was a protocal violation, abort; otherise let sender know there was an internal error
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
 		if errors.Is(err, ErrProtocolViolation) {
+			abortConn(c)
 			return
 		} else {
 			_ = sendCode(c, RejectCodeUndisclosed)
