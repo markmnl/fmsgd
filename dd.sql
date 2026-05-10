@@ -63,43 +63,73 @@ create table if not exists msg_attachment (
 );
 
 -- keep protocol parent hash populated for locally-created replies that set
--- the relational parent id. Do not overwrite an existing psha256 because
--- incoming protocol messages already carry the parent hash explicitly.
+-- the relational parent id. A reply cannot reference a draft parent, and any
+-- explicit psha256 must match the referenced parent's sha256.
 create or replace function populate_msg_psha256_from_pid() returns trigger as $$
+declare
+    parent_time_sent double precision;
+    parent_sha256 bytea;
 begin
-    if NEW.pid is not null and (NEW.psha256 is null or octet_length(NEW.psha256) = 0) then
-        select parent.sha256
-        into NEW.psha256
-        from msg parent
-        where parent.id = NEW.pid;
+    if NEW.pid is null then
+        return NEW;
     end if;
+
+    select parent.time_sent, parent.sha256
+    into parent_time_sent, parent_sha256
+    from msg parent
+    where parent.id = NEW.pid;
+
+    if not found then
+        raise exception 'parent message % does not exist', NEW.pid;
+    end if;
+
+    if parent_time_sent is null then
+        raise exception 'cannot set pid %: parent message is a draft', NEW.pid;
+    end if;
+
+    if parent_sha256 is null or octet_length(parent_sha256) = 0 then
+        raise exception 'cannot set pid %: parent message has no sha256', NEW.pid;
+    end if;
+
+    if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
+        NEW.psha256 = parent_sha256;
+    elsif NEW.psha256 <> parent_sha256 then
+        raise exception 'psha256 does not match parent message % sha256', NEW.pid;
+    end if;
+
     return NEW;
 end;
 $$ language plpgsql;
 
 drop trigger if exists trg_msg_populate_psha256 on msg;
 create trigger trg_msg_populate_psha256
-    before insert or update of pid on msg
+    before insert or update of pid, psha256 on msg
     for each row execute function populate_msg_psha256_from_pid();
 
--- if a parent message hash is populated after child rows already exist,
--- fill any missing child protocol parent hashes.
-create or replace function backfill_child_psha256_from_parent_sha256() returns trigger as $$
+-- once a message has replies, it must remain referenceable by protocol hash.
+create or replace function prevent_referenced_msg_from_becoming_unreferenceable() returns trigger as $$
 begin
-    if NEW.sha256 is not null then
-        update msg
-        set psha256 = NEW.sha256
-        where pid = NEW.id
-          and (psha256 is null or octet_length(psha256) = 0);
+    if exists (select 1 from msg child where child.pid = NEW.id) then
+        if NEW.time_sent is null then
+            raise exception 'cannot make message % a draft: it has replies', NEW.id;
+        end if;
+
+        if NEW.sha256 is null or octet_length(NEW.sha256) = 0 then
+            raise exception 'cannot clear sha256 for message %: it has replies', NEW.id;
+        end if;
+
+        if OLD.sha256 is distinct from NEW.sha256 then
+            raise exception 'cannot change sha256 for message %: it has replies', NEW.id;
+        end if;
     end if;
     return NEW;
 end;
 $$ language plpgsql;
 
-drop trigger if exists trg_msg_backfill_child_psha256 on msg;
-create trigger trg_msg_backfill_child_psha256
-    after insert or update of sha256 on msg
-    for each row execute function backfill_child_psha256_from_parent_sha256();
+drop trigger if exists trg_msg_prevent_unreferenceable_parent on msg;
+create trigger trg_msg_prevent_unreferenceable_parent
+    before update of time_sent, sha256 on msg
+    for each row execute function prevent_referenced_msg_from_becoming_unreferenceable();
 
 -- notify when a new msg_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
