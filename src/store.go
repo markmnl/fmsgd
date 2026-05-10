@@ -169,6 +169,13 @@ func requiresStoredParent(msg *FMsgHeader) bool {
 	return len(msg.Pid) > 0 && msg.Flags&FlagHasAddTo == 0
 }
 
+func wirePidForLoadedMessage(storedParentHash []byte, msgHash []byte, hasAddTo bool) []byte {
+	if hasAddTo {
+		return msgHash
+	}
+	return storedParentHash
+}
+
 // getMsgByID loads a message and all its recipients from the database by msg ID.
 // Returns the full FMsgHeader or nil if the message doesn't exist.
 func getMsgByID(msgID int64) (*FMsgHeader, error) {
@@ -531,13 +538,10 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	// has_pid and has_add_to are derived from actual data rather than stored,
 	// so add-to recipients added after the original message are included.
 	//
-	// When add-to recipients exist on a root message (no pid), set pid to the
-	// message's own hash so the wire format is valid: spec requires pid when
-	// add-to is present. This turns the outgoing message into an add-to
-	// notification referencing the original message.
-	if len(allAddTo) > 0 && len(pid) == 0 {
-		pid = msgHash
-	}
+	// When add-to recipients exist, the wire pid references the message being
+	// shared, not that message's parent. This keeps add-to on replies pointing
+	// at the reply payload rather than the root message.
+	pid = wirePidForLoadedMessage(pid, msgHash, len(allAddTo) > 0)
 
 	var addToFrom *FMsgAddress
 	if addToFromAddr.Valid && addToFromAddr.String != "" {

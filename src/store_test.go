@@ -117,3 +117,23 @@ func TestRequiresStoredParentUsesAddToFlag(t *testing.T) {
 		t.Fatal("add-to message required stored parent")
 	}
 }
+
+func TestWirePidForLoadedMessageAddToReferencesSharedMessage(t *testing.T) {
+	parentHash := []byte{1, 2, 3}
+	msgHash := []byte{4, 5, 6}
+
+	got := wirePidForLoadedMessage(parentHash, msgHash, true)
+	if !bytes.Equal(got, msgHash) {
+		t.Fatalf("add-to wire pid = %v, want message hash %v", got, msgHash)
+	}
+}
+
+func TestWirePidForLoadedMessageReplyKeepsParentHash(t *testing.T) {
+	parentHash := []byte{1, 2, 3}
+	msgHash := []byte{4, 5, 6}
+
+	got := wirePidForLoadedMessage(parentHash, msgHash, false)
+	if !bytes.Equal(got, parentHash) {
+		t.Fatalf("reply wire pid = %v, want parent hash %v", got, parentHash)
+	}
+}
