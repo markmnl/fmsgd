@@ -62,6 +62,45 @@ create table if not exists msg_attachment (
     primary key (msg_id, filename)
 );
 
+-- keep protocol parent hash populated for locally-created replies that set
+-- the relational parent id. Do not overwrite an existing psha256 because
+-- incoming protocol messages already carry the parent hash explicitly.
+create or replace function populate_msg_psha256_from_pid() returns trigger as $$
+begin
+    if NEW.pid is not null and (NEW.psha256 is null or octet_length(NEW.psha256) = 0) then
+        select parent.sha256
+        into NEW.psha256
+        from msg parent
+        where parent.id = NEW.pid;
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_populate_psha256 on msg;
+create trigger trg_msg_populate_psha256
+    before insert or update of pid on msg
+    for each row execute function populate_msg_psha256_from_pid();
+
+-- if a parent message hash is populated after child rows already exist,
+-- fill any missing child protocol parent hashes.
+create or replace function backfill_child_psha256_from_parent_sha256() returns trigger as $$
+begin
+    if NEW.sha256 is not null then
+        update msg
+        set psha256 = NEW.sha256
+        where pid = NEW.id
+          and (psha256 is null or octet_length(psha256) = 0);
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_backfill_child_psha256 on msg;
+create trigger trg_msg_backfill_child_psha256
+    after insert or update of sha256 on msg
+    for each row execute function backfill_child_psha256_from_parent_sha256();
+
 -- notify when a new msg_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
 create or replace function notify_msg_to_insert() returns trigger as $$
