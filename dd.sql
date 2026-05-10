@@ -62,39 +62,6 @@ create table if not exists msg_attachment (
     primary key (msg_id, filename)
 );
 
--- resolve the local numeric parent id whenever the wire parent hash is known
--- and the parent row already exists.
-create or replace function resolve_msg_pid_before_write() returns trigger as $$
-begin
-    if NEW.psha256 is not null and NEW.pid is null then
-        select id into NEW.pid from msg where sha256 = NEW.psha256;
-    end if;
-    return NEW;
-end;
-$$ language plpgsql;
-
-drop trigger if exists trg_msg_resolve_pid_before_write on msg;
-create trigger trg_msg_resolve_pid_before_write
-    before insert or update of psha256 on msg
-    for each row execute function resolve_msg_pid_before_write();
-
--- if a parent row's sha256 becomes available after child rows were stored,
--- backfill those child rows' numeric parent id.
-create or replace function resolve_msg_pid_after_hash() returns trigger as $$
-begin
-    if NEW.sha256 is not null then
-        update msg set pid = NEW.id
-        where psha256 = NEW.sha256 and pid is null;
-    end if;
-    return NEW;
-end;
-$$ language plpgsql;
-
-drop trigger if exists trg_msg_resolve_pid_after_hash on msg;
-create trigger trg_msg_resolve_pid_after_hash
-    after insert or update of sha256 on msg
-    for each row execute function resolve_msg_pid_after_hash();
-
 -- notify when a new msg_to row is inserted with null time_delivered so the
 -- sender can pick it up immediately instead of waiting for the next poll.
 create or replace function notify_msg_to_insert() returns trigger as $$
