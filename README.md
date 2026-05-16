@@ -9,8 +9,7 @@ Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in Go! Us
 Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 
 1. Clone this repository
-2. Navigate to src/
-2. Run `go build .`
+2. Run `go build ./cmd/fmsgd/`
 
 
 ## Environment

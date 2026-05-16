@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 )
 
 func TestAddressToString(t *testing.T) {
@@ -841,13 +843,13 @@ func TestHashPayloadRejectsExpandedSizeMismatch(t *testing.T) {
 
 	// Correct expanded size should succeed
 	var dst bytes.Buffer
-	if err := hashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))); err != nil {
+	if err := fmsg.HashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))); err != nil {
 		t.Fatalf("hashPayload with correct expanded size: %v", err)
 	}
 
 	// Wrong expanded size should fail
 	dst.Reset()
-	err := hashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))+1)
+	err := fmsg.HashPayload(&dst, p, int64(len(wire)), true, uint32(len(plain))+1)
 	if err == nil {
 		t.Fatal("hashPayload with wrong expanded size: expected error, got nil")
 	}
