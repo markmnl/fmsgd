@@ -19,6 +19,8 @@ All code MUST conform to the specification. When in doubt, re-read SPEC.md and f
 ## Build & Test
 
 - Language: Go
-- Module path: `src/`
-- Build: `cd src && go build ./...`
-- Test: `cd src && go test ./...`
+- Module path: repo root (`go.mod` at `fmsgd/go.mod`)
+- Binary source: `cmd/fmsgd/`
+- Shared protocol package: `pkg/protocol/`
+- Build: `go build ./...` (from repo root)
+- Test: `go test ./...` (from repo root)
