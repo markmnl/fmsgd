@@ -137,3 +137,34 @@ func TestWirePidForLoadedMessageReplyKeepsParentHash(t *testing.T) {
 		t.Fatalf("reply wire pid = %v, want parent hash %v", got, parentHash)
 	}
 }
+
+// An add-to message's row IS the shared message; its canonical hash is the
+// original-form hash carried in Pid, not the add-to variant. Storing the
+// variant would make replies reference a hash the origin host never knows.
+func TestCanonicalMsgHashAddToUsesPid(t *testing.T) {
+	origHash := []byte{9, 8, 7, 6}
+
+	got, err := canonicalMsgHash(&FMsgHeader{Flags: FlagHasPid | FlagHasAddTo, Pid: origHash})
+	if err != nil {
+		t.Fatalf("canonicalMsgHash returned error: %v", err)
+	}
+	if !bytes.Equal(got, origHash) {
+		t.Fatalf("add-to canonical hash = %v, want original-form hash %v", got, origHash)
+	}
+}
+
+// An add-to message's Pid identifies the message itself, not a parent, so it
+// must not be resolved as a relational parent. A plain reply's Pid is a parent.
+func TestRelationalParentHashAddToHasNoParent(t *testing.T) {
+	pid := []byte{1, 2, 3}
+
+	if got := relationalParentHash(&FMsgHeader{Flags: FlagHasPid | FlagHasAddTo, Pid: pid}); got != nil {
+		t.Fatalf("add-to relational parent = %v, want nil", got)
+	}
+	if got := relationalParentHash(&FMsgHeader{Flags: FlagHasPid, Pid: pid}); !bytes.Equal(got, pid) {
+		t.Fatalf("reply relational parent = %v, want %v", got, pid)
+	}
+	if got := relationalParentHash(&FMsgHeader{}); got != nil {
+		t.Fatalf("new-thread relational parent = %v, want nil", got)
+	}
+}

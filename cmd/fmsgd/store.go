@@ -176,6 +176,29 @@ func wirePidForLoadedMessage(storedParentHash []byte, msgHash []byte, hasAddTo b
 	return storedParentHash
 }
 
+// canonicalMsgHash returns the original-form message hash that is a message's
+// stable identity: it is stored in msg.sha256 and is what replies carry as
+// their wire pid. For an add-to message the row IS the shared message and its
+// original-form hash is already in msg.Pid (the add-to wire pid, SPEC §12);
+// GetMessageHash() there would instead hash the add-to variant and also needs
+// the message payload, which the code-11 path never downloads.
+func canonicalMsgHash(msg *FMsgHeader) ([]byte, error) {
+	if msg.Flags&FlagHasAddTo != 0 {
+		return msg.Pid, nil
+	}
+	return msg.GetMessageHash()
+}
+
+// relationalParentHash returns the hash of the message this one is a reply to,
+// or nil when there is none. An add-to message's Pid is its own identity, not
+// a parent pointer (SPEC §12), so it must never be resolved as a parent.
+func relationalParentHash(msg *FMsgHeader) []byte {
+	if msg.Flags&FlagHasAddTo != 0 {
+		return nil
+	}
+	return msg.Pid
+}
+
 // getMsgByID loads a message and all its recipients from the database by msg ID.
 // Returns the full FMsgHeader or nil if the message doesn't exist.
 func getMsgByID(msgID int64) (*FMsgHeader, error) {
@@ -218,10 +241,11 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	}
 	defer tx.Rollback()
 
-	msgHash, err := msg.GetMessageHash()
+	msgHash, err := canonicalMsgHash(msg)
 	if err != nil {
 		return err
 	}
+	parentHash := relationalParentHash(msg)
 
 	var addToFrom interface{}
 	if msg.AddToFrom != nil {
@@ -254,7 +278,7 @@ returning id`,
 		msg.Topic,
 		msg.Type,
 		msgHash,
-		msg.Pid,
+		parentHash,
 		int(msg.Size),
 		msg.Filepath).Scan(&msgID)
 	if err != nil {
@@ -316,7 +340,7 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 		}
 	}
 
-	if err := resolveMsgParentLinks(tx, msgID, msgHash, msg.Pid, requiresStoredParent(msg)); err != nil {
+	if err := resolveMsgParentLinks(tx, msgID, msgHash, parentHash, requiresStoredParent(msg)); err != nil {
 		return err
 	}
 
@@ -340,10 +364,11 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	}
 	defer tx.Rollback()
 
-	msgHash, err := msg.GetMessageHash()
+	msgHash, err := canonicalMsgHash(msg)
 	if err != nil {
 		return err
 	}
+	parentHash := relationalParentHash(msg)
 
 	var addToFrom interface{}
 	if msg.AddToFrom != nil {
@@ -376,7 +401,7 @@ returning id`,
 		msg.Topic,
 		msg.Type,
 		msgHash,
-		msg.Pid,
+		parentHash,
 		int(msg.Size),
 		"").Scan(&msgID)
 	if err != nil {
@@ -425,7 +450,7 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 		}
 	}
 
-	if err := resolveMsgParentLinks(tx, msgID, msgHash, msg.Pid, requiresStoredParent(msg)); err != nil {
+	if err := resolveMsgParentLinks(tx, msgID, msgHash, parentHash, requiresStoredParent(msg)); err != nil {
 		return err
 	}
 

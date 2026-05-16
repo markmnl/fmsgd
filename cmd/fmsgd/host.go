@@ -1396,6 +1396,14 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		return fmt.Errorf("%w actual hash: %s mismatch challenge response: %s", ErrProtocolViolation, actualHashStr, challengeHashStr)
 	}
 
+	// Duplicate detection keys on the message's canonical identity (msg.sha256),
+	// which for an add-to delivery is its original-form hash — not the add-to
+	// variant verified against the challenge above.
+	dupHash, err := canonicalMsgHash(h)
+	if err != nil {
+		return err
+	}
+
 	// pid/add-to validation is handled during header exchange in readHeader().
 
 	// determine file extension from MIME type
@@ -1423,7 +1431,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	acceptedAddTo := []FMsgAddress{}
 	var primaryFilepath string
 	for i, addr := range addrs {
-		code, err := validateMsgRecvForAddr(h, &addr, msgHash)
+		code, err := validateMsgRecvForAddr(h, &addr, dupHash)
 		if err != nil {
 			return err
 		}
@@ -1552,7 +1560,14 @@ func handleConn(c net.Conn) {
 	if header.ChallengeCompleted && header.InitialResponseCode != AcceptCodeAddTo {
 		addrs := localRecipients(header)
 		var err error
-		allLocalDup, err = allLocalRecipientsHaveMessageHash(header.ChallengeHash[:], addrs)
+		// Duplicate detection keys on msg.sha256 (the canonical original-form
+		// hash). For an add-to delivery that is header.Pid; the challenge hash
+		// is the add-to variant and would not match a stored row.
+		dupHash := header.ChallengeHash[:]
+		if header.Flags&FlagHasAddTo != 0 {
+			dupHash = header.Pid
+		}
+		allLocalDup, err = allLocalRecipientsHaveMessageHash(dupHash, addrs)
 		if err != nil {
 			log.Printf("ERROR: duplicate check failed for %s: %s", c.RemoteAddr().String(), err)
 			if err := sendCode(c, RejectCodeUndisclosed); err != nil {
