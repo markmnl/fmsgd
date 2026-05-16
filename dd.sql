@@ -88,7 +88,8 @@ begin
     end if;
 
     if parent_sha256 is null or octet_length(parent_sha256) = 0 then
-        raise exception 'cannot set pid %: parent message has no sha256', NEW.pid;
+        -- parent was delivered locally only and has no sha256 yet; psha256 cannot be populated
+        return NEW;
     end if;
 
     if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
@@ -114,7 +115,7 @@ begin
             raise exception 'cannot make message % a draft: it has replies', NEW.id;
         end if;
 
-        if NEW.sha256 is null or octet_length(NEW.sha256) = 0 then
+        if OLD.sha256 is not null and (NEW.sha256 is null or octet_length(NEW.sha256) = 0) then
             raise exception 'cannot clear sha256 for message %: it has replies', NEW.id;
         end if;
 
