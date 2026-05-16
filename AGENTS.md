@@ -21,6 +21,6 @@ All code MUST conform to the specification. When in doubt, re-read SPEC.md and f
 - Language: Go
 - Module path: repo root (`go.mod` at `fmsgd/go.mod`)
 - Binary source: `cmd/fmsgd/`
-- Shared protocol package: `pkg/protocol/`
+- Shared protocol package: `pkg/fmsg/`
 - Build: `go build ./...` (from repo root)
 - Test: `go test ./...` (from repo root)

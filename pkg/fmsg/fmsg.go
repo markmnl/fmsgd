@@ -1,12 +1,10 @@
-// Package protocol implements the fmsg wire protocol encoding and hashing.
+// Package fmsg defines the fmsg message types and implements wire-format
+// encoding and hashing as specified in SPEC.md.
 //
-// It provides the core types and methods needed to build, encode, and hash
-// fmsg messages as defined in the fmsg protocol specification (SPEC.md).
-//
-// To compute a message hash from database fields, populate an [FMsgHeader]
+// To compute a message hash from database fields, populate a [Header]
 // (including Filepath and per-attachment Filepath values), then call
-// [FMsgHeader.GetMessageHash].
-package protocol
+// [Header.GetMessageHash].
+package fmsg
 
 import (
 	"bytes"
@@ -31,19 +29,19 @@ const (
 	FlagDeflate    uint8 = 1 << 5 // bit 5: message body is zlib-deflate compressed
 )
 
-// FMsgAddress is an fmsg address of the form @user@domain.
-type FMsgAddress struct {
+// Address is an fmsg address of the form @user@domain.
+type Address struct {
 	User   string
 	Domain string
 }
 
 // ToString returns the address in @user@domain form.
-func (addr *FMsgAddress) ToString() string {
+func (addr *Address) ToString() string {
 	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
 }
 
-// FMsgAttachmentHeader holds the wire-level metadata for a single attachment.
-type FMsgAttachmentHeader struct {
+// AttachmentHeader holds the wire-level metadata for a single attachment.
+type AttachmentHeader struct {
 	Flags        uint8
 	TypeID       uint8
 	Type         string
@@ -54,19 +52,19 @@ type FMsgAttachmentHeader struct {
 	Filepath string // path to attachment data on disk
 }
 
-// FMsgHeader holds all fields of an fmsg message header.
+// Header holds all fields of an fmsg message header.
 //
 // Fields ChallengeHash, ChallengeCompleted, and InitialResponseCode are
 // fmsgd server-runtime state; they are not part of the wire format and can
 // be ignored by other consumers of this package.
-type FMsgHeader struct {
+type Header struct {
 	Version   uint8
 	Flags     uint8
 	Pid       []byte
-	From      FMsgAddress
-	To        []FMsgAddress
-	AddToFrom *FMsgAddress // present when FlagHasAddTo is set
-	AddTo     []FMsgAddress
+	From      Address
+	To        []Address
+	AddToFrom *Address // present when FlagHasAddTo is set
+	AddTo     []Address
 	Timestamp float64
 	TypeID    uint8
 	Topic     string
@@ -74,7 +72,7 @@ type FMsgHeader struct {
 
 	Size         uint32 // wire (possibly compressed) size of the message body
 	ExpandedSize uint32 // decompressed size; present on wire iff FlagDeflate set
-	Attachments  []FMsgAttachmentHeader
+	Attachments  []AttachmentHeader
 
 	HeaderHash          []byte
 	ChallengeHash       [32]byte // fmsgd server field: challenge response hash
@@ -88,7 +86,7 @@ type FMsgHeader struct {
 // The returned bytes cover all fields up to and including the attachment
 // headers (fields 1–12 per spec). This method panics on internal buffer errors
 // rather than returning an error.
-func (h *FMsgHeader) Encode() []byte {
+func (h *Header) Encode() []byte {
 	var b bytes.Buffer
 	b.WriteByte(h.Version)
 	b.WriteByte(h.Flags)
@@ -183,7 +181,7 @@ func (h *FMsgHeader) Encode() []byte {
 }
 
 // String returns a human-readable summary of the header fields.
-func (h *FMsgHeader) String() string {
+func (h *Header) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "v%d flags=%d", h.Version, h.Flags)
 	if len(h.Pid) > 0 {
@@ -212,7 +210,7 @@ func (h *FMsgHeader) String() string {
 
 // GetHeaderHash returns the SHA-256 hash of the encoded header (fields 1–12).
 // The result is cached after the first call.
-func (h *FMsgHeader) GetHeaderHash() []byte {
+func (h *Header) GetHeaderHash() []byte {
 	if h.HeaderHash == nil {
 		b := sha256.Sum256(h.Encode())
 		h.HeaderHash = b[:]
@@ -223,7 +221,7 @@ func (h *FMsgHeader) GetHeaderHash() []byte {
 // GetMessageHash returns the SHA-256 hash of the full message:
 // encoded header + decompressed message body + decompressed attachment data.
 // The result is cached after the first call.
-func (h *FMsgHeader) GetMessageHash() ([]byte, error) {
+func (h *Header) GetMessageHash() ([]byte, error) {
 	if h.messageHash == nil {
 		hash := sha256.New()
 
