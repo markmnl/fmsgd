@@ -2,4 +2,4 @@
 .claude/
 *.exe
 .env
-fmsgd
+/cmd/fmsgd/fmsgd
