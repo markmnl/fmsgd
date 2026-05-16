@@ -541,6 +541,43 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	// When add-to recipients exist, the wire pid references the message being
 	// shared, not that message's parent. This keeps add-to on replies pointing
 	// at the reply payload rather than the root message.
+	//
+	// If that shared message has no persisted sha256 (e.g. it was delivered
+	// locally only and so never sent over the wire), compute its original-form
+	// message hash now. Without it the add-to wire header would omit the pid
+	// field entirely and be rejected as invalid (SPEC §10.3 step 7, §12).
+	if len(allAddTo) > 0 && len(msgHash) == 0 {
+		origFlags := uint8(0)
+		if noReply {
+			origFlags |= FlagNoReply
+		}
+		if isImportant {
+			origFlags |= FlagImportant
+		}
+		if isDeflate {
+			origFlags |= FlagDeflate
+		}
+		if len(pid) > 0 {
+			origFlags |= FlagHasPid
+		}
+		orig := &FMsgHeader{
+			Version:     uint8(version),
+			Flags:       origFlags,
+			Pid:         pid,
+			From:        *from,
+			To:          allTo,
+			Timestamp:   timeSent,
+			Topic:       topic,
+			Type:        typ,
+			Size:        uint32(size),
+			Attachments: attachments,
+			Filepath:    filepath,
+		}
+		msgHash, err = orig.GetMessageHash()
+		if err != nil {
+			return nil, fmt.Errorf("compute original message hash for msg %d: %w", msgID, err)
+		}
+	}
 	pid = wirePidForLoadedMessage(pid, msgHash, len(allAddTo) > 0)
 
 	var addToFrom *FMsgAddress
