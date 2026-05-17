@@ -153,6 +153,19 @@ func TestCanonicalMsgHashAddToUsesPid(t *testing.T) {
 	}
 }
 
+// A non-add-to message must never take the add-to attach path: a colliding
+// sha256 there is a genuine duplicate, not the shared message being extended.
+// existingMsgIDForAddTo short-circuits before touching the database for it.
+func TestExistingMsgIDForAddToSkipsNonAddTo(t *testing.T) {
+	id, err := existingMsgIDForAddTo(nil, &FMsgHeader{Flags: FlagHasPid}, []byte{1, 2, 3})
+	if err != nil {
+		t.Fatalf("existingMsgIDForAddTo returned error: %v", err)
+	}
+	if id != 0 {
+		t.Fatalf("non-add-to message returned existing id %d, want 0", id)
+	}
+}
+
 // An add-to message's Pid identifies the message itself, not a parent, so it
 // must not be resolved as a relational parent. A plain reply's Pid is a parent.
 func TestRelationalParentHashAddToHasNoParent(t *testing.T) {

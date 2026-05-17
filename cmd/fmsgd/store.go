@@ -227,6 +227,63 @@ func getMsgByID(msgID int64) (*FMsgHeader, error) {
 	return h, nil
 }
 
+// existingMsgIDForAddTo returns the id of an already-stored message row whose
+// canonical sha256 matches msgHash, for an add-to delivery. It returns 0 when
+// the message is not an add-to message or no such row exists, so the caller
+// falls through to a normal INSERT. Non-add-to messages never take the attach
+// path: a colliding sha256 there is a genuine duplicate, not a shared message.
+func existingMsgIDForAddTo(tx *sql.Tx, msg *FMsgHeader, msgHash []byte) (int64, error) {
+	if msg.Flags&FlagHasAddTo == 0 || len(msgHash) == 0 {
+		return 0, nil
+	}
+	var id int64
+	err := tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", msgHash).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}
+
+// attachAddToRecipients extends an already-stored message with the recipients
+// carried by an add-to delivery, marking those on our domain delivered. It is
+// the add-to counterpart of an INSERT: when a host already holds the shared
+// message, an add-to delivery must grow its recipient list rather than insert
+// a second row under the same unique canonical sha256 (SPEC §12).
+func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
+	now := timeutil.TimestampNow().Float64()
+
+	add := func(table string, addr FMsgAddress) error {
+		var delivered interface{}
+		if addr.Domain == Domain {
+			delivered = now
+		}
+		_, err := tx.Exec(`insert into `+table+` (msg_id, addr, time_delivered)
+values ($1, $2, $3)
+on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered)
+		return err
+	}
+
+	for _, addr := range msg.To {
+		if err := add("msg_to", addr); err != nil {
+			return err
+		}
+	}
+	for _, addr := range msg.AddTo {
+		if err := add("msg_add_to", addr); err != nil {
+			return err
+		}
+	}
+
+	if msg.AddToFrom != nil {
+		if _, err := tx.Exec(`update msg set add_to_from = $1
+where id = $2 and (add_to_from is null or add_to_from = '')`,
+			msg.AddToFrom.ToString(), msgID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func storeMsgDetail(msg *FMsgHeader) error {
 
 	db, err := sql.Open("postgres", "")
@@ -246,6 +303,18 @@ func storeMsgDetail(msg *FMsgHeader) error {
 		return err
 	}
 	parentHash := relationalParentHash(msg)
+
+	// An add-to delivery for a message this host already holds extends the
+	// existing row's recipient list; inserting again would collide on the
+	// unique canonical sha256 (SPEC §12).
+	if existingID, err := existingMsgIDForAddTo(tx, msg, msgHash); err != nil {
+		return err
+	} else if existingID != 0 {
+		if err := attachAddToRecipients(tx, existingID, msg); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 
 	var addToFrom interface{}
 	if msg.AddToFrom != nil {
@@ -369,6 +438,18 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 		return err
 	}
 	parentHash := relationalParentHash(msg)
+
+	// An add-to delivery for a message this host already holds extends the
+	// existing row's recipient list; inserting again would collide on the
+	// unique canonical sha256 (SPEC §12).
+	if existingID, err := existingMsgIDForAddTo(tx, msg, msgHash); err != nil {
+		return err
+	} else if existingID != 0 {
+		if err := attachAddToRecipients(tx, existingID, msg); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 
 	var addToFrom interface{}
 	if msg.AddToFrom != nil {
