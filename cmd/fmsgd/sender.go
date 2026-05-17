@@ -368,18 +368,11 @@ func deliverMessage(target pendingTarget) {
 
 	// Ensure sha256 is populated for this message so future pid lookups
 	// (e.g. add-to notifications or replies referencing it) can find it.
-	// For an add-to message the row being delivered IS the shared message,
-	// whose original-form hash loadMsg has already placed in h.Pid; calling
-	// h.GetMessageHash() here would instead hash the add-to variant.
 	var msgHash []byte
-	if h.Flags&FlagHasAddTo != 0 {
-		msgHash = h.Pid
-	} else {
-		msgHash, err = h.GetMessageHash()
-		if err != nil {
-			log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
-			return
-		}
+	msgHash, err = canonicalMsgHash(h)
+	if err != nil {
+		log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
+		return
 	}
 	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`,
 		msgHash, target.MsgID); err != nil {
