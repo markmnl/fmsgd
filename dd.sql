@@ -139,7 +139,9 @@ create trigger trg_msg_prevent_unreferenceable_parent
 --                          for the first time); notify every recipient.
 --   * msg_to/msg_add_to -- a recipient row is inserted against an already-sent
 --                          message (recipients added via add-to after the
---                          message was sent); notify that recipient.
+--                          message was sent, including a freshly inserted
+--                          message whose recipient rows follow in the same
+--                          transaction); notify that recipient.
 -- The payload is advisory only: the worker re-polls fully on any wake-up.
 create or replace function notify_msg_sent() returns trigger as $$
 begin
@@ -174,3 +176,34 @@ create trigger trg_msg_sent
     after update on msg
     for each row execute function notify_msg_sent();
 
+-- Notify listeners (channel new_msg) that a message has become sent/arrived:
+-- time_sent set for the first time, on insert (e.g. a message received from a
+-- remote host) or update (a local draft being sent). Unlike new_msg_to this
+-- fires regardless of recipient domain, so push-notification listeners can wake
+-- without polling. Payload is "<msg id>,<addr>", one notification per recipient
+-- -- the listener checks addr against its currently-subscribed clients and only
+-- fetches message detail for those that are connected.
+--
+-- This is a DEFERRABLE constraint trigger so it runs at COMMIT: on insert the
+-- msg row is written before its msg_to/msg_add_to rows (FK ordering), so a
+-- plain row trigger would see no recipients. At commit every recipient row in
+-- the transaction is visible.
+create or replace function notify_new_msg() returns trigger as $$
+begin
+    if (TG_OP = 'INSERT' and NEW.time_sent is not null) or
+       (TG_OP = 'UPDATE' and OLD.time_sent is null and NEW.time_sent is not null) then
+        perform pg_notify('new_msg', NEW.id::text || ',' || addr)
+        from msg_to where msg_id = NEW.id;
+
+        perform pg_notify('new_msg', NEW.id::text || ',' || addr)
+        from msg_add_to where msg_id = NEW.id;
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_new_msg on msg;
+create constraint trigger trg_new_msg
+    after insert or update on msg
+    deferrable initially deferred
+    for each row execute function notify_new_msg();
