@@ -15,8 +15,7 @@ create table if not exists msg (
 	is_deflate		boolean				not null default false,
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
-    add_to_from   	varchar(255),
-    topic         	varchar(255)    	not null, 
+    topic         	varchar(255)    	not null,
     type          	varchar(255)    	not null,
     sha256        	bytea           	unique,
     psha256       	bytea,
@@ -38,9 +37,22 @@ create table if not exists msg_to (
 );
 create index on msg_to ((lower(addr)));
 
+-- Each add-to delivery for a shared message is one batch: a single sender
+-- (add_to_from) added a set of recipients at a point in time. Storing batches
+-- separately lets readers reconstruct who added which recipients and when,
+-- which a single flat recipient list cannot preserve (SPEC §12).
+create table if not exists msg_add_to_batch (
+	id				bigserial			primary key,
+	msg_id			bigint				not null references msg (id),
+	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
+	time_added		double precision	not null            -- when this host recorded the batch
+);
+create index on msg_add_to_batch (msg_id);
+
 create table if not exists msg_add_to (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
+	batch_id		bigint				references msg_add_to_batch (id), -- batch this recipient was added in
 	addr			varchar(255)		not null,
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
@@ -50,6 +62,41 @@ create table if not exists msg_add_to (
 	unique (msg_id, addr)
 );
 create index on msg_add_to ((lower(addr)));
+
+-- Migrate existing deployments: msg_add_to_batch / msg_add_to.batch_id are new,
+-- and the legacy single msg.add_to_from column is being removed. The add column
+-- precedes its index so an existing msg_add_to (created before batch_id) is
+-- altered first. Backfill one synthetic batch per message that already has
+-- add-to recipients, then drop the old column and tighten the FK. Guarded so
+-- re-running dd.sql is a no-op and a fresh install (no add_to_from column, no
+-- rows) skips the backfill entirely.
+alter table msg_add_to add column if not exists batch_id bigint references msg_add_to_batch (id);
+create index if not exists msg_add_to_batch_id_idx on msg_add_to (batch_id);
+do $$
+begin
+    if exists (
+        select 1 from information_schema.columns
+        where table_name = 'msg' and column_name = 'add_to_from'
+    ) then
+        insert into msg_add_to_batch (msg_id, add_to_from, time_added)
+        select m.id, coalesce(nullif(m.add_to_from, ''), m.from_addr), coalesce(m.time_sent, 0)
+        from msg m
+        where exists (
+            select 1 from msg_add_to a where a.msg_id = m.id and a.batch_id is null
+        );
+
+        update msg_add_to a
+        set batch_id = b.id
+        from msg_add_to_batch b
+        where a.batch_id is null and b.msg_id = a.msg_id;
+
+        alter table msg drop column add_to_from;
+    end if;
+
+    if not exists (select 1 from msg_add_to where batch_id is null) then
+        alter table msg_add_to alter column batch_id set not null;
+    end if;
+end $$;
 
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),

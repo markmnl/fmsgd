@@ -29,7 +29,7 @@ func testDb() error {
 	log.Printf("INFO: Database connected: %s@%s:%s/%s", user, host, port, dbName)
 
 	// verify required tables exist
-	for _, table := range []string{"msg", "msg_to", "msg_add_to", "msg_attachment"} {
+	for _, table := range []string{"msg", "msg_to", "msg_add_to", "msg_add_to_batch", "msg_attachment"} {
 		var exists bool
 		err = db.QueryRow(`SELECT EXISTS (
 			SELECT FROM information_schema.tables
@@ -244,40 +244,59 @@ func existingMsgIDForAddTo(tx *sql.Tx, msg *FMsgHeader, msgHash []byte) (int64, 
 	return id, err
 }
 
+// insertAddToBatch records one add-to delivery as a batch (its sender and the
+// time this host recorded it) and returns the new batch id. Recipients carried
+// by the delivery are linked to this batch so readers can reconstruct who added
+// which recipients and when (SPEC §12).
+func insertAddToBatch(tx *sql.Tx, msgID int64, addToFrom string, now float64) (int64, error) {
+	var batchID int64
+	err := tx.QueryRow(`insert into msg_add_to_batch (msg_id, add_to_from, time_added)
+values ($1, $2, $3) returning id`, msgID, addToFrom, now).Scan(&batchID)
+	return batchID, err
+}
+
 // attachAddToRecipients extends an already-stored message with the recipients
 // carried by an add-to delivery, marking those on our domain delivered. It is
 // the add-to counterpart of an INSERT: when a host already holds the shared
 // message, an add-to delivery must grow its recipient list rather than insert
-// a second row under the same unique canonical sha256 (SPEC §12).
+// a second row under the same unique canonical sha256 (SPEC §12). Each call is
+// one batch, recorded so its sender and timing are not lost.
 func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 	now := timeutil.TimestampNow().Float64()
 
-	add := func(table string, addr FMsgAddress) error {
+	for _, addr := range msg.To {
 		var delivered interface{}
 		if addr.Domain == Domain {
 			delivered = now
 		}
-		_, err := tx.Exec(`insert into `+table+` (msg_id, addr, time_delivered)
+		if _, err := tx.Exec(`insert into msg_to (msg_id, addr, time_delivered)
 values ($1, $2, $3)
-on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered)
+on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered); err != nil {
+			return err
+		}
+	}
+
+	if len(msg.AddTo) == 0 {
+		return nil
+	}
+
+	addToFrom := ""
+	if msg.AddToFrom != nil {
+		addToFrom = msg.AddToFrom.ToString()
+	}
+	batchID, err := insertAddToBatch(tx, msgID, addToFrom, now)
+	if err != nil {
 		return err
 	}
 
-	for _, addr := range msg.To {
-		if err := add("msg_to", addr); err != nil {
-			return err
-		}
-	}
 	for _, addr := range msg.AddTo {
-		if err := add("msg_add_to", addr); err != nil {
-			return err
+		var delivered interface{}
+		if addr.Domain == Domain {
+			delivered = now
 		}
-	}
-
-	if msg.AddToFrom != nil {
-		if _, err := tx.Exec(`update msg set add_to_from = $1
-where id = $2 and (add_to_from is null or add_to_from = '')`,
-			msg.AddToFrom.ToString(), msgID); err != nil {
+		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered)
+values ($1, $2, $3, $4)
+on conflict (msg_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered); err != nil {
 			return err
 		}
 	}
@@ -316,11 +335,6 @@ func storeMsgDetail(msg *FMsgHeader) error {
 		return tx.Commit()
 	}
 
-	var addToFrom interface{}
-	if msg.AddToFrom != nil {
-		addToFrom = msg.AddToFrom.ToString()
-	}
-
 	var msgID int64
 	err = tx.QueryRow(`insert into msg (version
 	, no_reply
@@ -328,14 +342,13 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	, is_deflate
 	, time_sent
 	, from_addr
-	, add_to_from
 	, topic
 	, type
 	, sha256
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -343,7 +356,6 @@ returning id`,
 		msg.Flags&FlagDeflate != 0,
 		msg.Timestamp,
 		msg.From.ToString(),
-		addToFrom,
 		msg.Topic,
 		msg.Type,
 		msgHash,
@@ -373,10 +385,19 @@ values ($1, $2, $3)`)
 		}
 	}
 
-	// insert add-to recipients into msg_add_to
+	// insert add-to recipients into msg_add_to as one batch
 	if len(msg.AddTo) > 0 {
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, addr, time_delivered)
-values ($1, $2, $3)`)
+		addToFrom := ""
+		if msg.AddToFrom != nil {
+			addToFrom = msg.AddToFrom.ToString()
+		}
+		batchID, err := insertAddToBatch(tx, msgID, addToFrom, now)
+		if err != nil {
+			return err
+		}
+
+		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered)
+values ($1, $2, $3, $4)`)
 		if err != nil {
 			return err
 		}
@@ -387,7 +408,7 @@ values ($1, $2, $3)`)
 			if addr.Domain == Domain {
 				delivered = now
 			}
-			if _, err := addToStmt.Exec(msgID, addr.ToString(), delivered); err != nil {
+			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString(), delivered); err != nil {
 				return err
 			}
 		}
@@ -451,11 +472,6 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 		return tx.Commit()
 	}
 
-	var addToFrom interface{}
-	if msg.AddToFrom != nil {
-		addToFrom = msg.AddToFrom.ToString()
-	}
-
 	var msgID int64
 	err = tx.QueryRow(`insert into msg (version
 	, no_reply
@@ -463,14 +479,13 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	, is_deflate
 	, time_sent
 	, from_addr
-	, add_to_from
 	, topic
 	, type
 	, sha256
 	, psha256
 	, size
 	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -478,7 +493,6 @@ returning id`,
 		msg.Flags&FlagDeflate != 0,
 		msg.Timestamp,
 		msg.From.ToString(),
-		addToFrom,
 		msg.Topic,
 		msg.Type,
 		msgHash,
@@ -501,15 +515,24 @@ returning id`,
 		}
 	}
 
-	// insert add-to recipients
+	// insert add-to recipients as one batch
 	if len(msg.AddTo) > 0 {
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, addr) values ($1, $2)`)
+		addToFrom := ""
+		if msg.AddToFrom != nil {
+			addToFrom = msg.AddToFrom.ToString()
+		}
+		batchID, err := insertAddToBatch(tx, msgID, addToFrom, timeutil.TimestampNow().Float64())
+		if err != nil {
+			return err
+		}
+
+		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr) values ($1, $2, $3)`)
 		if err != nil {
 			return err
 		}
 		defer addToStmt.Close()
 		for _, addr := range msg.AddTo {
-			if _, err := addToStmt.Exec(msgID, addr.ToString()); err != nil {
+			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString()); err != nil {
 				return err
 			}
 		}
@@ -545,12 +568,11 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	var noReply, isImportant, isDeflate bool
 	var pid, msgHash []byte
 	var fromAddr, topic, typ, filepath string
-	var addToFromAddr sql.NullString
 	var timeSent float64
 	err := tx.QueryRow(`
-		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, add_to_from, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &addToFromAddr, &topic, &typ, &timeSent, &size, &filepath)
+	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
 	if err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
 	}
@@ -686,18 +708,26 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	}
 	pid = wirePidForLoadedMessage(pid, msgHash, len(allAddTo) > 0)
 
+	// The wire header carries a single add-to-from, so resolve the earliest
+	// batch's sender (preserving the historical first-batch-wins behaviour).
+	// Fall back to the message's own sender for legacy rows with no batch.
 	var addToFrom *FMsgAddress
-	if addToFromAddr.Valid && addToFromAddr.String != "" {
-		addr, err := parseAddress([]byte(addToFromAddr.String))
-		if err != nil {
-			return nil, fmt.Errorf("invalid add_to_from address %s: %w", addToFromAddr.String, err)
+	if len(allAddTo) > 0 {
+		var batchFrom sql.NullString
+		if err := tx.QueryRow(`SELECT add_to_from FROM msg_add_to_batch
+WHERE msg_id = $1 ORDER BY time_added, id LIMIT 1`, msgID).Scan(&batchFrom); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("load add-to batch for msg %d: %w", msgID, err)
 		}
-		addToFrom = addr
-	}
-	if len(allAddTo) > 0 && addToFrom == nil {
-		// Backward-compatibility for older rows before add_to_from existed.
-		fallback := *from
-		addToFrom = &fallback
+		if batchFrom.Valid && batchFrom.String != "" {
+			addr, err := parseAddress([]byte(batchFrom.String))
+			if err != nil {
+				return nil, fmt.Errorf("invalid add_to_from address %s: %w", batchFrom.String, err)
+			}
+			addToFrom = addr
+		} else {
+			fallback := *from
+			addToFrom = &fallback
+		}
 	}
 
 	var flags uint8
