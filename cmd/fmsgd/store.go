@@ -561,75 +561,45 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 	return tx.Commit()
 }
 
-// loadMsg loads a message and all its recipients from the database within the
-// given transaction and returns a fully populated FMsgHeader.
-func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
-	var version, size int
-	var noReply, isImportant, isDeflate bool
-	var pid, msgHash []byte
-	var fromAddr, topic, typ, filepath string
-	var timeSent float64
-	err := tx.QueryRow(`
+// msgFields holds a message's stored columns plus its original recipients and
+// attachments: the raw material for building the message's wire headers. Add-to
+// recipients are NOT included here — they belong to batches (see addToBatch),
+// each of which is delivered as its own add-to message (SPEC §12).
+type msgFields struct {
+	version                         int
+	size                            int
+	noReply, isImportant, isDeflate bool
+	parentPid                       []byte // relational parent hash (stored pid column)
+	storedHash                      []byte // stored sha256; empty when not yet persisted
+	from                            FMsgAddress
+	to                              []FMsgAddress
+	attachments                     []FMsgAttachmentHeader
+	timeSent                        float64
+	topic, typ                      string
+	filepath                        string
+}
+
+// loadMsgFields reads the msg row, its msg_to recipients and its attachments.
+func loadMsgFields(tx *sql.Tx, msgID int64) (*msgFields, error) {
+	var m msgFields
+	var fromAddr string
+	if err := tx.QueryRow(`
 		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&version, &noReply, &isImportant, &isDeflate, &pid, &msgHash, &fromAddr, &topic, &typ, &timeSent, &size, &filepath)
-	if err != nil {
+	`, msgID).Scan(&m.version, &m.noReply, &m.isImportant, &m.isDeflate, &m.parentPid, &m.storedHash,
+		&fromAddr, &m.topic, &m.typ, &m.timeSent, &m.size, &m.filepath); err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
-	}
-
-	recipRows, err := tx.Query(`SELECT addr FROM msg_to WHERE msg_id = $1 ORDER BY id`, msgID)
-	if err != nil {
-		return nil, fmt.Errorf("load recipients for msg %d: %w", msgID, err)
-	}
-	var allRecipientAddrs []string
-	for recipRows.Next() {
-		var a string
-		if err := recipRows.Scan(&a); err != nil {
-			recipRows.Close()
-			return nil, fmt.Errorf("scan recipient addr: %w", err)
-		}
-		allRecipientAddrs = append(allRecipientAddrs, a)
-	}
-	recipRows.Close()
-	if err := recipRows.Err(); err != nil {
-		return nil, fmt.Errorf("recipients query err for msg %d: %w", msgID, err)
 	}
 
 	from, err := parseAddress([]byte(fromAddr))
 	if err != nil {
 		return nil, fmt.Errorf("invalid from address %s: %w", fromAddr, err)
 	}
-	allTo := make([]FMsgAddress, 0, len(allRecipientAddrs))
-	for _, a := range allRecipientAddrs {
-		addr, err := parseAddress([]byte(a))
-		if err != nil {
-			return nil, fmt.Errorf("invalid to address %s: %w", a, err)
-		}
-		allTo = append(allTo, *addr)
-	}
+	m.from = *from
 
-	// load add-to recipients from msg_add_to
-	addToRows, err := tx.Query(`SELECT addr FROM msg_add_to WHERE msg_id = $1 ORDER BY id`, msgID)
+	m.to, err = loadRecipientAddrs(tx, `SELECT addr FROM msg_to WHERE msg_id = $1 ORDER BY id`, msgID)
 	if err != nil {
-		return nil, fmt.Errorf("load add-to recipients for msg %d: %w", msgID, err)
-	}
-	var allAddTo []FMsgAddress
-	for addToRows.Next() {
-		var a string
-		if err := addToRows.Scan(&a); err != nil {
-			addToRows.Close()
-			return nil, fmt.Errorf("scan add-to addr: %w", err)
-		}
-		addr, err := parseAddress([]byte(a))
-		if err != nil {
-			addToRows.Close()
-			return nil, fmt.Errorf("invalid add-to address %s: %w", a, err)
-		}
-		allAddTo = append(allAddTo, *addr)
-	}
-	addToRows.Close()
-	if err := addToRows.Err(); err != nil {
-		return nil, fmt.Errorf("add-to recipients query err for msg %d: %w", msgID, err)
+		return nil, fmt.Errorf("load recipients for msg %d: %w", msgID, err)
 	}
 
 	attRows, err := tx.Query(`
@@ -641,7 +611,7 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load attachments for msg %d: %w", msgID, err)
 	}
-	attachments := []FMsgAttachmentHeader{}
+	m.attachments = []FMsgAttachmentHeader{}
 	for attRows.Next() {
 		var flags, filesize int
 		var typ, filename, filepath string
@@ -649,7 +619,7 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 			attRows.Close()
 			return nil, fmt.Errorf("scan attachment row: %w", err)
 		}
-		attachments = append(attachments, FMsgAttachmentHeader{
+		m.attachments = append(m.attachments, FMsgAttachmentHeader{
 			Flags:    uint8(flags),
 			Type:     typ,
 			Filename: filename,
@@ -661,105 +631,179 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	if err := attRows.Err(); err != nil {
 		return nil, fmt.Errorf("attachments query err for msg %d: %w", msgID, err)
 	}
+	return &m, nil
+}
 
-	// Compute flags bitfield from stored booleans and loaded data.
-	// has_pid and has_add_to are derived from actual data rather than stored,
-	// so add-to recipients added after the original message are included.
-	//
-	// When add-to recipients exist, the wire pid references the message being
-	// shared, not that message's parent. This keeps add-to on replies pointing
-	// at the reply payload rather than the root message.
-	//
-	// If that shared message has no persisted sha256 (e.g. it was delivered
-	// locally only and so never sent over the wire), compute its original-form
-	// message hash now. Without it the add-to wire header would omit the pid
-	// field entirely and be rejected as invalid (SPEC §10.3 step 7, §12).
-	if len(allAddTo) > 0 && len(msgHash) == 0 {
-		origFlags := uint8(0)
-		if noReply {
-			origFlags |= FlagNoReply
+// loadRecipientAddrs runs a single-column address query and parses the results.
+func loadRecipientAddrs(tx *sql.Tx, query string, msgID int64) ([]FMsgAddress, error) {
+	rows, err := tx.Query(query, msgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var addrs []FMsgAddress
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
 		}
-		if isImportant {
-			origFlags |= FlagImportant
-		}
-		if isDeflate {
-			origFlags |= FlagDeflate
-		}
-		if len(pid) > 0 {
-			origFlags |= FlagHasPid
-		}
-		orig := &FMsgHeader{
-			Version:     uint8(version),
-			Flags:       origFlags,
-			Pid:         pid,
-			From:        *from,
-			To:          allTo,
-			Timestamp:   timeSent,
-			Topic:       topic,
-			Type:        typ,
-			Size:        uint32(size),
-			Attachments: attachments,
-			Filepath:    filepath,
-		}
-		msgHash, err = orig.GetMessageHash()
+		addr, err := parseAddress([]byte(a))
 		if err != nil {
-			return nil, fmt.Errorf("compute original message hash for msg %d: %w", msgID, err)
+			return nil, fmt.Errorf("invalid address %s: %w", a, err)
 		}
+		addrs = append(addrs, *addr)
 	}
-	pid = wirePidForLoadedMessage(pid, msgHash, len(allAddTo) > 0)
+	return addrs, rows.Err()
+}
 
-	// The wire header carries a single add-to-from, so resolve the earliest
-	// batch's sender (preserving the historical first-batch-wins behaviour).
-	// Fall back to the message's own sender for legacy rows with no batch.
-	var addToFrom *FMsgAddress
-	if len(allAddTo) > 0 {
-		var batchFrom sql.NullString
-		if err := tx.QueryRow(`SELECT add_to_from FROM msg_add_to_batch
-WHERE msg_id = $1 ORDER BY time_added, id LIMIT 1`, msgID).Scan(&batchFrom); err != nil && err != sql.ErrNoRows {
-			return nil, fmt.Errorf("load add-to batch for msg %d: %w", msgID, err)
-		}
-		if batchFrom.Valid && batchFrom.String != "" {
-			addr, err := parseAddress([]byte(batchFrom.String))
-			if err != nil {
-				return nil, fmt.Errorf("invalid add_to_from address %s: %w", batchFrom.String, err)
-			}
-			addToFrom = addr
-		} else {
-			fallback := *from
-			addToFrom = &fallback
-		}
+// baseFlags returns the persisted flag bits (no_reply/important/deflate) shared
+// by every wire form of the message.
+func (m *msgFields) baseFlags() uint8 {
+	var f uint8
+	if m.noReply {
+		f |= FlagNoReply
 	}
+	if m.isImportant {
+		f |= FlagImportant
+	}
+	if m.isDeflate {
+		f |= FlagDeflate
+	}
+	return f
+}
 
-	var flags uint8
-	if len(pid) > 0 {
+// originalHeader builds the message in its original (non-add-to) wire form,
+// whose pid (if any) references the relational parent.
+func (m *msgFields) originalHeader() *FMsgHeader {
+	flags := m.baseFlags()
+	if len(m.parentPid) > 0 {
 		flags |= FlagHasPid
 	}
-	if len(allAddTo) > 0 {
-		flags |= FlagHasAddTo
+	return &FMsgHeader{
+		Version:     uint8(m.version),
+		Flags:       flags,
+		Pid:         m.parentPid,
+		From:        m.from,
+		To:          m.to,
+		Timestamp:   m.timeSent,
+		Topic:       m.topic,
+		Type:        m.typ,
+		Size:        uint32(m.size),
+		Attachments: m.attachments,
+		Filepath:    m.filepath,
 	}
-	if noReply {
-		flags |= FlagNoReply
+}
+
+// sharedHash returns the canonical hash identifying this message: its persisted
+// sha256, or — when not yet persisted (e.g. local-only delivery) — its
+// original-form message hash. Add-to batches reference this value as their pid
+// (SPEC §12).
+func (m *msgFields) sharedHash() ([]byte, error) {
+	if len(m.storedHash) > 0 {
+		return m.storedHash, nil
 	}
-	if isImportant {
-		flags |= FlagImportant
+	return m.originalHeader().GetMessageHash()
+}
+
+// addToHeader builds the wire header that delivers one add-to batch: a duplicate
+// of the original message carrying this batch's sender, recipients and
+// timestamp, with pid set to the shared message hash (SPEC §12). A fresh header
+// is returned each call so hash caches never cross between batches.
+func (m *msgFields) addToHeader(batch addToBatch, sharedHash []byte) *FMsgHeader {
+	h := m.originalHeader()
+	h.Flags |= FlagHasPid | FlagHasAddTo
+	h.Pid = sharedHash
+	from := batch.From
+	h.AddToFrom = &from
+	h.AddTo = batch.Recipients
+	h.Timestamp = batch.TimeAdded
+	h.Topic = "" // pid is present, so topic is omitted on the wire
+	return h
+}
+
+// addToBatch is one add-to delivery: a single sender added a set of recipients
+// at a point in time (SPEC §12).
+type addToBatch struct {
+	ID         int64
+	From       FMsgAddress
+	TimeAdded  float64
+	Recipients []FMsgAddress
+}
+
+// loadAddToBatches returns every add-to batch for a message, each with its
+// sender, timestamp and recipients, ordered by when it was added.
+func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
+	rows, err := tx.Query(`
+		SELECT b.id, b.add_to_from, b.time_added, a.addr
+		FROM msg_add_to_batch b
+		LEFT JOIN msg_add_to a ON a.batch_id = b.id
+		WHERE b.msg_id = $1
+		ORDER BY b.time_added, b.id, a.id
+	`, msgID)
+	if err != nil {
+		return nil, fmt.Errorf("load add-to batches for msg %d: %w", msgID, err)
 	}
-	if isDeflate {
-		flags |= FlagDeflate
+	defer rows.Close()
+
+	var batches []addToBatch
+	byID := make(map[int64]int) // batch id -> index in batches
+	for rows.Next() {
+		var id int64
+		var fromStr string
+		var timeAdded float64
+		var addr sql.NullString
+		if err := rows.Scan(&id, &fromStr, &timeAdded, &addr); err != nil {
+			return nil, fmt.Errorf("scan add-to batch row: %w", err)
+		}
+		idx, ok := byID[id]
+		if !ok {
+			from, err := parseAddress([]byte(fromStr))
+			if err != nil {
+				return nil, fmt.Errorf("invalid add_to_from address %s: %w", fromStr, err)
+			}
+			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded})
+			idx = len(batches) - 1
+			byID[id] = idx
+		}
+		if addr.Valid {
+			a, err := parseAddress([]byte(addr.String))
+			if err != nil {
+				return nil, fmt.Errorf("invalid add-to address %s: %w", addr.String, err)
+			}
+			batches[idx].Recipients = append(batches[idx].Recipients, *a)
+		}
+	}
+	return batches, rows.Err()
+}
+
+// loadMsg loads a message for inspection (participant and retrievability
+// checks): the original header plus the flat union of every add-to recipient.
+// AddToFrom is deliberately left nil — a stored message may aggregate batches
+// from several senders, and each add_to_from is validated to be in From or To
+// (SPEC §12), so participant checks need only From/To/AddTo. Outgoing delivery
+// never uses this merged form; it builds a separate header per batch.
+func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
+	m, err := loadMsgFields(tx, msgID)
+	if err != nil {
+		return nil, err
 	}
 
-	return &FMsgHeader{
-		Version:     uint8(version),
-		Flags:       flags,
-		Pid:         pid,
-		From:        *from,
-		To:          allTo,
-		AddToFrom:   addToFrom,
-		AddTo:       allAddTo,
-		Timestamp:   timeSent,
-		Topic:       topic,
-		Type:        typ,
-		Size:        uint32(size),
-		Attachments: attachments,
-		Filepath:    filepath,
-	}, nil
+	addTo, err := loadRecipientAddrs(tx, `SELECT addr FROM msg_add_to WHERE msg_id = $1 ORDER BY id`, msgID)
+	if err != nil {
+		return nil, fmt.Errorf("load add-to recipients for msg %d: %w", msgID, err)
+	}
+
+	h := m.originalHeader()
+	if len(addTo) > 0 {
+		// The wire pid of an add-to message references the shared message, not
+		// that message's relational parent (SPEC §12).
+		sharedHash, err := m.sharedHash()
+		if err != nil {
+			return nil, fmt.Errorf("compute shared hash for msg %d: %w", msgID, err)
+		}
+		h.Flags |= FlagHasPid | FlagHasAddTo
+		h.Pid = sharedHash
+		h.AddTo = addTo
+	}
+	return h, nil
 }
