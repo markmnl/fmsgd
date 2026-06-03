@@ -11,7 +11,7 @@
  *
  * Safe to re-run: every step is guarded, so a second run (or a database that
  * already has the new shape) is a no-op. Run msg_add_to_batch's CREATE from
- * dd.sql first if it does not yet exist.
+ * dd.sql first if it does not yet exist
  *
  * Apply with: psql "<conn>" -f temp.sql
  *
