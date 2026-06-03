@@ -160,13 +160,10 @@ func updateRecipient(tx *sql.Tx, table, addr string, msgID int64, now float64, c
 	}
 }
 
-// updateAllLocked applies the same outcome to every locked to and add-to address.
-func updateAllLocked(tx *sql.Tx, lockedAddrs, lockedAddToAddrs []string, msgID int64, now float64, code int, delivered bool) {
-	for _, a := range lockedAddrs {
-		updateRecipient(tx, "msg_to", a, msgID, now, code, delivered)
-	}
-	for _, a := range lockedAddToAddrs {
-		updateRecipient(tx, "msg_add_to", a, msgID, now, code, delivered)
+// updateLocked applies the same outcome to every locked address in one table.
+func updateLocked(tx *sql.Tx, table string, addrs []string, msgID int64, now float64, code int, delivered bool) {
+	for _, a := range addrs {
+		updateRecipient(tx, table, a, msgID, now, code, delivered)
 	}
 }
 
@@ -179,38 +176,142 @@ func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
 	}
 }
 
-func recordRetryableFailure(tx *sql.Tx, committed *bool, lockedAddrs, lockedAddToAddrs []string, msgID int64) {
+// recordRetryableFailure marks one delivery unit's locked recipients for retry.
+func recordRetryableFailure(tx *sql.Tx, committed *bool, table string, locked []string, msgID int64) {
 	now := timeutil.TimestampNow().Float64()
-	updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, msgID, now, localResponseCodeNoResponse, false)
+	updateLocked(tx, table, locked, msgID, now, localResponseCodeNoResponse, false)
 	commitOrLog(tx, committed, msgID)
 }
 
-// deliverMessage handles delivery of a single message to a single remote domain.
-//
-// It manages its own database transaction with the following lifecycle:
-//   - Locks the pending msg_to rows for this (message, domain) via FOR UPDATE SKIP LOCKED.
-//   - Loads the full message including ALL recipients (for the original wire header).
-//   - Sends the complete original message to the remote host.
-//   - On success: updates time_delivered + response_code, commits.
-//   - On rejection (got response code): updates response_code + time_last_attempt, commits.
-//   - On early delivery error: records a retryable failure, commits, and backs off.
+// deflatePart is one compressed payload (message body or attachment).
+type deflatePart struct {
+	path     string
+	size     uint32
+	expanded uint32
+}
+
+// deflateState captures the result of compressing a message's body and
+// attachments once, so the same compressed payload can be applied to every
+// outgoing wire header — the original message and each add-to batch share the
+// shared message data (SPEC §12).
+type deflateState struct {
+	body     deflatePart
+	bodyUsed bool
+	atts     []deflatePart
+	cleanup  []string // temp files to remove once delivery completes
+}
+
+// computeDeflate compresses the message body and each attachment of m where
+// worthwhile. Apply the result to a unit header with applyTo; remove its temp
+// files with removeTempFiles after delivery.
+func computeDeflate(m *msgFields, msgID int64) deflateState {
+	var d deflateState
+	d.atts = make([]deflatePart, len(m.attachments))
+
+	if shouldCompress(m.typ, uint32(m.size)) {
+		dp, cs, ok, derr := tryCompress(m.filepath, uint32(m.size))
+		if derr != nil {
+			log.Printf("WARN: sender: compress msg data for msg %d: %s", msgID, derr)
+		} else if ok {
+			log.Printf("INFO: sender: compressed msg %d data: %d -> %d bytes", msgID, m.size, cs)
+			d.body = deflatePart{path: dp, size: cs, expanded: uint32(m.size)}
+			d.bodyUsed = true
+			d.cleanup = append(d.cleanup, dp)
+		}
+	}
+	for i := range m.attachments {
+		att := m.attachments[i]
+		if !shouldCompress(att.Type, att.Size) {
+			continue
+		}
+		dp, cs, ok, derr := tryCompress(att.Filepath, att.Size)
+		if derr != nil {
+			log.Printf("WARN: sender: compress attachment %s for msg %d: %s", att.Filename, msgID, derr)
+		} else if ok {
+			log.Printf("INFO: sender: compressed msg %d attachment %s: %d -> %d bytes", msgID, att.Filename, att.Size, cs)
+			d.atts[i] = deflatePart{path: dp, size: cs, expanded: att.Size}
+			d.cleanup = append(d.cleanup, dp)
+		}
+	}
+	return d
+}
+
+// applyTo rewrites h's body and attachment fields to send the compressed
+// payloads, setting the corresponding deflate flags.
+func (d deflateState) applyTo(h *FMsgHeader) {
+	if d.bodyUsed {
+		h.Filepath = d.body.path
+		h.ExpandedSize = d.body.expanded
+		h.Size = d.body.size
+		h.Flags |= FlagDeflate
+	}
+	for i := range h.Attachments {
+		if i >= len(d.atts) || d.atts[i].path == "" {
+			continue
+		}
+		h.Attachments[i].Filepath = d.atts[i].path
+		h.Attachments[i].ExpandedSize = d.atts[i].expanded
+		h.Attachments[i].Size = d.atts[i].size
+		h.Attachments[i].Flags |= 1 << 1
+	}
+}
+
+// removeTempFiles deletes the compression temp files.
+func (d deflateState) removeTempFiles() {
+	for _, p := range d.cleanup {
+		_ = os.Remove(p)
+	}
+}
+
+// lockPendingRecipients locks (FOR UPDATE SKIP LOCKED) the undelivered,
+// retryable rows in `table` for one message on `domain`, returning the locked
+// addresses. For msg_add_to it locks only rows in batchID, so each add-to batch
+// is delivered as an independent unit.
+func lockPendingRecipients(tx *sql.Tx, table string, msgID int64, domain string, batchID int64, now float64) ([]string, error) {
+	q := fmt.Sprintf(`
+		SELECT r.addr
+		FROM %s r
+		INNER JOIN msg m ON m.id = r.msg_id
+		WHERE r.msg_id = $1
+		  AND r.time_delivered IS NULL
+		  AND m.time_sent IS NOT NULL
+		  AND (r.response_code IS NULL OR r.response_code = ANY($5))
+		  AND (r.time_last_attempt IS NULL OR ($2 - r.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(r.attempt_count - 1, 0)::float), $4))
+		  AND ($2 - m.time_sent) < $4`, table)
+	args := []interface{}{msgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes)}
+	if table == "msg_add_to" {
+		q += " AND r.batch_id = $6"
+		args = append(args, batchID)
+	}
+	q += " FOR UPDATE OF r SKIP LOCKED"
+
+	rows, err := tx.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var locked []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		lastAt := strings.LastIndex(addr, "@")
+		if lastAt != -1 && strings.EqualFold(addr[lastAt+1:], domain) {
+			locked = append(locked, addr)
+		}
+	}
+	return locked, rows.Err()
+}
+
+// deliverMessage delivers a message to a single remote domain. A stored message
+// is several wire messages: the original message (its msg_to recipients) plus
+// one add-to message per batch — each batch was added by a single sender at a
+// point in time and MUST be delivered under that sender (SPEC §12). Each unit is
+// sent over its own connection in its own transaction by deliverUnit.
 func deliverMessage(target pendingTarget) {
 	if strings.EqualFold(target.Domain, Domain) {
-		// local domain — mark as delivered rather than sending remotely
-		db, err := sql.Open("postgres", "")
-		if err != nil {
-			log.Printf("ERROR: sender: db open for local delivery: %s", err)
-			return
-		}
-		defer db.Close()
-		now := timeutil.TimestampNow().Float64()
-		if _, err := db.Exec(`
-			UPDATE msg_to SET time_delivered = $1, response_code = 200
-			WHERE msg_id = $2 AND time_delivered IS NULL
-			  AND lower(split_part(addr, '@', 3)) = lower($3)
-		`, now, target.MsgID, target.Domain); err != nil {
-			log.Printf("ERROR: sender: marking local recipients delivered for msg %d: %s", target.MsgID, err)
-		}
+		markLocalDelivered(target)
 		return
 	}
 
@@ -221,6 +322,99 @@ func deliverMessage(target pendingTarget) {
 	}
 	defer db.Close()
 
+	// Load the message fields and its add-to batches (read-only).
+	rtx, err := db.Begin()
+	if err != nil {
+		log.Printf("ERROR: sender: begin read tx: %s", err)
+		return
+	}
+	m, err := loadMsgFields(rtx, target.MsgID)
+	if err != nil {
+		log.Printf("ERROR: sender: %s", err)
+		rtx.Rollback()
+		return
+	}
+	batches, err := loadAddToBatches(rtx, target.MsgID)
+	if err != nil {
+		log.Printf("ERROR: sender: %s", err)
+		rtx.Rollback()
+		return
+	}
+	sharedHash, err := m.sharedHash()
+	if err != nil {
+		log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
+		rtx.Rollback()
+		return
+	}
+	rtx.Rollback()
+
+	// Persist the shared hash (so replies/add-to referencing this message
+	// resolve) and link any pending children — once for the whole message.
+	if err := ensureSharedHash(db, target.MsgID, sharedHash); err != nil {
+		log.Printf("ERROR: sender: %s", err)
+		return
+	}
+
+	// Compress the shared payload once; every unit header reuses it.
+	d := computeDeflate(m, target.MsgID)
+	defer d.removeTempFiles()
+
+	// Deliver the original message to its pending msg_to recipients.
+	orig := m.originalHeader()
+	d.applyTo(orig)
+	deliverUnit(db, target, orig, "msg_to", 0)
+
+	// Deliver each add-to batch as its own add-to message (one sender each).
+	for _, b := range batches {
+		h := m.addToHeader(b, sharedHash)
+		d.applyTo(h)
+		deliverUnit(db, target, h, "msg_add_to", b.ID)
+	}
+}
+
+// markLocalDelivered marks a message's local-domain msg_to recipients delivered
+// rather than sending over the network. (findPendingTargets skips the local
+// domain, so this is a defensive path.)
+func markLocalDelivered(target pendingTarget) {
+	db, err := sql.Open("postgres", "")
+	if err != nil {
+		log.Printf("ERROR: sender: db open for local delivery: %s", err)
+		return
+	}
+	defer db.Close()
+	now := timeutil.TimestampNow().Float64()
+	if _, err := db.Exec(`
+		UPDATE msg_to SET time_delivered = $1, response_code = 200
+		WHERE msg_id = $2 AND time_delivered IS NULL
+		  AND lower(split_part(addr, '@', 3)) = lower($3)
+	`, now, target.MsgID, target.Domain); err != nil {
+		log.Printf("ERROR: sender: marking local recipients delivered for msg %d: %s", target.MsgID, err)
+	}
+}
+
+// ensureSharedHash persists the message's canonical hash when not yet stored and
+// resolves any pending child (reply/add-to) links that reference it.
+func ensureSharedHash(db *sql.DB, msgID int64, sharedHash []byte) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`, sharedHash, msgID); err != nil {
+		return fmt.Errorf("storing sha256 for msg %d: %w", msgID, err)
+	}
+	if err := resolvePendingChildLinks(txParentLinkStore{tx: tx}, msgID, sharedHash); err != nil {
+		return fmt.Errorf("resolving child pids for msg %d: %w", msgID, err)
+	}
+	return tx.Commit()
+}
+
+// deliverUnit sends one wire message — the original message or a single add-to
+// batch — to target.Domain over its own connection, recording per-recipient
+// outcomes. It owns its transaction: it locks this unit's pending recipients in
+// `table` (msg_add_to rows restricted to batchID; batchID is 0 for the original
+// message) and marks them for retry on early failure.
+func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, batchID int64) {
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("ERROR: sender: begin tx: %s", err)
@@ -234,198 +428,52 @@ func deliverMessage(target pendingTarget) {
 	}()
 
 	now := timeutil.TimestampNow().Float64()
-
-	// Lock pending (undelivered, retryable) msg_to rows for this message
-	// on the target domain. SKIP LOCKED avoids blocking concurrent senders.
-	lockRows, err := tx.Query(`
-		SELECT mt.addr
-		FROM msg_to mt
-		INNER JOIN msg m ON m.id = mt.msg_id
-		WHERE mt.msg_id = $1
-		  AND mt.time_delivered IS NULL
-		  AND m.time_sent IS NOT NULL
-		  AND (mt.response_code IS NULL OR mt.response_code = ANY($5))
-		  AND (mt.time_last_attempt IS NULL OR ($2 - mt.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mt.attempt_count - 1, 0)::float), $4))
-		  AND ($2 - m.time_sent) < $4
-		FOR UPDATE OF mt SKIP LOCKED
-	`, target.MsgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
+	locked, err := lockPendingRecipients(tx, table, target.MsgID, target.Domain, batchID, now)
 	if err != nil {
-		log.Printf("ERROR: sender: lock rows for msg %d: %s", target.MsgID, err)
+		log.Printf("ERROR: sender: lock %s rows for msg %d: %s", table, target.MsgID, err)
 		return
 	}
-
-	var lockedAddrs []string
-	for lockRows.Next() {
-		var addr string
-		if err := lockRows.Scan(&addr); err != nil {
-			lockRows.Close()
-			log.Printf("ERROR: sender: scan locked addr: %s", err)
-			return
-		}
-		lastAt := strings.LastIndex(addr, "@")
-		if lastAt != -1 && strings.EqualFold(addr[lastAt+1:], target.Domain) {
-			lockedAddrs = append(lockedAddrs, addr)
-		}
-	}
-	lockRows.Close()
-	if err := lockRows.Err(); err != nil {
-		log.Printf("ERROR: sender: lock rows err for msg %d: %s", target.MsgID, err)
-		return
-	}
-
-	// Also lock pending msg_add_to rows for this message on the target domain.
-	lockAddToRows, err := tx.Query(`
-		SELECT mat.addr
-		FROM msg_add_to mat
-		INNER JOIN msg m ON m.id = mat.msg_id
-		WHERE mat.msg_id = $1
-		  AND mat.time_delivered IS NULL
-		  AND m.time_sent IS NOT NULL
-		  AND (mat.response_code IS NULL OR mat.response_code = ANY($5))
-		  AND (mat.time_last_attempt IS NULL OR ($2 - mat.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $4))
-		  AND ($2 - m.time_sent) < $4
-		FOR UPDATE OF mat SKIP LOCKED
-	`, target.MsgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
-	if err != nil {
-		log.Printf("ERROR: sender: lock add-to rows for msg %d: %s", target.MsgID, err)
-		return
-	}
-
-	var lockedAddToAddrs []string
-	for lockAddToRows.Next() {
-		var addr string
-		if err := lockAddToRows.Scan(&addr); err != nil {
-			lockAddToRows.Close()
-			log.Printf("ERROR: sender: scan locked add-to addr: %s", err)
-			return
-		}
-		lastAt := strings.LastIndex(addr, "@")
-		if lastAt != -1 && strings.EqualFold(addr[lastAt+1:], target.Domain) {
-			lockedAddToAddrs = append(lockedAddToAddrs, addr)
-		}
-	}
-	lockAddToRows.Close()
-	if err := lockAddToRows.Err(); err != nil {
-		log.Printf("ERROR: sender: lock add-to rows err for msg %d: %s", target.MsgID, err)
-		return
-	}
-
-	if len(lockedAddrs) == 0 && len(lockedAddToAddrs) == 0 {
-		return // already locked by another sender or no longer eligible
+	if len(locked) == 0 {
+		return // nothing pending for this unit (or locked by another sender)
 	}
 
 	deferRetry := true
 	defer func() {
 		if deferRetry && !committed {
-			recordRetryableFailure(tx, &committed, lockedAddrs, lockedAddToAddrs, target.MsgID)
+			recordRetryableFailure(tx, &committed, table, locked, target.MsgID)
 		}
 	}()
 
-	// Load the full message from msg table
-	h, err := loadMsg(tx, target.MsgID)
-	if err != nil {
-		log.Printf("ERROR: sender: %s", err)
-		return
-	}
-
-	// Try zlib-deflate compression for message data and attachment data.
-	// Compressed temp files are cleaned up after delivery completes.
-	var deflateCleanup []string
-	defer func() {
-		for _, p := range deflateCleanup {
-			_ = os.Remove(p)
-		}
-	}()
-	if shouldCompress(h.Type, h.Size) {
-		dp, cs, ok, derr := tryCompress(h.Filepath, h.Size)
-		if derr != nil {
-			log.Printf("WARN: sender: compress msg data for msg %d: %s", target.MsgID, derr)
-		} else if ok {
-			log.Printf("INFO: sender: compressed msg %d data: %d -> %d bytes", target.MsgID, h.Size, cs)
-			deflateCleanup = append(deflateCleanup, dp)
-			h.Filepath = dp
-			h.ExpandedSize = h.Size
-			h.Size = cs
-			h.Flags |= FlagDeflate
-		}
-	}
-	for i := range h.Attachments {
-		att := &h.Attachments[i]
-		if shouldCompress(att.Type, att.Size) {
-			dp, cs, ok, derr := tryCompress(att.Filepath, att.Size)
-			if derr != nil {
-				log.Printf("WARN: sender: compress attachment %s for msg %d: %s", att.Filename, target.MsgID, derr)
-			} else if ok {
-				log.Printf("INFO: sender: compressed msg %d attachment %s: %d -> %d bytes", target.MsgID, att.Filename, att.Size, cs)
-				deflateCleanup = append(deflateCleanup, dp)
-				att.Filepath = dp
-				att.ExpandedSize = att.Size
-				att.Size = cs
-				att.Flags |= 1 << 1
-			}
-		}
-	}
-
-	// Ensure sha256 is populated for this message so future pid lookups
-	// (e.g. add-to notifications or replies referencing it) can find it.
-	var msgHash []byte
-	msgHash, err = canonicalMsgHash(h)
-	if err != nil {
-		log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
-		return
-	}
-	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`,
-		msgHash, target.MsgID); err != nil {
-		log.Printf("ERROR: sender: storing sha256 for msg %d: %s", target.MsgID, err)
-		return
-	}
-	if err := resolvePendingChildLinks(txParentLinkStore{tx: tx}, target.MsgID, msgHash); err != nil {
-		log.Printf("ERROR: sender: resolving child pids for msg %d: %s", target.MsgID, err)
-		return
-	}
-
-	// Compute header hash now; registerOutgoing with Host B's IP happens after
-	// the connection is established (IP needed for challenge validation §10.5).
-	hash := h.GetHeaderHash()
-	hashArr := *(*[32]byte)(hash)
-
-	// Build the list of recipients on the target domain in to then add-to order.
-	// Per spec, per-recipient response codes follow the same order.
-	lockedSet := make(map[string]bool)
-	for _, a := range lockedAddrs {
-		lockedSet[strings.ToLower(a)] = true
-	}
-	for _, a := range lockedAddToAddrs {
+	// Per-recipient response codes arrive in to-field order then add-to order
+	// (SPEC §10.2 step 6). Only this unit's locked recipients are recorded; the
+	// recipients carried only to reconstruct that ordering stay unlocked.
+	lockedSet := make(map[string]bool, len(locked))
+	for _, a := range locked {
 		lockedSet[strings.ToLower(a)] = true
 	}
 	type domainRecip struct {
 		addr     string
 		isLocked bool
-		isAddTo  bool
 	}
 	var domainRecips []domainRecip
-	for _, addr := range h.To {
-		if strings.EqualFold(addr.Domain, target.Domain) {
+	appendDomain := func(addrs []FMsgAddress) {
+		for _, addr := range addrs {
+			if !strings.EqualFold(addr.Domain, target.Domain) {
+				continue
+			}
 			s := addr.ToString()
-			domainRecips = append(domainRecips, domainRecip{
-				addr:     s,
-				isLocked: lockedSet[strings.ToLower(s)],
-				isAddTo:  false,
-			})
+			domainRecips = append(domainRecips, domainRecip{addr: s, isLocked: lockedSet[strings.ToLower(s)]})
 		}
 	}
-	for _, addr := range h.AddTo {
-		if strings.EqualFold(addr.Domain, target.Domain) {
-			s := addr.ToString()
-			domainRecips = append(domainRecips, domainRecip{
-				addr:     s,
-				isLocked: lockedSet[strings.ToLower(s)],
-				isAddTo:  true,
-			})
-		}
+	appendDomain(h.To)
+	if h.Flags&FlagHasAddTo != 0 {
+		appendDomain(h.AddTo)
 	}
 
 	// --- network delivery ---
+
+	hash := h.GetHeaderHash()
+	hashArr := *(*[32]byte)(hash)
 
 	targetIPs, err := lookupAuthorisedIPs(target.Domain)
 	if err != nil {
@@ -494,7 +542,7 @@ func deliverMessage(target pendingTarget) {
 			return
 		}
 		log.Printf("INFO: sender: msg %d add-to accepted by %s (code 11)", target.MsgID, target.Domain)
-		updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), true)
+		updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), true)
 		deferRetry = false
 		commitOrLog(tx, &committed, target.MsgID)
 		return
@@ -503,7 +551,7 @@ func deliverMessage(target pendingTarget) {
 			// global rejection
 			log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 				target.MsgID, target.Domain, responseCodeName(initCode[0]), initCode[0])
-			updateAllLocked(tx, lockedAddrs, lockedAddToAddrs, target.MsgID, now, int(initCode[0]), false)
+			updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), false)
 			deferRetry = false
 			commitOrLog(tx, &committed, target.MsgID)
 		} else {
@@ -529,10 +577,6 @@ func deliverMessage(target pendingTarget) {
 			continue
 		}
 		c := codes[i]
-		table := "msg_to"
-		if dr.isAddTo {
-			table = "msg_add_to"
-		}
 		delivered := c == RejectCodeAccept
 		if delivered {
 			log.Printf("INFO: sender: delivered msg %d to %s", target.MsgID, dr.addr)
