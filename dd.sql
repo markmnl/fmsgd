@@ -220,3 +220,36 @@ create constraint trigger trg_new_msg
     after insert or update on msg
     deferrable initially deferred
     for each row execute function notify_new_msg();
+
+-- Notify the sender (channel delivered) once a recipient's delivery is
+-- confirmed, so the sender's UI can unlock replying without a manual reload.
+-- Fires on the NULL -> non-NULL transition of time_delivered, which happens
+-- once per recipient row regardless of who performs the UPDATE (fmsgd's own
+-- remote delivery, its local-domain delivery, or fmsg-webapi's same-domain
+-- delivery) -- triggering on the tables rather than the call site covers all
+-- of them. Payload is "<msg id>,<from_addr>", the same shape as new_msg's
+-- payload but with the sender's address instead of the recipient's, since
+-- it's the sender whose UI needs to react. Unlike trg_new_msg this does not
+-- need to be deferred: the msg row referenced by msg_id already exists (FK)
+-- by the time msg_to/msg_add_to is updated.
+create or replace function notify_delivered() returns trigger as $$
+begin
+    perform pg_notify('delivered', NEW.msg_id::text || ',' || m.from_addr)
+    from msg m where m.id = NEW.msg_id;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_to_delivered on msg_to;
+create trigger trg_msg_to_delivered
+    after update of time_delivered on msg_to
+    for each row
+    when (OLD.time_delivered is null and NEW.time_delivered is not null)
+    execute function notify_delivered();
+
+drop trigger if exists trg_msg_add_to_delivered on msg_add_to;
+create trigger trg_msg_add_to_delivered
+    after update of time_delivered on msg_add_to
+    for each row
+    when (OLD.time_delivered is null and NEW.time_delivered is not null)
+    execute function notify_delivered();
