@@ -620,3 +620,30 @@ func TestReadAttachmentHeadersRejectsExpandedSizeExceedsMax(t *testing.T) {
 		t.Fatalf("expected reject code %d, got %v", RejectCodeTooBig, got)
 	}
 }
+
+func TestHandleAddToParentNotStoredWithLocalRecipient(t *testing.T) {
+	c := &testConn{}
+	h := &FMsgHeader{}
+	got, err := handleAddToParentNotStored(c, h, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.InitialResponseCode != AcceptCodeContinue {
+		t.Fatalf("InitialResponseCode = %d, want %d (continue)", got.InitialResponseCode, AcceptCodeContinue)
+	}
+	if c.Buffer.Len() != 0 {
+		t.Fatalf("unexpected bytes written: %v", c.Buffer.Bytes())
+	}
+}
+
+func TestHandleAddToParentNotStoredParticipantOnly(t *testing.T) {
+	c := &testConn{}
+	h := &FMsgHeader{}
+	_, err := handleAddToParentNotStored(c, h, false)
+	if err == nil {
+		t.Fatal("expected error for participant-only add-to without stored parent")
+	}
+	if got := c.Buffer.Bytes(); len(got) != 1 || got[0] != RejectCodeParentNotFound {
+		t.Fatalf("wrote %v, want single code %d (parent not found)", got, RejectCodeParentNotFound)
+	}
+}

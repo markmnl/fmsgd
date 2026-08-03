@@ -57,7 +57,9 @@ func findPendingTargets() ([]pendingTarget, error) {
 
 	now := timeutil.TimestampNow().Float64()
 
-	// query both msg_to and msg_add_to for pending targets
+	// query both msg_to and msg_add_to for pending targets; add-to rows age
+	// against their batch, not the message — recipients may be added long
+	// after the message was sent
 	rows, err := db.Query(`
 		SELECT mt.msg_id, mt.addr
 		FROM msg_to mt
@@ -71,11 +73,12 @@ func findPendingTargets() ([]pendingTarget, error) {
 		SELECT mat.msg_id, mat.addr
 		FROM msg_add_to mat
 		INNER JOIN msg m ON m.id = mat.msg_id
+		INNER JOIN msg_add_to_batch b ON b.id = mat.batch_id
 		WHERE mat.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
 		  AND (mat.response_code IS NULL OR mat.response_code = ANY($4))
 		  AND (mat.time_last_attempt IS NULL OR ($1 - mat.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(mat.attempt_count - 1, 0)::float), $3))
-		  AND ($1 - m.time_sent) < $3
+		  AND ($1 - b.time_added) < $3
 	`, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
 	if err != nil {
 		return nil, err
@@ -88,6 +91,16 @@ func findPendingTargets() ([]pendingTarget, error) {
 	}
 	seen := make(map[key]bool)
 	var targets []pendingTarget
+	addTarget := func(msgID int64, domain string) {
+		if strings.EqualFold(domain, Domain) {
+			return // local domain — no remote delivery needed
+		}
+		k := key{msgID, strings.ToLower(domain)}
+		if !seen[k] {
+			seen[k] = true
+			targets = append(targets, pendingTarget{MsgID: msgID, Domain: domain})
+		}
+	}
 
 	for rows.Next() {
 		var msgID int64
@@ -99,17 +112,39 @@ func findPendingTargets() ([]pendingTarget, error) {
 		if lastAt == -1 {
 			continue
 		}
-		domain := addr[lastAt+1:]
-		if strings.EqualFold(domain, Domain) {
-			continue // local domain — no remote delivery needed
-		}
-		k := key{msgID, domain}
-		if !seen[k] {
-			seen[k] = true
-			targets = append(targets, pendingTarget{MsgID: msgID, Domain: domain})
-		}
+		addTarget(msgID, addr[lastAt+1:])
 	}
-	return targets, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Participant domains pending add-to notification (SPEC §10.2): domains
+	// hosting no recipient of a batch still receive the batch's add-to message
+	// so all participants learn recipients were added.
+	nrows, err := db.Query(`
+		SELECT b.msg_id, n.domain
+		FROM msg_add_to_notify n
+		INNER JOIN msg_add_to_batch b ON b.id = n.batch_id
+		INNER JOIN msg m ON m.id = b.msg_id
+		WHERE n.time_notified IS NULL
+		  AND m.time_sent IS NOT NULL
+		  AND (n.response_code IS NULL OR n.response_code = ANY($4))
+		  AND (n.time_last_attempt IS NULL OR ($1 - n.time_last_attempt) > LEAST($2 * POWER(2.0, GREATEST(n.attempt_count - 1, 0)::float), $3))
+		  AND ($1 - b.time_added) < $3
+	`, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes))
+	if err != nil {
+		return nil, err
+	}
+	defer nrows.Close()
+	for nrows.Next() {
+		var msgID int64
+		var domain string
+		if err := nrows.Scan(&msgID, &domain); err != nil {
+			return nil, err
+		}
+		addTarget(msgID, domain)
+	}
+	return targets, nrows.Err()
 }
 
 // sendMsgData transmits the message body then all attachment payloads on conn.
@@ -176,11 +211,68 @@ func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
 	}
 }
 
-// recordRetryableFailure marks one delivery unit's locked recipients for retry.
-func recordRetryableFailure(tx *sql.Tx, committed *bool, table string, locked []string, msgID int64) {
+// recordRetryableFailure marks one delivery unit's locked recipients and
+// locked notify row (if any) for retry.
+func recordRetryableFailure(tx *sql.Tx, committed *bool, table string, locked []string, msgID int64, notifyID int64) {
 	now := timeutil.TimestampNow().Float64()
 	updateLocked(tx, table, locked, msgID, now, localResponseCodeNoResponse, false)
+	updateNotify(tx, notifyID, now, localResponseCodeNoResponse, false)
 	commitOrLog(tx, committed, msgID)
+}
+
+// lockPendingNotify locks (FOR UPDATE SKIP LOCKED) the pending
+// msg_add_to_notify row for one batch and domain, returning its id — 0 when
+// none is pending or another sender holds it. A notify row is a participant
+// domain owed the batch's add-to message even though it hosts none of the
+// batch's recipients (SPEC §10.2).
+func lockPendingNotify(tx *sql.Tx, batchID int64, domain string, now float64) (int64, error) {
+	if batchID == 0 {
+		return 0, nil
+	}
+	var id int64
+	err := tx.QueryRow(`
+		SELECT n.id
+		FROM msg_add_to_notify n
+		INNER JOIN msg_add_to_batch b ON b.id = n.batch_id
+		INNER JOIN msg m ON m.id = b.msg_id
+		WHERE n.batch_id = $1
+		  AND lower(n.domain) = lower($2)
+		  AND n.time_notified IS NULL
+		  AND m.time_sent IS NOT NULL
+		  AND (n.response_code IS NULL OR n.response_code = ANY($6))
+		  AND (n.time_last_attempt IS NULL OR ($3 - n.time_last_attempt) > LEAST($4 * POWER(2.0, GREATEST(n.attempt_count - 1, 0)::float), $5))
+		  AND ($3 - b.time_added) < $5
+		FOR UPDATE OF n SKIP LOCKED
+	`, batchID, domain, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes)).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}
+
+// updateNotify records a notification outcome for one msg_add_to_notify row.
+// notifyID 0 is a no-op so callers need not branch on whether the unit
+// carried a notify row.
+func updateNotify(tx *sql.Tx, notifyID int64, now float64, code int, notified bool) {
+	if notifyID == 0 {
+		return
+	}
+	var err error
+	if notified {
+		_, err = tx.Exec(`
+			UPDATE msg_add_to_notify SET time_notified = $1, response_code = $2
+			WHERE id = $3
+		`, now, code, notifyID)
+	} else {
+		_, err = tx.Exec(`
+			UPDATE msg_add_to_notify SET time_last_attempt = $1, response_code = $2,
+			                             attempt_count = attempt_count + 1
+			WHERE id = $3
+		`, now, code, notifyID)
+	}
+	if err != nil {
+		log.Printf("ERROR: sender: update notify row %d: %s", notifyID, err)
+	}
 }
 
 // deflatePart is one compressed payload (message body or attachment).
@@ -268,16 +360,25 @@ func (d deflateState) removeTempFiles() {
 // addresses. For msg_add_to it locks only rows in batchID, so each add-to batch
 // is delivered as an independent unit.
 func lockPendingRecipients(tx *sql.Tx, table string, msgID int64, domain string, batchID int64, now float64) ([]string, error) {
+	// msg_add_to rows age against their batch, not the message — recipients
+	// may be added long after the message was sent.
+	ageRef := "m.time_sent"
+	joinBatch := ""
+	if table == "msg_add_to" {
+		ageRef = "b.time_added"
+		joinBatch = "INNER JOIN msg_add_to_batch b ON b.id = r.batch_id"
+	}
 	q := fmt.Sprintf(`
 		SELECT r.addr
 		FROM %s r
 		INNER JOIN msg m ON m.id = r.msg_id
+		%s
 		WHERE r.msg_id = $1
 		  AND r.time_delivered IS NULL
 		  AND m.time_sent IS NOT NULL
 		  AND (r.response_code IS NULL OR r.response_code = ANY($5))
 		  AND (r.time_last_attempt IS NULL OR ($2 - r.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(r.attempt_count - 1, 0)::float), $4))
-		  AND ($2 - m.time_sent) < $4`, table)
+		  AND ($2 - %s) < $4`, table, joinBatch, ageRef)
 	args := []interface{}{msgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes)}
 	if table == "msg_add_to" {
 		q += " AND r.batch_id = $6"
@@ -366,6 +467,9 @@ func deliverMessage(target pendingTarget) {
 
 	// Deliver each add-to batch as its own add-to message (one sender each).
 	for _, b := range batches {
+		if len(b.Recipients) == 0 {
+			continue // degenerate batch; an add-to message needs ≥ 1 recipient
+		}
 		h := m.addToHeader(b, sharedHash)
 		d.applyTo(h)
 		deliverUnit(db, target, h, "msg_add_to", b.ID)
@@ -433,14 +537,24 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		log.Printf("ERROR: sender: lock %s rows for msg %d: %s", table, target.MsgID, err)
 		return
 	}
-	if len(locked) == 0 {
+	// An add-to unit may be owed to this domain as a participant notification
+	// even when it hosts none of the batch's recipients (SPEC §10.2).
+	var notifyID int64
+	if table == "msg_add_to" {
+		notifyID, err = lockPendingNotify(tx, batchID, target.Domain, now)
+		if err != nil {
+			log.Printf("ERROR: sender: lock notify row for batch %d: %s", batchID, err)
+			return
+		}
+	}
+	if len(locked) == 0 && notifyID == 0 {
 		return // nothing pending for this unit (or locked by another sender)
 	}
 
 	deferRetry := true
 	defer func() {
 		if deferRetry && !committed {
-			recordRetryableFailure(tx, &committed, table, locked, target.MsgID)
+			recordRetryableFailure(tx, &committed, table, locked, target.MsgID, notifyID)
 		}
 	}()
 
@@ -543,6 +657,7 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		}
 		log.Printf("INFO: sender: msg %d add-to accepted by %s (code 11)", target.MsgID, target.Domain)
 		updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), true)
+		updateNotify(tx, notifyID, now, int(initCode[0]), true)
 		deferRetry = false
 		commitOrLog(tx, &committed, target.MsgID)
 		return
@@ -552,6 +667,7 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 			log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 				target.MsgID, target.Domain, responseCodeName(initCode[0]), initCode[0])
 			updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), false)
+			updateNotify(tx, notifyID, now, int(initCode[0]), false)
 			deferRetry = false
 			commitOrLog(tx, &committed, target.MsgID)
 		} else {
@@ -585,6 +701,10 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		}
 		updateRecipient(tx, table, dr.addr, target.MsgID, now, int(c), delivered)
 	}
+
+	// The exchange completed, so a locked notify row is satisfied too: the
+	// domain was informed of the batch through this delivery.
+	updateNotify(tx, notifyID, now, int(initCode[0]), true)
 
 	deferRetry = false
 	commitOrLog(tx, &committed, target.MsgID)

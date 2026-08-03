@@ -253,3 +253,79 @@ create trigger trg_msg_add_to_delivered
     for each row
     when (OLD.time_delivered is null and NEW.time_delivered is not null)
     execute function notify_delivered();
+
+-- Sender-side state for add-to participant notification (SPEC §10.2): an
+-- add-to message is sent to every participant domain of the message being
+-- added to -- the domains of from and every to address as well as the new
+-- recipients' -- so all participants learn recipients were added, not only
+-- the domains hosting the new recipients. Domains hosting a recipient of the
+-- batch itself learn through normal recipient delivery; every other
+-- participant domain gets one row here per batch and receives the add-to as
+-- a notification-only exchange completing at code 11. Rows are created by
+-- the Web API when recipients are added through it (the local domain itself
+-- needs no row -- this database is its record).
+create table if not exists msg_add_to_notify (
+    id                bigserial        primary key,
+    batch_id          bigint           not null references msg_add_to_batch (id),
+    domain            varchar(255)     not null,
+    time_notified     double precision,   -- time remote host acknowledged the batch; null means pending
+    time_last_attempt double precision,   -- time of last failed attempt; drives exponential back-off
+    response_code     smallint,           -- response code of last attempt
+    attempt_count     int              not null default 0,
+    unique (batch_id, domain)
+);
+
+-- Wake the sender's outgoing worker (channel new_msg_to) for a pending
+-- participant notification, mirroring notify_msg_sent for recipient rows.
+-- The payload is advisory only: the worker re-polls fully on any wake-up.
+create or replace function notify_add_to_notify_pending() returns trigger as $$
+begin
+    perform pg_notify('new_msg_to', b.msg_id::text || ',' || NEW.domain)
+    from msg_add_to_batch b
+    inner join msg m on m.id = b.msg_id
+    where b.id = NEW.batch_id and m.time_sent is not null;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_add_to_notify_insert on msg_add_to_notify;
+create trigger trg_msg_add_to_notify_insert
+    after insert on msg_add_to_notify
+    for each row execute function notify_add_to_notify_pending();
+
+-- Notify listeners (channel recipients_added) that an add-to batch was
+-- recorded against a sent message, so existing participants' clients learn of
+-- the new recipients without polling. Fires wherever a batch is recorded --
+-- added locally through the Web API or received from a remote host -- because
+-- both paths insert a msg_add_to_batch row. Payload is "<msg id>,<addr>", one
+-- notification per participant (from, every msg_to and every msg_add_to
+-- address, including the new batch's own recipients, who have no other
+-- realtime event for a message that was sent before they were added); the
+-- listener checks addr against its currently-connected clients, exactly as
+-- new_msg. Like trg_new_msg this is a deferred constraint trigger: the
+-- batch's own msg_add_to rows are inserted after the batch row, so only at
+-- commit is the full recipient set visible.
+create or replace function notify_recipients_added() returns trigger as $$
+begin
+    if not exists (select 1 from msg where id = NEW.msg_id and time_sent is not null) then
+        return NEW;
+    end if;
+
+    perform pg_notify('recipients_added', NEW.msg_id::text || ',' || from_addr)
+    from msg where id = NEW.msg_id;
+
+    perform pg_notify('recipients_added', NEW.msg_id::text || ',' || addr)
+    from msg_to where msg_id = NEW.msg_id;
+
+    perform pg_notify('recipients_added', NEW.msg_id::text || ',' || addr)
+    from msg_add_to where msg_id = NEW.msg_id;
+
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_recipients_added on msg_add_to_batch;
+create constraint trigger trg_recipients_added
+    after insert on msg_add_to_batch
+    deferrable initially deferred
+    for each row execute function notify_recipients_added();
