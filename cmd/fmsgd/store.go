@@ -29,7 +29,7 @@ func testDb() error {
 	log.Printf("INFO: Database connected: %s@%s:%s/%s", user, host, port, dbName)
 
 	// verify required tables exist
-	for _, table := range []string{"msg", "msg_to", "msg_add_to", "msg_add_to_batch", "msg_attachment"} {
+	for _, table := range []string{"msg", "msg_to", "msg_add_to", "msg_add_to_batch", "msg_add_to_notify", "msg_attachment"} {
 		var exists bool
 		err = db.QueryRow(`SELECT EXISTS (
 			SELECT FROM information_schema.tables
@@ -244,6 +244,37 @@ func existingMsgIDForAddTo(tx *sql.Tx, msg *FMsgHeader, msgHash []byte) (int64, 
 	return id, err
 }
 
+// addToBatchRecorded reports whether an incoming add-to batch carries nothing
+// this host has not already recorded against stored message msgID: every
+// address is unique per message across batches (msg_add_to unique (msg_id,
+// addr)), so when every address in the incoming batch is already attached the
+// delivery is a re-send of a recorded batch and is a duplicate (code 10,
+// SPEC §10.4 step 1).
+func addToBatchRecorded(msgID int64, addTo []FMsgAddress) (bool, error) {
+	if len(addTo) == 0 {
+		return false, nil
+	}
+	db, err := sql.Open("postgres", "")
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+
+	for i := range addTo {
+		var exists bool
+		err = db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = $2
+		)`, msgID, strings.ToLower(addTo[i].ToString())).Scan(&exists)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // insertAddToBatch records one add-to delivery as a batch (its sender and the
 // time this host recorded it) and returns the new batch id. Recipients carried
 // by the delivery are linked to this batch so readers can reconstruct who added
@@ -264,14 +295,22 @@ values ($1, $2, $3) returning id`, msgID, addToFrom, now).Scan(&batchID)
 func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 	now := timeutil.TimestampNow().Float64()
 
+	// This host is recording a batch it RECEIVED: delivering the batch to
+	// other domains is the batch sender's job, not ours (SPEC §10.2 — a host
+	// delivers iff from or add to from belongs to its domain). Rows for other
+	// domains are recorded with response code 11 (accept add to) so the
+	// sender's pending queries never treat them as our delivery work.
 	for _, addr := range msg.To {
 		var delivered interface{}
+		var code interface{}
 		if addr.Domain == Domain {
 			delivered = now
+		} else {
+			code = int16(AcceptCodeAddTo)
 		}
-		if _, err := tx.Exec(`insert into msg_to (msg_id, addr, time_delivered)
-values ($1, $2, $3)
-on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered); err != nil {
+		if _, err := tx.Exec(`insert into msg_to (msg_id, addr, time_delivered, response_code)
+values ($1, $2, $3, $4)
+on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code); err != nil {
 			return err
 		}
 	}
@@ -291,12 +330,15 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered); err 
 
 	for _, addr := range msg.AddTo {
 		var delivered interface{}
+		var code interface{}
 		if addr.Domain == Domain {
 			delivered = now
+		} else {
+			code = int16(AcceptCodeAddTo)
 		}
-		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered)
-values ($1, $2, $3, $4)
-on conflict (msg_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered); err != nil {
+		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered, response_code)
+values ($1, $2, $3, $4, $5)
+on conflict (msg_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered, code); err != nil {
 			return err
 		}
 	}

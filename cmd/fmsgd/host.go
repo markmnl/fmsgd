@@ -522,12 +522,28 @@ func verifySenderIP(c net.Conn, senderDomain string) error {
 	return fmt.Errorf("DNS verification failed")
 }
 
+// handleAddToParentNotStored resolves an add-to whose parent this host does
+// not hold (SPEC §10.3 step 7): with a local recipient the add-to is treated
+// as a full message delivery; without one nothing can be stored for anyone,
+// so respond code 6 (parent not found) and close.
+func handleAddToParentNotStored(c net.Conn, h *FMsgHeader, hasLocalRecipient bool) (*FMsgHeader, error) {
+	if hasLocalRecipient {
+		h.InitialResponseCode = AcceptCodeContinue
+		return h, nil
+	}
+	if err := sendCode(c, RejectCodeParentNotFound); err != nil {
+		return h, err
+	}
+	return h, fmt.Errorf("add-to: parent not stored and no recipients for domain %s", Domain)
+}
+
 func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	if len(h.AddTo) == 0 {
 		return h, nil
 	}
 
 	addToHasOurDomain := hasDomainRecipient(h.AddTo, Domain)
+	hasLocalRecipient := addToHasOurDomain || hasDomainRecipient(h.To, Domain)
 
 	parentID, err := lookupMsgIdByHash(h.Pid)
 	if err != nil {
@@ -535,8 +551,7 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	}
 
 	if parentID == 0 {
-		h.InitialResponseCode = AcceptCodeContinue
-		return h, nil
+		return handleAddToParentNotStored(c, h, hasLocalRecipient)
 	}
 
 	parentMsg, err := getMsgByID(parentID)
@@ -544,8 +559,7 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return h, err
 	}
 	if parentMsg == nil || !isMessageRetrievable(parentMsg) {
-		h.InitialResponseCode = AcceptCodeContinue
-		return h, nil
+		return handleAddToParentNotStored(c, h, hasLocalRecipient)
 	}
 
 	if parentMsg.Timestamp-FutureTimeDelta > h.Timestamp {
@@ -553,6 +567,18 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 			return h, err
 		}
 		return h, fmt.Errorf("add-to: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
+	}
+
+	// A batch this host already recorded is a duplicate (SPEC §10.4 step 1).
+	recorded, err := addToBatchRecorded(parentID, h.AddTo)
+	if err != nil {
+		return h, err
+	}
+	if recorded {
+		if err := sendCode(c, RejectCodeDuplicate); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("add-to: batch already recorded for msg %d", parentID)
 	}
 
 	if addToHasOurDomain {
@@ -1022,10 +1048,17 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	log.Printf("INFO: <-- MSG\n%s", h)
 
 	if !hasDomainRecipient(h.To, Domain) && !hasDomainRecipient(h.AddTo, Domain) {
-		if err := sendCode(c, RejectCodeInvalid); err != nil {
-			return h, r, err
+		// An add-to message is delivered to every participant domain, not only
+		// recipient domains (SPEC §10.2/§10.3): a domain hosting no recipient
+		// is being notified that recipients were added. add to from is always
+		// in from or to, so from is the only participant left to check.
+		participantOnly := len(h.AddTo) > 0 && strings.EqualFold(h.From.Domain, Domain)
+		if !participantOnly {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return h, r, err
+			}
+			return h, r, fmt.Errorf("no participants for domain %s", Domain)
 		}
-		return h, r, fmt.Errorf("no recipients for domain %s", Domain)
 	}
 
 	if err := verifySenderIP(c, determineSenderDomain(h)); err != nil {
