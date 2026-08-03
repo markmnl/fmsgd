@@ -22,8 +22,18 @@ var RetryMaxAge float64 = 86400
 var PollInterval = 10
 var MaxConcurrentSend = 1024
 
-// localResponseCodeNoResponse is stored only in the database; it is not an fmsg protocol response code.
-const localResponseCodeNoResponse = -1
+// Local response codes are stored only in the database; they are not fmsg
+// protocol response codes (negative so they can never collide with one).
+const (
+	// localResponseCodeNoResponse marks a delivery attempt that got no
+	// response; the row stays retryable.
+	localResponseCodeNoResponse = -1
+	// localResponseCodeNotOurDelivery marks a recipient recorded from a
+	// received exchange purely for participant checks and faithful message
+	// reconstruction (SPEC §10.3/§11) — delivering to them is another host's
+	// job, so the row is never retried and never treated as pending.
+	localResponseCodeNotOurDelivery = -2
+)
 
 var retryableResponseCodes = []int16{
 	int16(localResponseCodeNoResponse),

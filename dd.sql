@@ -20,9 +20,11 @@ create table if not exists msg (
     sha256        	bytea           	unique,
     psha256       	bytea,
 	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
-    filepath      	text            	not null
+    filepath      	text            	not null,
+    wire_header   	bytea                         -- received messages: the exact wire header bytes (fields 1-13), so any hash can always be faithfully recomputed (SPEC §11); null for locally-authored messages
 );
 create index on msg ((lower(from_addr)));
+alter table msg add column if not exists wire_header bytea; -- upgrade path for databases created before this column
 
 create table if not exists msg_to (
 	id				bigserial			primary key,
@@ -31,7 +33,7 @@ create table if not exists msg_to (
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
     time_read       double precision,   -- time recipient read the message; null if unread
-    response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+    response_code   smallint,		    -- when sending, response code of last delivery attempt if failed; when receiving, the per-recipient code this host responded, or a negative local sentinel (-1 attempt got no response, retryable; -2 recorded from an exchange, another host's delivery)
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
@@ -57,7 +59,7 @@ create table if not exists msg_add_to (
     time_delivered  double precision,   -- if sending, time sending host recieved delivery confirmation, if receiving, time successfully received message
     time_last_attempt double precision, -- only used when sending, time of last delivery attempt if failed; otherwise null
     time_read       double precision,   -- time recipient read the message; null if unread
-    response_code   smallint,		    -- only used when sending, response code of last delivery attempt if failed; otherwise null
+    response_code   smallint,		    -- when sending, response code of last delivery attempt if failed; when receiving, the per-recipient code this host responded, or a negative local sentinel (-1 attempt got no response, retryable; -2 recorded from an exchange, another host's delivery)
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
