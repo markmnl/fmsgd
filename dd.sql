@@ -2,6 +2,19 @@
  *
  * PostgreSQL database objects data definition for fmsgd
  *
+ * This script is IDEMPOTENT: every statement is safe to re-run
+ * (create table/index if not exists, alter table add column if
+ * not exists, create or replace function, drop trigger if exists
+ * before create trigger). Migrating an existing database is
+ * therefore just re-running the whole script, e.g.:
+ *
+ *   psql -d fmsgd -v ON_ERROR_STOP=1 -f dd.sql
+ *
+ * Keep it that way: add new objects and columns only with
+ * idempotent statements, and name indexes explicitly to match
+ * PostgreSQL's default generated names so indexes that already
+ * exist unnamed on live databases are recognised, not duplicated.
+ *
  ****************************************************************/
 
 -- database with encoding UTF8 should already be created and connected
@@ -23,7 +36,7 @@ create table if not exists msg (
     filepath      	text            	not null,
     wire_header   	bytea                         -- received messages: the exact wire header bytes (fields 1-13), so any hash can always be faithfully recomputed (SPEC §11); null for locally-authored messages
 );
-create index on msg ((lower(from_addr)));
+create index if not exists msg_lower_idx on msg ((lower(from_addr)));
 alter table msg add column if not exists wire_header bytea; -- upgrade path for databases created before this column
 
 create table if not exists msg_to (
@@ -37,7 +50,7 @@ create table if not exists msg_to (
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
-create index on msg_to ((lower(addr)));
+create index if not exists msg_to_lower_idx on msg_to ((lower(addr)));
 
 -- Each add-to delivery for a shared message is one batch: a single sender
 -- (add_to_from) added a set of recipients at a point in time. Storing batches
@@ -49,7 +62,7 @@ create table if not exists msg_add_to_batch (
 	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
 	time_added		double precision	not null            -- when this host recorded the batch
 );
-create index on msg_add_to_batch (msg_id);
+create index if not exists msg_add_to_batch_msg_id_idx on msg_add_to_batch (msg_id);
 
 create table if not exists msg_add_to (
 	id				bigserial			primary key,
@@ -63,8 +76,8 @@ create table if not exists msg_add_to (
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
-create index on msg_add_to ((lower(addr)));
-create index on msg_add_to (batch_id);
+create index if not exists msg_add_to_lower_idx on msg_add_to ((lower(addr)));
+create index if not exists msg_add_to_batch_id_idx on msg_add_to (batch_id);
 
 create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
