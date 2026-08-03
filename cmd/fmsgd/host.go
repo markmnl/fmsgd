@@ -1367,20 +1367,20 @@ func persistAttachmentPayloads(h *FMsgHeader, dirpath string) error {
 	return nil
 }
 
-func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress, acceptedAddTo []FMsgAddress, primaryFilepath string) bool {
+// storeAcceptedMessage stores a received message once at least one local
+// recipient accepted it. The header is stored with its COMPLETE wire
+// recipient lists (never truncated to this host's recipients — §10.3
+// participant checks and §11 hash reconstruction need the message exactly as
+// transmitted); localOutcome carries the per-recipient codes this host
+// responded so each row records delivered/rejected/not-our-delivery.
+func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress, acceptedAddTo []FMsgAddress, localOutcome map[string]uint8, primaryFilepath string) bool {
 	if len(acceptedTo) == 0 && len(acceptedAddTo) == 0 {
 		return false
 	}
 
-	origTo := h.To
-	origAddTo := h.AddTo
-	h.To = acceptedTo
-	h.AddTo = acceptedAddTo
 	h.Filepath = primaryFilepath
-	if err := storeMsgDetail(h); err != nil {
+	if err := storeMsgDetail(h, localOutcome); err != nil {
 		log.Printf("ERROR: storing message: %s", err)
-		h.To = origTo
-		h.AddTo = origAddTo
 		for i := range codes {
 			if codes[i] == RejectCodeAccept {
 				codes[i] = RejectCodeUndisclosed
@@ -1389,8 +1389,6 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 		return false
 	}
 
-	h.To = origTo
-	h.AddTo = origAddTo
 	allAccepted := append(acceptedTo, acceptedAddTo...)
 	for i := range allAccepted {
 		if err := postMsgStatRecv(&allAccepted[i], h.Timestamp, int(h.Size)); err != nil {
@@ -1506,7 +1504,15 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		}
 	}
 
-	stored := storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, primaryFilepath)
+	// Map each local recipient to the code this host responded, so storage can
+	// record every wire recipient's outcome (delivered / rejected / another
+	// host's delivery).
+	localOutcome := make(map[string]uint8, len(addrs))
+	for i := range addrs {
+		localOutcome[strings.ToLower(addrs[i].ToString())] = codes[i]
+	}
+
+	stored := storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, localOutcome, primaryFilepath)
 	if stored {
 		cleanupOnReturn = false
 	}

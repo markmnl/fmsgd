@@ -298,7 +298,7 @@ func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 	// This host is recording a batch it RECEIVED: delivering the batch to
 	// other domains is the batch sender's job, not ours (SPEC §10.2 — a host
 	// delivers iff from or add to from belongs to its domain). Rows for other
-	// domains are recorded with response code 11 (accept add to) so the
+	// domains are recorded with localResponseCodeNotOurDelivery so the
 	// sender's pending queries never treat them as our delivery work.
 	for _, addr := range msg.To {
 		var delivered interface{}
@@ -306,7 +306,7 @@ func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 		if addr.Domain == Domain {
 			delivered = now
 		} else {
-			code = int16(AcceptCodeAddTo)
+			code = int16(localResponseCodeNotOurDelivery)
 		}
 		if _, err := tx.Exec(`insert into msg_to (msg_id, addr, time_delivered, response_code)
 values ($1, $2, $3, $4)
@@ -334,7 +334,7 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 		if addr.Domain == Domain {
 			delivered = now
 		} else {
-			code = int16(AcceptCodeAddTo)
+			code = int16(localResponseCodeNotOurDelivery)
 		}
 		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered, response_code)
 values ($1, $2, $3, $4, $5)
@@ -345,7 +345,28 @@ on conflict (msg_id, addr) do nothing`, msgID, batchID, addr.ToString(), deliver
 	return nil
 }
 
-func storeMsgDetail(msg *FMsgHeader) error {
+// inboundRecipientRow maps one wire recipient of a received message to its
+// stored row state: recipients this host accepted are delivered; recipients
+// this host rejected keep the per-recipient code it responded; recipients on
+// other domains are recorded for participant checks and faithful message
+// reconstruction (SPEC §10.3/§11) but are another host's delivery duty.
+func inboundRecipientRow(addr FMsgAddress, localOutcome map[string]uint8, now float64) (delivered interface{}, code interface{}) {
+	c, ok := localOutcome[strings.ToLower(addr.ToString())]
+	if !ok {
+		return nil, int16(localResponseCodeNotOurDelivery)
+	}
+	if c == RejectCodeAccept {
+		return now, nil
+	}
+	return nil, int16(c)
+}
+
+// storeMsgDetail stores a RECEIVED message: the complete wire recipient lists
+// are kept in wire order — never truncated to this host's recipients —
+// because §10.3's participant checks and §11's hash reconstruction both need
+// the message exactly as transmitted. localOutcome maps each lower-cased
+// local recipient address to the per-recipient code this host responded.
+func storeMsgDetail(msg *FMsgHeader, localOutcome map[string]uint8) error {
 
 	db, err := sql.Open("postgres", "")
 	if err != nil {
@@ -389,8 +410,9 @@ func storeMsgDetail(msg *FMsgHeader) error {
 	, sha256
 	, psha256
 	, size
-	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	, filepath
+	, wire_header)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -403,13 +425,14 @@ returning id`,
 		msgHash,
 		parentHash,
 		int(msg.Size),
-		msg.Filepath).Scan(&msgID)
+		msg.Filepath,
+		msg.Encode()).Scan(&msgID)
 	if err != nil {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`insert into msg_to (msg_id, addr, time_delivered)
-values ($1, $2, $3)`)
+	stmt, err := tx.Prepare(`insert into msg_to (msg_id, addr, time_delivered, response_code)
+values ($1, $2, $3, $4)`)
 	if err != nil {
 		return err
 	}
@@ -417,12 +440,8 @@ values ($1, $2, $3)`)
 
 	now := timeutil.TimestampNow().Float64()
 	for _, addr := range msg.To {
-		// recipients on our domain are already delivered; others are pending
-		var delivered interface{}
-		if addr.Domain == Domain {
-			delivered = now
-		}
-		if _, err := stmt.Exec(msgID, addr.ToString(), delivered); err != nil {
+		delivered, code := inboundRecipientRow(addr, localOutcome, now)
+		if _, err := stmt.Exec(msgID, addr.ToString(), delivered, code); err != nil {
 			return err
 		}
 	}
@@ -438,19 +457,16 @@ values ($1, $2, $3)`)
 			return err
 		}
 
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered)
-values ($1, $2, $3, $4)`)
+		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered, response_code)
+values ($1, $2, $3, $4, $5)`)
 		if err != nil {
 			return err
 		}
 		defer addToStmt.Close()
 
 		for _, addr := range msg.AddTo {
-			var delivered interface{}
-			if addr.Domain == Domain {
-				delivered = now
-			}
-			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString(), delivered); err != nil {
+			delivered, code := inboundRecipientRow(addr, localOutcome, now)
+			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString(), delivered, code); err != nil {
 				return err
 			}
 		}
@@ -526,8 +542,9 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	, sha256
 	, psha256
 	, size
-	, filepath)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	, filepath
+	, wire_header)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
@@ -540,19 +557,21 @@ returning id`,
 		msgHash,
 		parentHash,
 		int(msg.Size),
-		"").Scan(&msgID)
+		"",
+		msg.Encode()).Scan(&msgID)
 	if err != nil {
 		return err
 	}
 
-	// insert to recipients (for record keeping)
-	toStmt, err := tx.Prepare(`insert into msg_to (msg_id, addr) values ($1, $2)`)
+	// Record-keeping rows only: no delivery happened for anyone here, so every
+	// recipient is marked not-our-delivery.
+	toStmt, err := tx.Prepare(`insert into msg_to (msg_id, addr, response_code) values ($1, $2, $3)`)
 	if err != nil {
 		return err
 	}
 	defer toStmt.Close()
 	for _, addr := range msg.To {
-		if _, err := toStmt.Exec(msgID, addr.ToString()); err != nil {
+		if _, err := toStmt.Exec(msgID, addr.ToString(), int16(localResponseCodeNotOurDelivery)); err != nil {
 			return err
 		}
 	}
@@ -568,13 +587,13 @@ returning id`,
 			return err
 		}
 
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr) values ($1, $2, $3)`)
+		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr, response_code) values ($1, $2, $3, $4)`)
 		if err != nil {
 			return err
 		}
 		defer addToStmt.Close()
 		for _, addr := range msg.AddTo {
-			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString()); err != nil {
+			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString(), int16(localResponseCodeNotOurDelivery)); err != nil {
 				return err
 			}
 		}

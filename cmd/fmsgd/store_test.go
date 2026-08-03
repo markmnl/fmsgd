@@ -181,3 +181,29 @@ func TestRelationalParentHashAddToHasNoParent(t *testing.T) {
 		t.Fatalf("new-thread relational parent = %v, want nil", got)
 	}
 }
+
+func TestInboundRecipientRow(t *testing.T) {
+	now := 1234.5
+	local := FMsgAddress{User: "alice", Domain: "here.example"}
+	rejected := FMsgAddress{User: "carol", Domain: "here.example"}
+	remote := FMsgAddress{User: "bob", Domain: "there.example"}
+	outcome := map[string]uint8{
+		"@alice@here.example": RejectCodeAccept,
+		"@carol@here.example": RejectCodeUserFull,
+	}
+
+	delivered, code := inboundRecipientRow(local, outcome, now)
+	if delivered != now || code != nil {
+		t.Fatalf("accepted local: got (%v, %v), want (%v, nil)", delivered, code, now)
+	}
+
+	delivered, code = inboundRecipientRow(rejected, outcome, now)
+	if delivered != nil || code != int16(RejectCodeUserFull) {
+		t.Fatalf("rejected local: got (%v, %v), want (nil, %d)", delivered, code, RejectCodeUserFull)
+	}
+
+	delivered, code = inboundRecipientRow(remote, outcome, now)
+	if delivered != nil || code != int16(localResponseCodeNotOurDelivery) {
+		t.Fatalf("remote: got (%v, %v), want (nil, %d)", delivered, code, localResponseCodeNotOurDelivery)
+	}
+}
