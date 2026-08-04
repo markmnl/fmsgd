@@ -756,9 +756,11 @@ func (m *msgFields) originalHeader() *FMsgHeader {
 }
 
 // sharedHash returns the canonical hash identifying this message: its persisted
-// sha256, or — when not yet persisted (e.g. local-only delivery) — its
-// original-form message hash. Add-to batches reference this value as their pid
-// (SPEC §12).
+// sha256 (computed at first outbound delivery over the header exactly as
+// transmitted — deflated form; see the sender), or — when not yet persisted
+// (e.g. local-only delivery, where nothing external can reference it) — its
+// undeflated original-form hash as a local fallback. Add-to batches reference
+// this value as their pid (SPEC §12).
 func (m *msgFields) sharedHash() ([]byte, error) {
 	if len(m.storedHash) > 0 {
 		return m.storedHash, nil
