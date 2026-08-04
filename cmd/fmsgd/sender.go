@@ -451,13 +451,28 @@ func deliverMessage(target pendingTarget) {
 		rtx.Rollback()
 		return
 	}
-	sharedHash, err := m.sharedHash()
-	if err != nil {
-		log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
-		rtx.Rollback()
-		return
-	}
 	rtx.Rollback()
+
+	// Compress the shared payload once; every unit header reuses it. Deflate
+	// must be applied BEFORE the shared hash is computed: the message hash
+	// covers the header fields exactly as transmitted (SPEC "Message hash"),
+	// and applyTo changes flags, size and expanded size. Hashing the
+	// undeflated form recorded a sha256 the receiving host never computes,
+	// so cross-host replies bounced with code 6 (parent not found).
+	d := computeDeflate(m, target.MsgID)
+	defer d.removeTempFiles()
+
+	orig := m.originalHeader()
+	d.applyTo(orig)
+
+	sharedHash := m.storedHash
+	if len(sharedHash) == 0 {
+		sharedHash, err = orig.GetMessageHash()
+		if err != nil {
+			log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
+			return
+		}
+	}
 
 	// Persist the shared hash (so replies/add-to referencing this message
 	// resolve) and link any pending children — once for the whole message.
@@ -466,13 +481,7 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	// Compress the shared payload once; every unit header reuses it.
-	d := computeDeflate(m, target.MsgID)
-	defer d.removeTempFiles()
-
 	// Deliver the original message to its pending msg_to recipients.
-	orig := m.originalHeader()
-	d.applyTo(orig)
 	deliverUnit(db, target, orig, "msg_to", 0)
 
 	// Deliver each add-to batch as its own add-to message (one sender each).
