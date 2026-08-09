@@ -37,6 +37,7 @@ Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
 | FMSG_MAX_CONCURRENT_SEND   | 1024    | Maximum number of concurrent outbound message deliveries.                                                                                              |
 | FMSG_SKIP_DOMAIN_IP_CHECK  | false   | Set to "true" to skip verifying this host's external IP is in the fmsg DNS authorised IP set on startup.                                               |
 | FMSG_SKIP_AUTHORISED_IPS  | false   | Set to "true" to skip verifying remote hosts IP is in the fmsg DNS authorised IP set during message exchange. WARNING setting this true effectively disables sender verification. |
+| FMSG_CHALLENGE_MODE        | ALWAYS  | When to issue an automatic CHALLENGE to the sending host. `ALWAYS` (default): always challenge. `HAS_NOT_PARTICIPATED`: challenge only when the message has no pid, or no message in the thread is from this host's domain. `NEVER`: never challenge. |
 
 
 

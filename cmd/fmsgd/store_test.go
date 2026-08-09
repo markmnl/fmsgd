@@ -65,6 +65,24 @@ func TestResolveStoredParentAllowsOptionalMissingParent(t *testing.T) {
 	}
 }
 
+func TestThreadHasFromDomainEmptyInputs(t *testing.T) {
+	// No DB needed: empty hash/domain short-circuit.
+	ok, err := threadHasFromDomain(nil, "example.com")
+	if err != nil {
+		t.Fatalf("nil hash: %v", err)
+	}
+	if ok {
+		t.Fatal("nil hash: want false")
+	}
+	ok, err = threadHasFromDomain([]byte{1}, "")
+	if err != nil {
+		t.Fatalf("empty domain: %v", err)
+	}
+	if ok {
+		t.Fatal("empty domain: want false")
+	}
+}
+
 func TestResolveStoredParentSetsPidWhenParentExists(t *testing.T) {
 	store := &fakeParentLinkStore{parentID: 42}
 

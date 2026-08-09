@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -508,6 +509,177 @@ func TestReadAttachmentHeadersRejectsReservedAttachmentBits(t *testing.T) {
 	}
 	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
 		t.Fatalf("expected reject code %d, got %v", RejectCodeInvalid, got)
+	}
+}
+
+func TestParseChallengeMode(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"", ChallengeModeAlways, false},
+		{"ALWAYS", ChallengeModeAlways, false},
+		{"always", ChallengeModeAlways, false},
+		{"  Always  ", ChallengeModeAlways, false},
+		{"HAS_NOT_PARTICIPATED", ChallengeModeHasNotParticipated, false},
+		{"has_not_participated", ChallengeModeHasNotParticipated, false},
+		{"HAVE_NOT_PARTICIPATED", ChallengeModeHasNotParticipated, false},
+		{"NEVER", ChallengeModeNever, false},
+		{"never", ChallengeModeNever, false},
+		{"SOMETIMES", "", true},
+		{"DIFFERENT_DOMAIN", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%q", tt.in), func(t *testing.T) {
+			got, err := parseChallengeMode(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseChallengeMode(%q) = %q, want error", tt.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseChallengeMode(%q) error: %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseChallengeMode(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldChallenge(t *testing.T) {
+	origMode := ChallengeMode
+	origDomain := Domain
+	origFn := threadHasFromDomainFn
+	t.Cleanup(func() {
+		ChallengeMode = origMode
+		Domain = origDomain
+		threadHasFromDomainFn = origFn
+	})
+	Domain = "here.example"
+	pid := []byte{
+		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+	}
+
+	tests := []struct {
+		name         string
+		mode         string
+		header       *FMsgHeader
+		stub         func(hash []byte, domain string) (bool, error)
+		want         bool
+		wantErr      bool
+		wantStubCall bool
+	}{
+		{
+			name:   "never always skips",
+			mode:   ChallengeModeNever,
+			header: &FMsgHeader{},
+			want:   false,
+		},
+		{
+			name:   "always always challenges",
+			mode:   ChallengeModeAlways,
+			header: &FMsgHeader{},
+			want:   true,
+		},
+		{
+			name:   "has-not-participated no pid",
+			mode:   ChallengeModeHasNotParticipated,
+			header: &FMsgHeader{},
+			want:   true,
+		},
+		{
+			name: "has-not-participated empty pid flag",
+			mode: ChallengeModeHasNotParticipated,
+			header: &FMsgHeader{
+				Flags: FlagHasPid,
+				Pid:   nil,
+			},
+			want: true,
+		},
+		{
+			name: "has-not-participated local from in thread",
+			mode: ChallengeModeHasNotParticipated,
+			header: &FMsgHeader{
+				Flags: FlagHasPid,
+				Pid:   pid,
+			},
+			stub: func(hash []byte, domain string) (bool, error) {
+				if domain != "here.example" {
+					t.Errorf("domain = %q, want here.example", domain)
+				}
+				return true, nil
+			},
+			want:         false,
+			wantStubCall: true,
+		},
+		{
+			name: "has-not-participated no local from",
+			mode: ChallengeModeHasNotParticipated,
+			header: &FMsgHeader{
+				Flags: FlagHasPid,
+				Pid:   pid,
+			},
+			stub: func(hash []byte, domain string) (bool, error) {
+				return false, nil
+			},
+			want:         true,
+			wantStubCall: true,
+		},
+		{
+			name: "has-not-participated store error",
+			mode: ChallengeModeHasNotParticipated,
+			header: &FMsgHeader{
+				Flags: FlagHasPid,
+				Pid:   pid,
+			},
+			stub: func(hash []byte, domain string) (bool, error) {
+				return false, fmt.Errorf("db down")
+			},
+			wantErr:      true,
+			wantStubCall: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ChallengeMode = tt.mode
+			calls := 0
+			if tt.stub != nil {
+				threadHasFromDomainFn = func(hash []byte, domain string) (bool, error) {
+					calls++
+					return tt.stub(hash, domain)
+				}
+			} else {
+				threadHasFromDomainFn = func(hash []byte, domain string) (bool, error) {
+					t.Fatal("threadHasFromDomain should not be called")
+					return false, nil
+				}
+			}
+
+			got, err := shouldChallenge(tt.header)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("shouldChallenge() = %v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("shouldChallenge() error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("shouldChallenge() = %v, want %v", got, tt.want)
+			}
+			if tt.wantStubCall && calls != 1 {
+				t.Fatalf("threadHasFromDomain calls = %d, want 1", calls)
+			}
+			if !tt.wantStubCall && calls != 0 {
+				t.Fatalf("threadHasFromDomain calls = %d, want 0", calls)
+			}
+		})
 	}
 }
 
