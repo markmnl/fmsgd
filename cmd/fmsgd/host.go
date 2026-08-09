@@ -1235,6 +1235,18 @@ func prepareMessageData(r io.Reader, h *FMsgHeader, skipData bool) ([]string, er
 			return nil, fmt.Errorf("%w code 65 parent data unavailable for msg %d", ErrProtocolViolation, parentID)
 		}
 		h.Filepath = parentMsg.Filepath
+		// §10.3 step 5: for code 65 the hash is computed from the received
+		// header + stored data — attachments included, so map their stored
+		// paths in just like the message body above.
+		if len(parentMsg.Attachments) != len(h.Attachments) {
+			return nil, fmt.Errorf("%w code 65 attachment count mismatch for msg %d", ErrProtocolViolation, parentID)
+		}
+		for i := range h.Attachments {
+			if parentMsg.Attachments[i].Filepath == "" {
+				return nil, fmt.Errorf("%w code 65 attachment data unavailable for msg %d", ErrProtocolViolation, parentID)
+			}
+			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
+		}
 		return nil, nil
 	}
 
