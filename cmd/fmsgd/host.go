@@ -126,7 +126,7 @@ var MaxMessageSize = uint32(1024 * 10)
 var MaxExpandedSize = uint32(1024 * 10)
 var SkipAuthorisedIPs = false
 var TLSInsecureSkipVerify = false
-var ChallengeMode = ChallengeModeAlways
+var ChallengeMode = ChallengeModeHasNotParticipated
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
@@ -165,14 +165,14 @@ func buildClientTLSConfig(serverName string) *tls.Config {
 	}
 }
 
-// parseChallengeMode normalises FMSG_CHALLENGE_MODE. Empty defaults to ALWAYS.
-// HAVE_NOT_PARTICIPATED is accepted as an alias of HAS_NOT_PARTICIPATED.
+// parseChallengeMode normalises FMSG_CHALLENGE_MODE. Empty defaults to
+// HAS_NOT_PARTICIPATED. HAVE_NOT_PARTICIPATED is accepted as an alias.
 func parseChallengeMode(s string) (string, error) {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
-	case "", ChallengeModeAlways:
-		return ChallengeModeAlways, nil
-	case ChallengeModeHasNotParticipated, "HAVE_NOT_PARTICIPATED":
+	case "", ChallengeModeHasNotParticipated, "HAVE_NOT_PARTICIPATED":
 		return ChallengeModeHasNotParticipated, nil
+	case ChallengeModeAlways:
+		return ChallengeModeAlways, nil
 	case ChallengeModeNever:
 		return ChallengeModeNever, nil
 	default:
