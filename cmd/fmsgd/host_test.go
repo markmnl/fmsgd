@@ -518,13 +518,14 @@ func TestParseChallengeMode(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"", ChallengeModeAlways, false},
+		{"", ChallengeModeHasNotParticipated, false},
 		{"ALWAYS", ChallengeModeAlways, false},
 		{"always", ChallengeModeAlways, false},
 		{"  Always  ", ChallengeModeAlways, false},
 		{"HAS_NOT_PARTICIPATED", ChallengeModeHasNotParticipated, false},
 		{"has_not_participated", ChallengeModeHasNotParticipated, false},
 		{"HAVE_NOT_PARTICIPATED", ChallengeModeHasNotParticipated, false},
+		{"  Has_Not_Participated  ", ChallengeModeHasNotParticipated, false},
 		{"NEVER", ChallengeModeNever, false},
 		{"never", ChallengeModeNever, false},
 		{"SOMETIMES", "", true},
