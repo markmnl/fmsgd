@@ -103,6 +103,16 @@ func responseCodeName(code uint8) string {
 
 var ErrProtocolViolation = errors.New("protocol violation")
 
+// ChallengeMode values for FMSG_CHALLENGE_MODE (SPEC §2 automatic challenge).
+const (
+	ChallengeModeAlways             = "ALWAYS"
+	ChallengeModeHasNotParticipated = "HAS_NOT_PARTICIPATED"
+	ChallengeModeNever              = "NEVER"
+)
+
+// maxThreadWalkDepth bounds the parent-chain walk for HAS_NOT_PARTICIPATED.
+const maxThreadWalkDepth = 256
+
 var Port = 4930
 
 // The only reason RemotePort would ever be different from Port is when running two fmsg hosts on the same machine so the same port is unavaliable.
@@ -116,6 +126,7 @@ var MaxMessageSize = uint32(1024 * 10)
 var MaxExpandedSize = uint32(1024 * 10)
 var SkipAuthorisedIPs = false
 var TLSInsecureSkipVerify = false
+var ChallengeMode = ChallengeModeAlways
 var DataDir = "got on startup"
 var Domain = "got on startup"
 var IDURI = "got on startup"
@@ -154,6 +165,21 @@ func buildClientTLSConfig(serverName string) *tls.Config {
 	}
 }
 
+// parseChallengeMode normalises FMSG_CHALLENGE_MODE. Empty defaults to ALWAYS.
+// HAVE_NOT_PARTICIPATED is accepted as an alias of HAS_NOT_PARTICIPATED.
+func parseChallengeMode(s string) (string, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "", ChallengeModeAlways:
+		return ChallengeModeAlways, nil
+	case ChallengeModeHasNotParticipated, "HAVE_NOT_PARTICIPATED":
+		return ChallengeModeHasNotParticipated, nil
+	case ChallengeModeNever:
+		return ChallengeModeNever, nil
+	default:
+		return "", fmt.Errorf("invalid FMSG_CHALLENGE_MODE %q (want ALWAYS, HAS_NOT_PARTICIPATED, or NEVER)", s)
+	}
+}
+
 // loadEnvConfig reads env vars (after godotenv.Load so .env is picked up).
 func loadEnvConfig() {
 	Port = env.GetIntDefault("FMSG_PORT", 4930)
@@ -167,6 +193,11 @@ func loadEnvConfig() {
 	MaxExpandedSize = uint32(env.GetIntDefault("FMSG_MAX_EXPANDED_SIZE", int(MaxMessageSize)))
 	SkipAuthorisedIPs = os.Getenv("FMSG_SKIP_AUTHORISED_IPS") == "true"
 	TLSInsecureSkipVerify = os.Getenv("FMSG_TLS_INSECURE_SKIP_VERIFY") == "true"
+	mode, err := parseChallengeMode(os.Getenv("FMSG_CHALLENGE_MODE"))
+	if err != nil {
+		log.Fatalf("ERROR: %s", err)
+	}
+	ChallengeMode = mode
 }
 
 // Updates DataDir from environment, panics if not a valid directory.
@@ -1080,11 +1111,36 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	return h, r, nil
 }
 
+// threadHasFromDomainFn is the store lookup used by HAS_NOT_PARTICIPATED.
+// Overridable in tests.
+var threadHasFromDomainFn = threadHasFromDomain
+
+// shouldChallenge reports whether Host B should issue a CHALLENGE for h under
+// the configured ChallengeMode (SPEC §2 automatic challenge modes).
+func shouldChallenge(h *FMsgHeader) (bool, error) {
+	switch ChallengeMode {
+	case ChallengeModeNever:
+		return false, nil
+	case ChallengeModeAlways:
+		return true, nil
+	case ChallengeModeHasNotParticipated:
+		if h == nil || h.Flags&FlagHasPid == 0 || len(h.Pid) == 0 {
+			return true, nil
+		}
+		participated, err := threadHasFromDomainFn(h.Pid, Domain)
+		if err != nil {
+			return false, err
+		}
+		// Challenge when our domain has not participated in the thread.
+		return !participated, nil
+	default:
+		return false, fmt.Errorf("unknown challenge mode %q", ChallengeMode)
+	}
+}
+
 // Sends CHALLENGE request to sender, receiving and storing the challenge hash.
 // DNS verification of the remote IP is performed during header exchange (readHeader).
-// TODO [Spec step 2]: The spec defines challenge modes (NEVER, ALWAYS,
-// HAS_NOT_PARTICIPATED, DIFFERENT_DOMAIN) as implementation choices.
-// Currently defaults to ALWAYS. Implement configurable challenge mode.
+// Whether to call this is decided by shouldChallenge under FMSG_CHALLENGE_MODE.
 func challenge(conn net.Conn, h *FMsgHeader, senderDomain string) error {
 
 	// Connection 2 MUST target the same IP as Connection 1 (spec 2.1).
@@ -1235,6 +1291,18 @@ func prepareMessageData(r io.Reader, h *FMsgHeader, skipData bool) ([]string, er
 			return nil, fmt.Errorf("%w code 65 parent data unavailable for msg %d", ErrProtocolViolation, parentID)
 		}
 		h.Filepath = parentMsg.Filepath
+		// §10.3 step 5: for code 65 the hash is computed from the received
+		// header + stored data — attachments included, so map their stored
+		// paths in just like the message body above.
+		if len(parentMsg.Attachments) != len(h.Attachments) {
+			return nil, fmt.Errorf("%w code 65 attachment count mismatch for msg %d", ErrProtocolViolation, parentID)
+		}
+		for i := range h.Attachments {
+			if parentMsg.Attachments[i].Filepath == "" {
+				return nil, fmt.Errorf("%w code 65 attachment data unavailable for msg %d", ErrProtocolViolation, parentID)
+			}
+			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
+		}
 		return nil, nil
 	}
 
@@ -1586,10 +1654,20 @@ func handleConn(c net.Conn) {
 		return
 	}
 
-	if err := challenge(tc, header, determineSenderDomain(header)); err != nil {
-		log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
+	doChallenge, err := shouldChallenge(header)
+	if err != nil {
+		log.Printf("ERROR: challenge mode decision failed for %s: %s", c.RemoteAddr().String(), err)
 		abortConn(c)
 		return
+	}
+	if doChallenge {
+		if err := challenge(tc, header, determineSenderDomain(header)); err != nil {
+			log.Printf("ERROR: Challenge failed to, %s: %s", c.RemoteAddr().String(), err)
+			abortConn(c)
+			return
+		}
+	} else {
+		log.Printf("INFO: skipping challenge (mode %s) from %s", ChallengeMode, c.RemoteAddr().String())
 	}
 
 	// §10.4: Determine initial response code after optional challenge.
@@ -1696,6 +1774,7 @@ func main() {
 
 	// read env config (must be after godotenv.Load)
 	loadEnvConfig()
+	log.Printf("INFO: challenge mode: %s", ChallengeMode)
 
 	// determine listen address from args
 	listenAddress := "127.0.0.1"

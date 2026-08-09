@@ -62,6 +62,48 @@ func lookupMsgIdByHash(hash []byte) (int64, error) {
 	return id, err
 }
 
+// threadHasFromDomain reports whether any message in the thread rooted at hash
+// (inclusive), following msg.pid (relational parent id), has a from_addr whose
+// domain equals domain (case-insensitive). Used by HAS_NOT_PARTICIPATED
+// challenge mode. Returns false when hash is not stored (cannot prove
+// participation). Walks via relational pid, not add-to wire pids.
+func threadHasFromDomain(hash []byte, domain string) (bool, error) {
+	if len(hash) == 0 || domain == "" {
+		return false, nil
+	}
+
+	db, err := sql.Open("postgres", "")
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+
+	// from_addr is @user@domain; split_part(..., 3) is the domain.
+	// Depth cap and cycle guard limit pathological chains.
+	var found bool
+	err = db.QueryRow(`
+		WITH RECURSIVE thread AS (
+			SELECT id, from_addr, pid, 1 AS depth, ARRAY[id] AS seen
+			FROM msg
+			WHERE sha256 = $1
+			UNION ALL
+			SELECT m.id, m.from_addr, m.pid, t.depth + 1, t.seen || m.id
+			FROM msg m
+			INNER JOIN thread t ON m.id = t.pid
+			WHERE t.depth < $3
+			  AND NOT m.id = ANY (t.seen)
+		)
+		SELECT EXISTS (
+			SELECT 1 FROM thread
+			WHERE lower(split_part(from_addr, '@', 3)) = lower($2)
+		)
+	`, hash, domain, maxThreadWalkDepth).Scan(&found)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
 // hasAddrReceivedMsgHash reports whether addr has already received a stored
 // message identified by hash.
 func hasAddrReceivedMsgHash(hash []byte, addr *FMsgAddress) (bool, error) {
