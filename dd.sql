@@ -64,7 +64,7 @@ create table if not exists msg_add_to_batch (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
-	time_added		double precision	not null,           -- when this host recorded the batch
+	time_added		double precision	not null,           -- the batch message's wire time field (for locally originated batches, when the batch was created)
 	sha256			bytea                                   -- batch message hash: the batch's identity (SPEC §11)
 );
 alter table msg_add_to_batch add column if not exists sha256 bytea;
