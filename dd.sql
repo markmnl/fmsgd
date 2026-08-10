@@ -134,7 +134,14 @@ begin
     if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
         NEW.psha256 = parent_sha256;
     elsif NEW.psha256 <> parent_sha256 then
-        raise exception 'psha256 does not match parent message % sha256', NEW.pid;
+        -- a reply may reference one of the parent's add-to batch messages by
+        -- its batch hash (SPEC §12); the relational parent is the shared row
+        if not exists (
+            select 1 from msg_add_to_batch b
+            where b.msg_id = NEW.pid and b.sha256 = NEW.psha256
+        ) then
+            raise exception 'psha256 does not match parent message % sha256 or any of its add-to batch hashes', NEW.pid;
+        end if;
     end if;
 
     return NEW;
