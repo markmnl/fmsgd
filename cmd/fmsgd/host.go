@@ -1018,7 +1018,7 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	}
 
 	// read pid if any
-	if flags&FlagHasPid == 1 {
+	if flags&FlagHasPid != 0 {
 		pid, err := io.ReadAll(io.LimitReader(r, 32))
 		if err != nil {
 			return h, r, err
