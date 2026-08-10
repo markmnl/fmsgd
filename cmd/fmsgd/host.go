@@ -1456,9 +1456,11 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 	h.Filepath = primaryFilepath
 	if err := storeMsgDetail(h, localOutcome); err != nil {
 		log.Printf("ERROR: storing message: %s", err)
+		// These bytes go into the per-recipient code stream, so the failure
+		// code must be the per-recipient 105, never the header-level 3.
 		for i := range codes {
 			if codes[i] == RejectCodeAccept {
-				codes[i] = RejectCodeUndisclosed
+				codes[i] = RejectCodeUserUndisclosed
 			}
 		}
 		return false
@@ -1556,7 +1558,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		fp := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
 		if err := copyMessagePayload(src, fp, h.Flags&FlagDeflate != 0, h.Size); err != nil {
 			log.Printf("ERROR: copying downloaded message from: %s, to: %s", h.Filepath, fp)
-			codes[i] = RejectCodeUndisclosed
+			codes[i] = RejectCodeUserUndisclosed
 			continue
 		}
 
@@ -1570,7 +1572,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 			primaryFilepath = fp
 			if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
 				log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
-				codes[i] = RejectCodeUndisclosed
+				codes[i] = RejectCodeUserUndisclosed
 				primaryFilepath = ""
 				acceptedTo = acceptedTo[:0]
 				acceptedAddTo = acceptedAddTo[:0]
@@ -1756,14 +1758,13 @@ func handleConn(c net.Conn) {
 	}
 	c.SetReadDeadline(time.Now().Add(calcNetIODuration(deadlineBytes, MinDownloadRate)))
 	if err := downloadMessage(c, r, header, skipData); err != nil {
-		// if error was a protocal violation, abort; otherise let sender know there was an internal error
+		// After code 64/65 the sender reads one byte per recipient, so a
+		// header-level code here would be read as a recipient's code and
+		// desync the stream — abort instead; the sender records no response
+		// and retries later (§10.4).
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
-		if errors.Is(err, ErrProtocolViolation) {
-			abortConn(c)
-			return
-		} else {
-			_ = sendCode(c, RejectCodeUndisclosed)
-		}
+		abortConn(c)
+		return
 	}
 
 	// gracefully close 1st connection
