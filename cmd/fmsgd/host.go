@@ -583,6 +583,9 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	addToHasOurDomain := hasDomainRecipient(h.AddTo, Domain)
 	hasLocalRecipient := addToHasOurDomain || hasDomainRecipient(h.To, Domain)
 
+	// Deliberately resolves canonical message hashes only: batches do not
+	// chain, so an add-to whose pid is another batch's hash must not resolve
+	// (SPEC §12).
 	parentID, err := lookupMsgIdByHash(h.Pid)
 	if err != nil {
 		return h, err
@@ -653,14 +656,16 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 	if err != nil {
 		return err
 	}
-	if parentID == 0 {
-		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
-			return err
-		}
-		return fmt.Errorf("pid reply: parent not found for pid %s", hex.EncodeToString(h.Pid))
-	}
 
-	parentMsg, err := getMsgByID(parentID)
+	var parentMsg *FMsgHeader
+	if parentID != 0 {
+		parentMsg, err = getMsgByID(parentID)
+	} else {
+		// A reply may reference an add-to batch message via pid (SPEC §12);
+		// its wire form is reconstructed from the stored shared message and
+		// batch fields (SPEC §11).
+		parentMsg, err = getMsgByBatchHash(h.Pid)
+	}
 	if err != nil {
 		return err
 	}
@@ -668,7 +673,7 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
 			return err
 		}
-		return fmt.Errorf("pid reply: parent message not found by ID %d", parentID)
+		return fmt.Errorf("pid reply: parent not found for pid %s", hex.EncodeToString(h.Pid))
 	}
 	if !isMessageRetrievable(parentMsg) {
 		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
