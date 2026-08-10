@@ -156,12 +156,19 @@ func buildServerTLSConfig() *tls.Config {
 	}
 }
 
+// Shared across all outbound connections (deliveries and challenges) so TLS
+// session tickets are reused; entries are keyed by ServerName so tickets never
+// cross remote hosts. Resumed handshakes skip the certificate exchange while
+// keeping forward secrecy (TLS 1.3 resumption still performs an ECDHE).
+var clientSessionCache = tls.NewLRUClientSessionCache(256)
+
 func buildClientTLSConfig(serverName string) *tls.Config {
 	return &tls.Config{
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: TLSInsecureSkipVerify,
 		NextProtos:         []string{"fmsg/1"},
+		ClientSessionCache: clientSessionCache,
 	}
 }
 
