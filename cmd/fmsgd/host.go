@@ -693,9 +693,9 @@ func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, e
 		if challengeVersion == 1 {
 			return true, handleChallenge(c, r)
 		}
-		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
-			log.Printf("WARN: failed to send unsupported version response: %s", err)
-		}
+		// TERMINATE without responding (SPEC §10.3/§10.5): the challenger's
+		// next read is exactly the 32-byte CHALLENGE-RESPONSE hash, so a
+		// response code here would be indistinguishable from hash bytes.
 		return false, fmt.Errorf("unsupported challenge version: %d", challengeVersion)
 	}
 	if v != 1 {
