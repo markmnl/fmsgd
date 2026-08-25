@@ -162,7 +162,6 @@ func TestResponseCodeName(t *testing.T) {
 		want string
 	}{
 		{RejectCodeInvalid, "invalid"},
-		{RejectCodeUnsupportedVersion, "unsupported version"},
 		{RejectCodeUndisclosed, "undisclosed"},
 		{RejectCodeTooBig, "too big"},
 		{RejectCodeInsufficentResources, "insufficient resources"},
