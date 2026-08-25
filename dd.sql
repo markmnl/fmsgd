@@ -55,13 +55,19 @@ create index if not exists msg_to_lower_idx on msg_to ((lower(addr)));
 -- Each add-to delivery for a shared message is one batch: a single sender
 -- (add_to_from) added a set of recipients at a point in time. Storing batches
 -- separately lets readers reconstruct who added which recipients and when,
--- which a single flat recipient list cannot preserve (SPEC §12).
+-- which a single flat recipient list cannot preserve (SPEC §12). A batch's
+-- identity is its message hash (sha256), which covers the batch's time: the
+-- same addresses re-issued at a new time are a distinct batch, not a
+-- duplicate (SPEC §11/§12). sha256 is null for rows recorded before this
+-- column existed and for locally originated batches not yet hashed.
 create table if not exists msg_add_to_batch (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
-	time_added		double precision	not null            -- when this host recorded the batch
+	time_added		double precision	not null,           -- the batch message's wire time field (for locally originated batches, when the batch was created)
+	sha256			bytea                                   -- batch message hash: the batch's identity (SPEC §11)
 );
+alter table msg_add_to_batch add column if not exists sha256 bytea;
 create index if not exists msg_add_to_batch_msg_id_idx on msg_add_to_batch (msg_id);
 
 create table if not exists msg_add_to (
@@ -74,8 +80,13 @@ create table if not exists msg_add_to (
     time_read       double precision,   -- time recipient read the message; null if unread
     response_code   smallint,		    -- when sending, response code of last delivery attempt if failed; when receiving, the per-recipient code this host responded, or a negative local sentinel (-1 attempt got no response, retryable; -2 recorded from an exchange, another host's delivery)
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
-	unique (msg_id, addr)
+	unique (batch_id, addr)
 );
+-- An address is unique within a batch, not across batches: distinct batches
+-- may re-add the same address (each batch is its own sibling branch, SPEC
+-- §12). Migrate existing databases off the old per-message constraint.
+alter table msg_add_to drop constraint if exists msg_add_to_msg_id_addr_key;
+create unique index if not exists msg_add_to_batch_id_addr_key on msg_add_to (batch_id, addr);
 create index if not exists msg_add_to_lower_idx on msg_add_to ((lower(addr)));
 create index if not exists msg_add_to_batch_id_idx on msg_add_to (batch_id);
 
@@ -123,7 +134,14 @@ begin
     if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
         NEW.psha256 = parent_sha256;
     elsif NEW.psha256 <> parent_sha256 then
-        raise exception 'psha256 does not match parent message % sha256', NEW.pid;
+        -- a reply may reference one of the parent's add-to batch messages by
+        -- its batch hash (SPEC §12); the relational parent is the shared row
+        if not exists (
+            select 1 from msg_add_to_batch b
+            where b.msg_id = NEW.pid and b.sha256 = NEW.psha256
+        ) then
+            raise exception 'psha256 does not match parent message % sha256 or any of its add-to batch hashes', NEW.pid;
+        end if;
     end if;
 
     return NEW;

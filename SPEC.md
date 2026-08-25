@@ -24,7 +24,7 @@ All fields are read sequentially. `[ ]` = conditionally present.
 | 4 | from | address | Sender address. |
 | 5 | to | uint8 count + addresses | ≥ 1 distinct (case-insensitive) addresses. |
 | 6 | [add to from] | address | Present iff flag bit 1 set. Must be in _from_ or _to_. |
-| 7 | [add to] | uint8 count + addresses | Present iff flag bit 1 set. ≥ 1 distinct addresses. |
+| 7 | [add to] | uint8 count + addresses | Present iff flag bit 1 set. ≥ 1 addresses, distinct within this list (case-insensitive); MAY overlap _to_. |
 | 8 | time | float64 | POSIX epoch, stamped by sending host. |
 | 9 | [topic] | uint8 length + UTF-8 | Present iff pid is NOT present. Length may be 0. |
 | 10 | type | uint8 + [US-ASCII string] | If flag bit 2 (common type) set: uint8 is a Common Media Type ID (see §4). Otherwise: uint8 is length of subsequent ASCII Media Type string. |
@@ -129,7 +129,6 @@ Single-value codes (sent as first/only byte):
 | Code | Name | Meaning |
 |-----:|------|---------|
 | 1 | invalid | Message header fails validation. |
-| 2 | unsupported version | Version not supported. |
 | 3 | undisclosed | No reason given. |
 | 4 | too big | Exceeds MAX_SIZE or MAX_EXPANDED_SIZE. |
 | 5 | insufficient resources | e.g. disk full. |
@@ -137,8 +136,8 @@ Single-value codes (sent as first/only byte):
 | 7 | too old | Timestamp too far in past. |
 | 8 | future time | Timestamp too far in future. |
 | 9 | time travel | Timestamp before parent's timestamp. |
-| 10 | duplicate | Already received for all recipients. |
-| 11 | accept add to | Add-to accepted; parent already stored; no _add to_ recipients on this host (including notification-only participant domains). Stop. |
+| 10 | duplicate | Message already received by this host. |
+| 11 | accept add to | Additional recipients received, discontinue. |
 | 64 | continue | Header accepted; send data. |
 | 65 | skip data | Add-to accepted; parent already stored; _add to_ recipients on this host. Skip data, per-recipient codes follow. |
 
@@ -180,7 +179,7 @@ Host A delivers iff _from_ or _add to from_ belongs to Host A's domain.
 
 When _has add to_ is NOT set: perform the steps below for each unique recipient domain.
 
-When _has add to_ IS set: perform the steps below for each unique participant domain — the domains of _from_ and of every address in _to_ and _add to_. _from_'s domain is omitted when _from_ is the _add to from_ (the adder is the original sender, whose host is Host A). Domains having no address in this message's _to_ or _add to_ are **notification-only**: the exchange completes at the single response code in step 5 (code 11 on success, or code 6 when the domain's host does not hold the parent) and never reaches step 6.
+When _has add to_ IS set: perform the steps below for each unique participant domain — the domains of _from_ and of every address in _to_ and _add to_. _from_'s domain is omitted when _from_ is the _add to from_ (the adder is the original sender, whose host is Host A).
 
 1. Resolve recipient domain IPs via ``fmsg.<domain>``. Connect to first responsive IP (Connection 1). Retry with backoff if unreachable.
 2. Register the message header hash and Host B's IP in an outgoing record (for matching challenges).
@@ -200,11 +199,11 @@ When _has add to_ IS set: perform the steps below for each unique participant do
 1. Read first byte on Connection 1:
    - 1–127 and supported → message version, continue.
    - 129–255 and (256 − value) supported → incoming CHALLENGE, handle per §10.5.
-   - Otherwise → respond code 2 (unsupported version), close.
+   - Otherwise → TERMINATE (unsupported version — we don't know how to respond).
 2. Parse remaining header. If unparseable → TERMINATE.
 3. Validate (all must pass, else respond code 1 invalid and close):
    - _to_ has ≥ 1 distinct address.
-   - If _has add to_: _add to from_ exists and is in _from_ or _to_; _add to_ has ≥ 1 distinct address.
+   - If _has add to_: _add to from_ exists and is in _from_ or _to_; _add to_ has ≥ 1 address, distinct within _add to_ (case-insensitive). _add to_ MAY overlap _to_ — re-serving an original recipient who lost the message.
    - If _has add to_ not set: ≥ 1 recipient in _to_ belongs to Host B's domain. If _has add to_ set: ≥ 1 participant (_from_, _to_, _add to from_ or _add to_) belongs to Host B's domain.
    - Common type IDs (message and attachment) are mapped.
    - _expanded size_ fields are present iff the corresponding zlib-deflate flag is set.
@@ -228,15 +227,17 @@ When _has add to_ IS set: perform the steps below for each unique participant do
 
 ### 10.4 Receiving — ACCEPT Response, Data Download and Per-Recipient Response
 
+Steps 1–3 determine exactly one response code for the message header: the first rule that matches decides the code sent and the remaining rules are not evaluated.
+
 1. If _add to_ set and parent verified stored in step 7:
    - If Host B has already recorded this exact add-to batch (§11) → respond code 10 (duplicate), close.
    - If any _add to_ recipient belongs to Host B's domain → respond 65 (skip data).
-   - Otherwise → record the add-to batch (_add to from_, _add to_, _time_) per §11, respond 11 (accept add to), close. This is the path notification-only participant domains take.
+   - Otherwise → record the add-to batch (_add to from_, _add to_, _time_) per §11, respond 11 (accept add to), close. This is the path taken by a participant domain hosting none of the _add to_ recipients, including a **notification-only** domain — one with no address in _to_ or _add to_ at all, being told only that recipients were added.
 2. If challenge was completed, use the message hash from the challenge response to check for duplicates across all recipients on Host B. If duplicate for all → respond code 10, close.
 3. Otherwise → respond 64 (continue).
 4. If code 65 was sent, skip to step 6 (data already stored). Otherwise download data + attachments (exactly declared on-wire sizes). For each zlib-deflate part, decompress and verify output byte length exactly equals _expanded size_; failure or mismatch means invalid → TERMINATE.
 5. If challenge was completed, verify computed message hash matches the challenge response hash. For code 65, compute from received header + stored data. Mismatch → TERMINATE.
-6. For each recipient on Host B's domain (in _to_ order, then _add to_ order), send one response byte:
+6. For each recipient on Host B's domain, send one response byte, in _to_ order then _add to_ order. An address in both lists is a recipient of each and gets one byte for its _to_ entry and one for its _add to_ entry.
    - Already received → 103 (or 105).
    - Unknown address → 100 (or 105).
    - Quota exceeded → 101 (or 105).
@@ -254,9 +255,9 @@ The challenge is optional (Receiving Host's discretion). It runs on a separate C
 
 **Sending Host (Host A) handles:**
 1. Read first byte on incoming connection:
-   - 1–127 → incoming message, handle normally.
-   - 129–255 → CHALLENGE, continue.
-   - Other → TERMINATE connection.
+   - 1–127 and supported → incoming message, handle normally.
+   - 129–255 and (256 − value) supported → CHALLENGE, continue.
+   - Otherwise → TERMINATE (unsupported version).
 2. Read 32-byte header hash. Match against outgoing record by header hash AND challenger's IP. No match → TERMINATE.
 3. Send CHALLENGE RESPONSE: 32-byte SHA-256 of entire message.
 
@@ -267,28 +268,32 @@ Host A MUST maintain a record of outgoing messages keyed by message header hash,
 ## 11. Verifying Message Stored
 
 A message is verified as stored iff:
-- A SHA-256 digest matches a previously accepted message (code 200 or 11).
+- A SHA-256 digest matches a message either previously accepted by the host (code 200 to ≥ 1 recipient, or code 11), or sent by the host (its _from_ / _add to from_ belongs to the host's domain and the host transmitted it or holds it for sending — including each add-to batch it sent, since replies may reference a batch by its hash).
 - That message currently exists and is retrievable.
 
 A host MUST retain each stored message in full and exactly as transmitted — including the complete _to_ and _add to_ recipient lists, not only recipients on its own domain — so the message hash can always be faithfully recomputed and participant checks (§10.3 step 7) evaluate against the true participant set.
 
-For accept-add-to (code 11) messages, the hash is computed by combining the add-to message header with the original message's data and attachment data.
+An add-to message's data never crosses the wire when the host already holds the original (codes 11 and 65), and its sender likewise already holds it. Its hash is therefore computed by RECONSTRUCTION: the add-to header exactly as transmitted combined with the original message's data and attachment data. Every host holding a batch — accepted via 11 or 65, or sent by it — MUST be able to reconstruct it so replies referencing the batch hash can be verified; hosts on the 65 path MUST record the batch fields (_add to from_, _add to_, _time_) exactly as transmitted, as the 11 path already requires.
 
-Each add-to batch produces a distinct hash. Only the exact batch that had an accepted response (200 or 11) matches.
+Each add-to batch produces a distinct hash — batch identity IS the batch message hash, which covers _time_: the same _add to_ addresses re-issued at a new _time_ are a distinct batch. Only the exact batch that had an accepted response (200 or 11) matches.
 
 ## 12. Adding Recipients
 
 An add-to message is a duplicate of the original message with these differences:
-- Flag bit 1 (_has add to_) set.
-- _pid_ = hash of the message being added to.
+- Flag bits 0 (_has pid_) and 1 (_has add to_) set.
+- _pid_ = hash of the message being added to (replacing any _pid_ the original had).
 - _add to from_ = participant initiating the add (must be in original _from_ or _to_).
-- _add to_ = new recipient addresses.
+- _add to_ = the added recipient addresses; these MAY include an address already in _to_, re-serving an original recipient.
 - _time_ = new timestamp.
 - _topic_ is NOT present (pid is set).
 
 An add-to message MUST be sent to every participant domain per §10.2, so all participants of the message being added to — including the original sender, when not themselves the _add to from_ — learn of the added recipients, not only the domains hosting the new recipients. This is required because a subsequent reply may reference this add-to message via _pid_, and a host can only accept a reply whose parent it holds.
 
-Add-to batches do not chain: recipients are always added to the original message; an add-to message's _pid_ MUST NOT reference another add-to message. A message therefore has 0 or more add-to batches, each independently referencing it.
+Add-to batches do not chain: recipients are always added to the original message; an add-to message's _pid_ MUST NOT reference another add-to message. A message therefore has 0 or more add-to batches, each a sibling branch under the original — the thread evolves as a tree.
+
+A recipient added by a batch and not already in _to_ is a participant of that batch message only, not of the original: their replies MUST reference the batch message via _pid_ (referencing the original would fail the participant check, §10.3 step 7) and extend the batch's branch. An address in both _to_ and _add to_ was already a participant of the original and may reply on either branch.
+
+A batch is identified by its message hash, which covers _time_ (§11): re-issuing the same _add to_ addresses at a new _time_ is a new, distinct batch — a new sibling branch — not a duplicate.
 
 ## 13. Security Requirements
 

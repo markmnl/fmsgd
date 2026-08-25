@@ -33,8 +33,10 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
+	// Response codes (SPEC §9). 2 was "unsupported version"; unsupported
+	// versions now TERMINATE without responding (SPEC §10.3/§10.5), so it is
+	// never sent and is left unassigned to keep the numbering stable.
 	RejectCodeInvalid              uint8 = 1
-	RejectCodeUnsupportedVersion   uint8 = 2
 	RejectCodeUndisclosed          uint8 = 3
 	RejectCodeTooBig               uint8 = 4
 	RejectCodeInsufficentResources uint8 = 5
@@ -64,8 +66,6 @@ func responseCodeName(code uint8) string {
 	switch code {
 	case RejectCodeInvalid:
 		return "invalid"
-	case RejectCodeUnsupportedVersion:
-		return "unsupported version"
 	case RejectCodeUndisclosed:
 		return "undisclosed"
 	case RejectCodeTooBig:
@@ -583,6 +583,9 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	addToHasOurDomain := hasDomainRecipient(h.AddTo, Domain)
 	hasLocalRecipient := addToHasOurDomain || hasDomainRecipient(h.To, Domain)
 
+	// Deliberately resolves canonical message hashes only: batches do not
+	// chain, so an add-to whose pid is another batch's hash must not resolve
+	// (SPEC §12).
 	parentID, err := lookupMsgIdByHash(h.Pid)
 	if err != nil {
 		return h, err
@@ -607,8 +610,24 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return h, fmt.Errorf("add-to: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
 	}
 
+	// Batch identity is the batch message hash — this add-to header combined
+	// with the stored parent's payload (SPEC §11) — so map the parent's data
+	// in and compute it before the duplicate check.
+	h.Filepath = parentMsg.Filepath
+	for i := range h.Attachments {
+		if i < len(parentMsg.Attachments) {
+			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
+		}
+	}
+	batchHash, err := h.GetMessageHash()
+	if err != nil {
+		return h, err
+	}
+
 	// A batch this host already recorded is a duplicate (SPEC §10.4 step 1).
-	recorded, err := addToBatchRecorded(parentID, h.AddTo)
+	// The same addresses re-issued at a new time hash differently and are a
+	// distinct batch — a new sibling branch — not a duplicate (SPEC §12).
+	recorded, err := addToBatchRecorded(parentID, batchHash)
 	if err != nil {
 		return h, err
 	}
@@ -624,12 +643,6 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return h, nil
 	}
 
-	h.Filepath = parentMsg.Filepath
-	for i := range h.Attachments {
-		if i < len(parentMsg.Attachments) {
-			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
-		}
-	}
 	h.InitialResponseCode = AcceptCodeAddTo
 	return h, nil
 }
@@ -643,14 +656,16 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 	if err != nil {
 		return err
 	}
-	if parentID == 0 {
-		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
-			return err
-		}
-		return fmt.Errorf("pid reply: parent not found for pid %s", hex.EncodeToString(h.Pid))
-	}
 
-	parentMsg, err := getMsgByID(parentID)
+	var parentMsg *FMsgHeader
+	if parentID != 0 {
+		parentMsg, err = getMsgByID(parentID)
+	} else {
+		// A reply may reference an add-to batch message via pid (SPEC §12);
+		// its wire form is reconstructed from the stored shared message and
+		// batch fields (SPEC §11).
+		parentMsg, err = getMsgByBatchHash(h.Pid)
+	}
 	if err != nil {
 		return err
 	}
@@ -658,7 +673,7 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
 			return err
 		}
-		return fmt.Errorf("pid reply: parent message not found by ID %d", parentID)
+		return fmt.Errorf("pid reply: parent not found for pid %s", hex.EncodeToString(h.Pid))
 	}
 	if !isMessageRetrievable(parentMsg) {
 		if err := sendCode(c, RejectCodeParentNotFound); err != nil {
@@ -693,15 +708,12 @@ func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, e
 		if challengeVersion == 1 {
 			return true, handleChallenge(c, r)
 		}
-		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
-			log.Printf("WARN: failed to send unsupported version response: %s", err)
-		}
+		// TERMINATE without responding (SPEC §10.3/§10.5): an unsupported
+		// version is one we do not know how to respond in.
 		return false, fmt.Errorf("unsupported challenge version: %d", challengeVersion)
 	}
 	if v != 1 {
-		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
-			log.Printf("WARN: failed to send unsupported version response: %s", err)
-		}
+		// TERMINATE without responding (SPEC §10.3/§10.5).
 		return false, fmt.Errorf("unsupported message version: %d", v)
 	}
 	h.Version = v
@@ -1015,7 +1027,7 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 	}
 
 	// read pid if any
-	if flags&FlagHasPid == 1 {
+	if flags&FlagHasPid != 0 {
 		pid, err := io.ReadAll(io.LimitReader(r, 32))
 		if err != nil {
 			return h, r, err
@@ -1459,9 +1471,11 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 	h.Filepath = primaryFilepath
 	if err := storeMsgDetail(h, localOutcome); err != nil {
 		log.Printf("ERROR: storing message: %s", err)
+		// These bytes go into the per-recipient code stream, so the failure
+		// code must be the per-recipient 105, never the header-level 3.
 		for i := range codes {
 			if codes[i] == RejectCodeAccept {
-				codes[i] = RejectCodeUndisclosed
+				codes[i] = RejectCodeUserUndisclosed
 			}
 		}
 		return false
@@ -1554,7 +1568,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		fp := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
 		if err := copyMessagePayload(src, fp, h.Flags&FlagDeflate != 0, h.Size); err != nil {
 			log.Printf("ERROR: copying downloaded message from: %s, to: %s", h.Filepath, fp)
-			codes[i] = RejectCodeUndisclosed
+			codes[i] = RejectCodeUserUndisclosed
 			continue
 		}
 
@@ -1571,7 +1585,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 			primaryFilepath = fp
 			if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
 				log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
-				codes[i] = RejectCodeUndisclosed
+				codes[i] = RejectCodeUserUndisclosed
 				primaryFilepath = ""
 				acceptedTo = acceptedTo[:0]
 				acceptedAddTo = acceptedAddTo[:0]
@@ -1757,14 +1771,13 @@ func handleConn(c net.Conn) {
 	}
 	c.SetReadDeadline(time.Now().Add(calcNetIODuration(deadlineBytes, MinDownloadRate)))
 	if err := downloadMessage(c, r, header, skipData); err != nil {
-		// if error was a protocal violation, abort; otherise let sender know there was an internal error
+		// After code 64/65 the sender reads one byte per recipient, so a
+		// header-level code here would be read as a recipient's code and
+		// desync the stream — abort instead; the sender records no response
+		// and retries later (§10.4).
 		log.Printf("ERROR: Download failed from, %s: %s", c.RemoteAddr().String(), err)
-		if errors.Is(err, ErrProtocolViolation) {
-			abortConn(c)
-			return
-		} else {
-			_ = sendCode(c, RejectCodeUndisclosed)
-		}
+		abortConn(c)
+		return
 	}
 
 	// gracefully close 1st connection

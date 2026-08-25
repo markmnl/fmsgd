@@ -491,6 +491,19 @@ func deliverMessage(target pendingTarget) {
 		}
 		h := m.addToHeader(b, sharedHash)
 		d.applyTo(h)
+		// Persist the batch hash — the batch's identity (SPEC §11) — once,
+		// so replies referencing this batch resolve at this host too, which
+		// must verify messages it sent, not only ones it received. Cached on
+		// h, so the challenge response reuses this computation.
+		batchHash, err := h.GetMessageHash()
+		if err != nil {
+			log.Printf("ERROR: sender: computing batch hash for batch %d of msg %d: %s", b.ID, target.MsgID, err)
+			continue
+		}
+		if err := ensureBatchHash(db, b.ID, batchHash); err != nil {
+			log.Printf("ERROR: sender: %s", err)
+			continue
+		}
 		deliverUnit(db, target, h, "msg_add_to", b.ID)
 	}
 }
@@ -513,6 +526,17 @@ func markLocalDelivered(target pendingTarget) {
 	`, now, target.MsgID, target.Domain); err != nil {
 		log.Printf("ERROR: sender: marking local recipients delivered for msg %d: %s", target.MsgID, err)
 	}
+}
+
+// ensureBatchHash persists an add-to batch's message hash when not yet stored.
+// Like ensureSharedHash for the canonical hash, this is what lets replies that
+// reference the batch via pid resolve on the host that originated the batch
+// (SPEC §11: a host verifies messages it sent, not only ones it received).
+func ensureBatchHash(db *sql.DB, batchID int64, batchHash []byte) error {
+	if _, err := db.Exec(`UPDATE msg_add_to_batch SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`, batchHash, batchID); err != nil {
+		return fmt.Errorf("storing sha256 for add-to batch %d: %w", batchID, err)
+	}
+	return nil
 }
 
 // ensureSharedHash persists the message's canonical hash when not yet stored and
