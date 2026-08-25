@@ -33,8 +33,10 @@ const (
 	InboxDirName  = "in"
 	OutboxDirName = "out"
 
+	// Response codes (SPEC §9). 2 was "unsupported version"; unsupported
+	// versions now TERMINATE without responding (SPEC §10.3/§10.5), so it is
+	// never sent and is left unassigned to keep the numbering stable.
 	RejectCodeInvalid              uint8 = 1
-	RejectCodeUnsupportedVersion   uint8 = 2
 	RejectCodeUndisclosed          uint8 = 3
 	RejectCodeTooBig               uint8 = 4
 	RejectCodeInsufficentResources uint8 = 5
@@ -64,8 +66,6 @@ func responseCodeName(code uint8) string {
 	switch code {
 	case RejectCodeInvalid:
 		return "invalid"
-	case RejectCodeUnsupportedVersion:
-		return "unsupported version"
 	case RejectCodeUndisclosed:
 		return "undisclosed"
 	case RejectCodeTooBig:
@@ -693,15 +693,12 @@ func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, e
 		if challengeVersion == 1 {
 			return true, handleChallenge(c, r)
 		}
-		// TERMINATE without responding (SPEC §10.3/§10.5): the challenger's
-		// next read is exactly the 32-byte CHALLENGE-RESPONSE hash, so a
-		// response code here would be indistinguishable from hash bytes.
+		// TERMINATE without responding (SPEC §10.3/§10.5): an unsupported
+		// version is one we do not know how to respond in.
 		return false, fmt.Errorf("unsupported challenge version: %d", challengeVersion)
 	}
 	if v != 1 {
-		if err := sendCode(c, RejectCodeUnsupportedVersion); err != nil {
-			log.Printf("WARN: failed to send unsupported version response: %s", err)
-		}
+		// TERMINATE without responding (SPEC §10.3/§10.5).
 		return false, fmt.Errorf("unsupported message version: %d", v)
 	}
 	h.Version = v
