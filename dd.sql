@@ -64,7 +64,7 @@ create table if not exists msg_add_to_batch (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
-	time_added		double precision	not null,           -- when this host recorded the batch
+	time_added		double precision	not null,           -- the batch message's wire time field (for locally originated batches, when the batch was created)
 	sha256			bytea                                   -- batch message hash: the batch's identity (SPEC §11)
 );
 alter table msg_add_to_batch add column if not exists sha256 bytea;
@@ -134,7 +134,14 @@ begin
     if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
         NEW.psha256 = parent_sha256;
     elsif NEW.psha256 <> parent_sha256 then
-        raise exception 'psha256 does not match parent message % sha256', NEW.pid;
+        -- a reply may reference one of the parent's add-to batch messages by
+        -- its batch hash (SPEC §12); the relational parent is the shared row
+        if not exists (
+            select 1 from msg_add_to_batch b
+            where b.msg_id = NEW.pid and b.sha256 = NEW.psha256
+        ) then
+            raise exception 'psha256 does not match parent message % sha256 or any of its add-to batch hashes', NEW.pid;
+        end if;
     end if;
 
     return NEW;

@@ -86,6 +86,7 @@ func threadHasFromDomain(hash []byte, domain string) (bool, error) {
 			SELECT id, from_addr, pid, 1 AS depth, ARRAY[id] AS seen
 			FROM msg
 			WHERE sha256 = $1
+			   OR id IN (SELECT msg_id FROM msg_add_to_batch WHERE sha256 = $1)
 			UNION ALL
 			SELECT m.id, m.from_addr, m.pid, t.depth + 1, t.seen || m.id
 			FROM msg m
@@ -155,8 +156,15 @@ type txParentLinkStore struct {
 }
 
 func (s txParentLinkStore) lookupParentID(parentHash []byte) (int64, error) {
+	// A reply's pid may reference a message's canonical hash or one of its
+	// add-to batch hashes (SPEC §12); either way the relational parent is the
+	// shared message row.
 	var id int64
-	err := s.tx.QueryRow("SELECT id FROM msg WHERE sha256 = $1", parentHash).Scan(&id)
+	err := s.tx.QueryRow(`
+		SELECT id FROM msg WHERE sha256 = $1
+		UNION ALL
+		SELECT msg_id FROM msg_add_to_batch WHERE sha256 = $1
+		LIMIT 1`, parentHash).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -269,6 +277,57 @@ func getMsgByID(msgID int64) (*FMsgHeader, error) {
 	return h, nil
 }
 
+// getMsgByBatchHash reconstructs the wire form of an add-to batch message
+// identified by its batch hash, or nil when no such batch is recorded. A reply
+// may reference a batch via pid, and per SPEC §11 the batch message is
+// reconstructible from what the host already holds — the stored shared message
+// plus the batch's sender, recipients and wire time — even though the batch's
+// data was never downloaded again.
+func getMsgByBatchHash(batchHash []byte) (*FMsgHeader, error) {
+	if len(batchHash) == 0 {
+		return nil, nil
+	}
+	db, err := sql.Open("postgres", "")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var msgID, batchID int64
+	err = tx.QueryRow(`SELECT msg_id, id FROM msg_add_to_batch WHERE sha256 = $1`, batchHash).Scan(&msgID, &batchID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	m, err := loadMsgFields(tx, msgID)
+	if err != nil {
+		return nil, err
+	}
+	batches, err := loadAddToBatches(tx, msgID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range batches {
+		if batches[i].ID == batchID {
+			sharedHash, err := m.sharedHash()
+			if err != nil {
+				return nil, err
+			}
+			return m.addToHeader(batches[i], sharedHash), nil
+		}
+	}
+	return nil, fmt.Errorf("add-to batch %d missing for msg %d", batchID, msgID)
+}
+
 // existingMsgIDForAddTo returns the id of an already-stored message row whose
 // canonical sha256 matches msgHash, for an add-to delivery. It returns 0 when
 // the message is not an add-to message or no such row exists, so the caller
@@ -364,7 +423,10 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 	if err != nil {
 		return fmt.Errorf("compute add-to batch hash: %w", err)
 	}
-	batchID, err := insertAddToBatch(tx, msgID, addToFrom, now, batchHash)
+	// The batch's WIRE time is stored, not the local record time: the batch
+	// message must be reconstructible exactly as transmitted so its hash can
+	// be recomputed and replies referencing it verified (SPEC §11).
+	batchID, err := insertAddToBatch(tx, msgID, addToFrom, msg.Timestamp, batchHash)
 	if err != nil {
 		return err
 	}
@@ -494,12 +556,14 @@ values ($1, $2, $3, $4)`)
 			addToFrom = msg.AddToFrom.ToString()
 		}
 		// Cached from download verification: the wire hash of an add-to
-		// message is its batch hash, the batch's identity (SPEC §11).
+		// message is its batch hash, the batch's identity (SPEC §11). The
+		// batch's wire time is stored so the batch message stays
+		// reconstructible exactly as transmitted.
 		batchHash, err := msg.GetMessageHash()
 		if err != nil {
 			return fmt.Errorf("compute add-to batch hash: %w", err)
 		}
-		batchID, err := insertAddToBatch(tx, msgID, addToFrom, now, batchHash)
+		batchID, err := insertAddToBatch(tx, msgID, addToFrom, msg.Timestamp, batchHash)
 		if err != nil {
 			return err
 		}
