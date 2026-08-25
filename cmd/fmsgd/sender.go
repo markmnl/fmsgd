@@ -601,9 +601,11 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		}
 	}()
 
-	// Per-recipient response codes arrive in to-field order then add-to order
-	// (SPEC §10.2 step 6). Only this unit's locked recipients are recorded; the
-	// recipients carried only to reconstruct that ordering stay unlocked.
+	// Per-recipient response codes arrive one per recipient entry, in to-field
+	// order then add-to order (SPEC §10.2 step 6). An address in both lists is a
+	// recipient of each and so is counted, and answered, twice. Only this
+	// unit's locked recipients are recorded; the recipients carried only to
+	// reconstruct that ordering stay unlocked.
 	lockedSet := make(map[string]bool, len(locked))
 	for _, a := range locked {
 		lockedSet[strings.ToLower(a)] = true

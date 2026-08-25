@@ -720,35 +720,35 @@ func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, e
 	return false, nil
 }
 
-func readToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) (map[string]bool, error) {
+func readToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 	num, err := r.ReadByte()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if num == 0 {
 		if err := sendCode(c, RejectCodeInvalid); err != nil {
-			return nil, err
+			return err
 		}
-		return nil, fmt.Errorf("to count must be >= 1")
+		return fmt.Errorf("to count must be >= 1")
 	}
 	seen := make(map[string]bool)
 	for num > 0 {
 		addr, err := readAddress(r)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		key := strings.ToLower(addr.ToString())
 		if seen[key] {
-			return nil, fmt.Errorf("duplicate recipient address: %s", addr.ToString())
+			return fmt.Errorf("duplicate recipient address: %s", addr.ToString())
 		}
 		seen[key] = true
 		h.To = append(h.To, *addr)
 		num--
 	}
-	return seen, nil
+	return nil
 }
 
-func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader, seen map[string]bool) error {
+func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 	if h.Flags&FlagHasAddTo == 0 {
 		return nil
 	}
@@ -811,12 +811,9 @@ func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader, seen map[st
 			return fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
 		}
 		addToSeen[key] = true
-		if seen[key] {
-			if err := sendCode(c, RejectCodeInvalid); err != nil {
-				return err
-			}
-			return fmt.Errorf("add-to address already in to: %s", addr.ToString())
-		}
+		// An address in both _to_ and _add to_ is permitted (SPEC §1.4.6.3
+		// NOTE II): it re-serves an original recipient. It is a recipient of
+		// each list and gets one response code per entry.
 		h.AddTo = append(h.AddTo, *addr)
 		addToCount--
 	}
@@ -1047,12 +1044,11 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 
 	h.From = *from
 
-	seen, err := readToRecipients(c, r, h)
-	if err != nil {
+	if err := readToRecipients(c, r, h); err != nil {
 		return h, r, err
 	}
 
-	if err := readAddToRecipients(c, r, h, seen); err != nil {
+	if err := readAddToRecipients(c, r, h); err != nil {
 		return h, r, err
 	}
 
@@ -1256,19 +1252,26 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 	}
 }
 
-func localRecipients(h *FMsgHeader) []FMsgAddress {
-	addrs := make([]FMsgAddress, 0, len(h.To)+len(h.AddTo))
+// localRecipients returns this host's recipients in wire order: every _to_
+// entry for this domain, then every _add to_ entry for this domain. Addresses
+// are distinct within each list but MAY appear in both (SPEC Terms), in which
+// case the address is a recipient of each and receives one response code per
+// entry — so the count here is exactly the number of code bytes exchanged.
+// numLocalTo reports how many of the returned entries came from _to_.
+func localRecipients(h *FMsgHeader) (addrs []FMsgAddress, numLocalTo int) {
+	addrs = make([]FMsgAddress, 0, len(h.To)+len(h.AddTo))
 	for _, addr := range h.To {
 		if strings.EqualFold(addr.Domain, Domain) {
 			addrs = append(addrs, addr)
 		}
 	}
+	numLocalTo = len(addrs)
 	for _, addr := range h.AddTo {
 		if strings.EqualFold(addr.Domain, Domain) {
 			addrs = append(addrs, addr)
 		}
 	}
-	return addrs
+	return addrs, numLocalTo
 }
 
 func allLocalRecipientsHaveMessageHash(msgHash []byte, addrs []FMsgAddress) (bool, error) {
@@ -1488,7 +1491,7 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 }
 
 func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) error {
-	addrs := localRecipients(h)
+	addrs, numLocalTo := localRecipients(h)
 	if len(addrs) == 0 {
 		return fmt.Errorf("%w our domain: %s, not in recipient list", ErrProtocolViolation, Domain)
 	}
@@ -1542,11 +1545,6 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	defer src.Close()
 
 	// validate each recipient and copy message for accepted ones
-	// Build a set of add-to addresses for later classification
-	addToSet := make(map[string]bool)
-	for _, addr := range h.AddTo {
-		addToSet[strings.ToLower(addr.ToString())] = true
-	}
 	acceptedTo := []FMsgAddress{}
 	acceptedAddTo := []FMsgAddress{}
 	var primaryFilepath string
@@ -1575,10 +1573,13 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		}
 
 		codes[i] = RejectCodeAccept
-		if addToSet[strings.ToLower(addr.ToString())] {
-			acceptedAddTo = append(acceptedAddTo, addr)
-		} else {
+		// Entries before numLocalTo came from _to_, the rest from _add to_. An
+		// address in both lists appears once in each range and is recorded in
+		// both, rather than being classified exclusively as add-to.
+		if i < numLocalTo {
 			acceptedTo = append(acceptedTo, addr)
+		} else {
+			acceptedAddTo = append(acceptedAddTo, addr)
 		}
 		if primaryFilepath == "" {
 			primaryFilepath = fp
@@ -1696,7 +1697,7 @@ func handleConn(c net.Conn) {
 	// Codes 65 and 64 both require a dup check when challenge was completed.
 	allLocalDup := false
 	if header.ChallengeCompleted && header.InitialResponseCode != AcceptCodeAddTo {
-		addrs := localRecipients(header)
+		addrs, _ := localRecipients(header)
 		var err error
 		// Duplicate detection keys on msg.sha256 (the canonical original-form
 		// hash). For an add-to delivery that is header.Pid; the challenge hash

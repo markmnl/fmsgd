@@ -262,15 +262,14 @@ func TestReadToRecipients(t *testing.T) {
 	b = append(b, encodeUInt8String(t, "@bob@example.com")...)
 
 	h := &FMsgHeader{}
-	seen, err := readToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h)
-	if err != nil {
+	if err := readToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h); err != nil {
 		t.Fatalf("readToRecipients returned error: %v", err)
 	}
 	if len(h.To) != 2 {
 		t.Fatalf("len(h.To) = %d, want 2", len(h.To))
 	}
-	if !seen["@alice@example.com"] || !seen["@bob@example.com"] {
-		t.Fatalf("seen map missing expected recipients: %#v", seen)
+	if h.To[0].ToString() != "@alice@example.com" || h.To[1].ToString() != "@bob@example.com" {
+		t.Fatalf("unexpected To: %+v", h.To)
 	}
 }
 
@@ -280,14 +279,12 @@ func TestReadAddToRecipients(t *testing.T) {
 		From:  FMsgAddress{User: "alice", Domain: "example.com"},
 		To:    []FMsgAddress{{User: "bob", Domain: "example.com"}},
 	}
-	seen := map[string]bool{"@bob@example.com": true}
-
 	b := []byte{}
 	b = append(b, encodeUInt8String(t, "@alice@example.com")...) // add-to-from
 	b = append(b, 1)                                             // add-to count
 	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
 
-	err := readAddToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h, seen)
+	err := readAddToRecipients(nil, bufio.NewReader(bytes.NewReader(b)), h)
 	if err != nil {
 		t.Fatalf("readAddToRecipients returned error: %v", err)
 	}
@@ -358,7 +355,7 @@ func TestReadAddToRecipientsRejectsWhenPidMissing(t *testing.T) {
 	h := &FMsgHeader{Flags: FlagHasAddTo}
 	c := &testConn{}
 
-	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(nil)), h, map[string]bool{})
+	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(nil)), h)
 	if err == nil {
 		t.Fatalf("expected error when add-to flag is set without pid")
 	}
@@ -374,15 +371,13 @@ func TestReadAddToRecipientsRejectsDuplicateAddTo(t *testing.T) {
 		To:    []FMsgAddress{{User: "bob", Domain: "example.com"}},
 	}
 	c := &testConn{}
-	seen := map[string]bool{"@bob@example.com": true}
-
 	b := []byte{}
 	b = append(b, encodeUInt8String(t, "@alice@example.com")...) // add-to-from
 	b = append(b, 2)                                             // add-to count
 	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
 	b = append(b, encodeUInt8String(t, "@carol@example.com")...)
 
-	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(b)), h, seen)
+	err := readAddToRecipients(c, bufio.NewReader(bytes.NewReader(b)), h)
 	if err == nil {
 		t.Fatalf("expected duplicate add-to error")
 	}
