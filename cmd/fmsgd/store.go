@@ -627,110 +627,20 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	if err != nil {
 		return err
 	}
-	parentHash := relationalParentHash(msg)
 
-	// An add-to delivery for a message this host already holds extends the
-	// existing row's recipient list; inserting again would collide on the
-	// unique canonical sha256 (SPEC §12).
-	if existingID, err := existingMsgIDForAddTo(tx, msg, msgHash); err != nil {
-		return err
-	} else if existingID != 0 {
-		if err := attachAddToRecipients(tx, existingID, msg); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-
-	var msgID int64
-	err = tx.QueryRow(`insert into msg (version
-	, no_reply
-	, is_important
-	, is_deflate
-	, time_sent
-	, from_addr
-	, topic
-	, type
-	, sha256
-	, psha256
-	, size
-	, filepath
-	, wire_header)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-returning id`,
-		msg.Version,
-		msg.Flags&FlagNoReply != 0,
-		msg.Flags&FlagImportant != 0,
-		msg.Flags&FlagDeflate != 0,
-		msg.Timestamp,
-		msg.From.ToString(),
-		msg.Topic,
-		msg.Type,
-		msgHash,
-		parentHash,
-		int(msg.Size),
-		"",
-		msg.Encode()).Scan(&msgID)
+	// Code 11 is only ever responded when this host already holds the message
+	// being added to (SPEC §10.4 step 1), so the shared row always exists and
+	// the add-to delivery extends its recipient list (SPEC §12).
+	existingID, err := existingMsgIDForAddTo(tx, msg, msgHash)
 	if err != nil {
 		return err
 	}
-
-	// Record-keeping rows only: no delivery happened for anyone here, so every
-	// recipient is marked not-our-delivery.
-	toStmt, err := tx.Prepare(`insert into msg_to (msg_id, addr, response_code) values ($1, $2, $3)`)
-	if err != nil {
+	if existingID == 0 {
+		return fmt.Errorf("add-to header for unstored message %x", msgHash)
+	}
+	if err := attachAddToRecipients(tx, existingID, msg); err != nil {
 		return err
 	}
-	defer toStmt.Close()
-	for _, addr := range msg.To {
-		if _, err := toStmt.Exec(msgID, addr.ToString(), int16(localResponseCodeNotOurDelivery)); err != nil {
-			return err
-		}
-	}
-
-	// insert add-to recipients as one batch
-	if len(msg.AddTo) > 0 {
-		addToFrom := ""
-		if msg.AddToFrom != nil {
-			addToFrom = msg.AddToFrom.ToString()
-		}
-		// No stored parent payload here, so the batch hash cannot be computed.
-		batchID, err := insertAddToBatch(tx, msgID, addToFrom, timeutil.TimestampNow().Float64(), nil)
-		if err != nil {
-			return err
-		}
-
-		addToStmt, err := tx.Prepare(`insert into msg_add_to (msg_id, batch_id, addr, response_code) values ($1, $2, $3, $4)`)
-		if err != nil {
-			return err
-		}
-		defer addToStmt.Close()
-		for _, addr := range msg.AddTo {
-			if _, err := addToStmt.Exec(msgID, batchID, addr.ToString(), int16(localResponseCodeNotOurDelivery)); err != nil {
-				return err
-			}
-		}
-	}
-
-	if len(msg.Attachments) > 0 {
-		attStmt, err := tx.Prepare(`insert into msg_attachment (msg_id, position, flags, type, filename, filesize, filepath)
-values ($1, $2, $3, $4, $5, $6, $7)`)
-		if err != nil {
-			return err
-		}
-		defer attStmt.Close()
-
-		for i := range msg.Attachments {
-			att := msg.Attachments[i]
-			if _, err := attStmt.Exec(msgID, i, int(att.Flags), att.Type, att.Filename, int(att.Size), att.Filepath); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := resolveMsgParentLinks(tx, msgID, msgHash, parentHash, requiresStoredParent(msg)); err != nil {
-		return err
-	}
-
 	return tx.Commit()
 }
 
