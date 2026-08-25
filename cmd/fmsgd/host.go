@@ -799,12 +799,9 @@ func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader, seen map[st
 			return fmt.Errorf("duplicate recipient address in add to: %s", addr.ToString())
 		}
 		addToSeen[key] = true
-		if seen[key] {
-			if err := sendCode(c, RejectCodeInvalid); err != nil {
-				return err
-			}
-			return fmt.Errorf("add-to address already in to: %s", addr.ToString())
-		}
+		// An address in both _to_ and _add to_ is permitted (SPEC §1.4.6.3
+		// NOTE II): it re-serves an original recipient. Recipients are a set,
+		// so localRecipients collapses it to a single per-recipient code.
 		h.AddTo = append(h.AddTo, *addr)
 		addToCount--
 	}
@@ -1244,17 +1241,30 @@ func uniqueFilepath(dir string, timestamp uint32, ext string) string {
 	}
 }
 
+// localRecipients returns this host's recipients as a SET (SPEC Terms): one
+// entry per distinct address, in the order the address first appears scanning
+// _to_ then _add to_. An address in both lists is one recipient and so gets
+// exactly one per-recipient response code, keeping the response stream in
+// step with what the sender expects.
 func localRecipients(h *FMsgHeader) []FMsgAddress {
 	addrs := make([]FMsgAddress, 0, len(h.To)+len(h.AddTo))
-	for _, addr := range h.To {
-		if strings.EqualFold(addr.Domain, Domain) {
-			addrs = append(addrs, addr)
+	seen := make(map[string]bool, len(h.To)+len(h.AddTo))
+	appendUnique := func(addr FMsgAddress) {
+		if !strings.EqualFold(addr.Domain, Domain) {
+			return
 		}
+		key := strings.ToLower(addr.ToString())
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		addrs = append(addrs, addr)
+	}
+	for _, addr := range h.To {
+		appendUnique(addr)
 	}
 	for _, addr := range h.AddTo {
-		if strings.EqualFold(addr.Domain, Domain) {
-			addrs = append(addrs, addr)
-		}
+		appendUnique(addr)
 	}
 	return addrs
 }
@@ -1528,7 +1538,13 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	defer src.Close()
 
 	// validate each recipient and copy message for accepted ones
-	// Build a set of add-to addresses for later classification
+	// Build sets of to / add-to addresses for later classification. The two
+	// may overlap (SPEC §1.4.6.3 NOTE II), in which case the recipient belongs
+	// to both the original's _to_ list and this batch and is recorded in both.
+	toSet := make(map[string]bool)
+	for _, addr := range h.To {
+		toSet[strings.ToLower(addr.ToString())] = true
+	}
 	addToSet := make(map[string]bool)
 	for _, addr := range h.AddTo {
 		addToSet[strings.ToLower(addr.ToString())] = true
@@ -1561,10 +1577,12 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		}
 
 		codes[i] = RejectCodeAccept
-		if addToSet[strings.ToLower(addr.ToString())] {
-			acceptedAddTo = append(acceptedAddTo, addr)
-		} else {
+		key := strings.ToLower(addr.ToString())
+		if toSet[key] {
 			acceptedTo = append(acceptedTo, addr)
+		}
+		if addToSet[key] {
+			acceptedAddTo = append(acceptedAddTo, addr)
 		}
 		if primaryFilepath == "" {
 			primaryFilepath = fp

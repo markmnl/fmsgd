@@ -577,8 +577,9 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		}
 	}()
 
-	// Per-recipient response codes arrive in to-field order then add-to order
-	// (SPEC §10.2 step 6). Only this unit's locked recipients are recorded; the
+	// Per-recipient response codes arrive one per DISTINCT recipient, in the
+	// order the address first appears scanning _to_ then _add to_ (SPEC §10.2
+	// step 6). Only this unit's locked recipients are recorded; the
 	// recipients carried only to reconstruct that ordering stay unlocked.
 	lockedSet := make(map[string]bool, len(locked))
 	for _, a := range locked {
@@ -589,13 +590,23 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		isLocked bool
 	}
 	var domainRecips []domainRecip
+	// Recipients are a SET (SPEC Terms): an address in both _to_ and _add to_
+	// is one recipient and the receiving host sends exactly one code for it,
+	// in its _to_ position. Counting the occurrence twice here would read one
+	// byte too many and desync the stream.
+	seenRecip := make(map[string]bool)
 	appendDomain := func(addrs []FMsgAddress) {
 		for _, addr := range addrs {
 			if !strings.EqualFold(addr.Domain, target.Domain) {
 				continue
 			}
 			s := addr.ToString()
-			domainRecips = append(domainRecips, domainRecip{addr: s, isLocked: lockedSet[strings.ToLower(s)]})
+			key := strings.ToLower(s)
+			if seenRecip[key] {
+				continue
+			}
+			seenRecip[key] = true
+			domainRecips = append(domainRecips, domainRecip{addr: s, isLocked: lockedSet[key]})
 		}
 	}
 	appendDomain(h.To)
