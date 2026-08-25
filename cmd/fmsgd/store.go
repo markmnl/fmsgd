@@ -286,14 +286,13 @@ func existingMsgIDForAddTo(tx *sql.Tx, msg *FMsgHeader, msgHash []byte) (int64, 
 	return id, err
 }
 
-// addToBatchRecorded reports whether an incoming add-to batch carries nothing
-// this host has not already recorded against stored message msgID: every
-// address is unique per message across batches (msg_add_to unique (msg_id,
-// addr)), so when every address in the incoming batch is already attached the
-// delivery is a re-send of a recorded batch and is a duplicate (code 10,
-// SPEC §10.4 step 1).
-func addToBatchRecorded(msgID int64, addTo []FMsgAddress) (bool, error) {
-	if len(addTo) == 0 {
+// addToBatchRecorded reports whether this host has already recorded an add-to
+// batch with this batch message hash against stored message msgID. Batch
+// identity IS the batch message hash, which covers time (SPEC §11): the same
+// addresses re-issued at a new time hash differently and are a distinct
+// batch, not a duplicate (SPEC §12).
+func addToBatchRecorded(msgID int64, batchHash []byte) (bool, error) {
+	if len(batchHash) == 0 {
 		return false, nil
 	}
 	db, err := sql.Open("postgres", "")
@@ -302,29 +301,22 @@ func addToBatchRecorded(msgID int64, addTo []FMsgAddress) (bool, error) {
 	}
 	defer db.Close()
 
-	for i := range addTo {
-		var exists bool
-		err = db.QueryRow(`SELECT EXISTS (
-			SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = $2
-		)`, msgID, strings.ToLower(addTo[i].ToString())).Scan(&exists)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
-			return false, nil
-		}
-	}
-	return true, nil
+	var exists bool
+	err = db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM msg_add_to_batch WHERE msg_id = $1 AND sha256 = $2
+	)`, msgID, batchHash).Scan(&exists)
+	return exists, err
 }
 
-// insertAddToBatch records one add-to delivery as a batch (its sender and the
-// time this host recorded it) and returns the new batch id. Recipients carried
-// by the delivery are linked to this batch so readers can reconstruct who added
-// which recipients and when (SPEC §12).
-func insertAddToBatch(tx *sql.Tx, msgID int64, addToFrom string, now float64) (int64, error) {
+// insertAddToBatch records one add-to delivery as a batch (its sender, the
+// time this host recorded it, and its identifying batch message hash, SPEC
+// §11) and returns the new batch id. Recipients carried by the delivery are
+// linked to this batch so readers can reconstruct who added which recipients
+// and when (SPEC §12).
+func insertAddToBatch(tx *sql.Tx, msgID int64, addToFrom string, now float64, batchHash []byte) (int64, error) {
 	var batchID int64
-	err := tx.QueryRow(`insert into msg_add_to_batch (msg_id, add_to_from, time_added)
-values ($1, $2, $3) returning id`, msgID, addToFrom, now).Scan(&batchID)
+	err := tx.QueryRow(`insert into msg_add_to_batch (msg_id, add_to_from, time_added, sha256)
+values ($1, $2, $3, $4) returning id`, msgID, addToFrom, now, batchHash).Scan(&batchID)
 	return batchID, err
 }
 
@@ -365,7 +357,14 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 	if msg.AddToFrom != nil {
 		addToFrom = msg.AddToFrom.ToString()
 	}
-	batchID, err := insertAddToBatch(tx, msgID, addToFrom, now)
+	// Cached since the header exchange computed it against the stored
+	// parent's payload (handleAddToPath); it is the batch's identity (SPEC
+	// §11) and what duplicate detection compares against.
+	batchHash, err := msg.GetMessageHash()
+	if err != nil {
+		return fmt.Errorf("compute add-to batch hash: %w", err)
+	}
+	batchID, err := insertAddToBatch(tx, msgID, addToFrom, now, batchHash)
 	if err != nil {
 		return err
 	}
@@ -380,7 +379,7 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 		}
 		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered, response_code)
 values ($1, $2, $3, $4, $5)
-on conflict (msg_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered, code); err != nil {
+on conflict (batch_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered, code); err != nil {
 			return err
 		}
 	}
@@ -494,7 +493,13 @@ values ($1, $2, $3, $4)`)
 		if msg.AddToFrom != nil {
 			addToFrom = msg.AddToFrom.ToString()
 		}
-		batchID, err := insertAddToBatch(tx, msgID, addToFrom, now)
+		// Cached from download verification: the wire hash of an add-to
+		// message is its batch hash, the batch's identity (SPEC §11).
+		batchHash, err := msg.GetMessageHash()
+		if err != nil {
+			return fmt.Errorf("compute add-to batch hash: %w", err)
+		}
+		batchID, err := insertAddToBatch(tx, msgID, addToFrom, now, batchHash)
 		if err != nil {
 			return err
 		}
@@ -624,7 +629,8 @@ returning id`,
 		if msg.AddToFrom != nil {
 			addToFrom = msg.AddToFrom.ToString()
 		}
-		batchID, err := insertAddToBatch(tx, msgID, addToFrom, timeutil.TimestampNow().Float64())
+		// No stored parent payload here, so the batch hash cannot be computed.
+		batchID, err := insertAddToBatch(tx, msgID, addToFrom, timeutil.TimestampNow().Float64(), nil)
 		if err != nil {
 			return err
 		}

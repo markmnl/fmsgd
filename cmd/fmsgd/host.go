@@ -607,8 +607,24 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return h, fmt.Errorf("add-to: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
 	}
 
+	// Batch identity is the batch message hash — this add-to header combined
+	// with the stored parent's payload (SPEC §11) — so map the parent's data
+	// in and compute it before the duplicate check.
+	h.Filepath = parentMsg.Filepath
+	for i := range h.Attachments {
+		if i < len(parentMsg.Attachments) {
+			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
+		}
+	}
+	batchHash, err := h.GetMessageHash()
+	if err != nil {
+		return h, err
+	}
+
 	// A batch this host already recorded is a duplicate (SPEC §10.4 step 1).
-	recorded, err := addToBatchRecorded(parentID, h.AddTo)
+	// The same addresses re-issued at a new time hash differently and are a
+	// distinct batch — a new sibling branch — not a duplicate (SPEC §12).
+	recorded, err := addToBatchRecorded(parentID, batchHash)
 	if err != nil {
 		return h, err
 	}
@@ -624,12 +640,6 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return h, nil
 	}
 
-	h.Filepath = parentMsg.Filepath
-	for i := range h.Attachments {
-		if i < len(parentMsg.Attachments) {
-			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
-		}
-	}
 	h.InitialResponseCode = AcceptCodeAddTo
 	return h, nil
 }
