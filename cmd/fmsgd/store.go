@@ -800,7 +800,7 @@ func (m *msgFields) originalHeader() *FMsgHeader {
 		Topic:       m.topic,
 		Type:        m.typ,
 		Size:        uint32(m.size),
-		Attachments: m.attachments,
+		Attachments: append([]FMsgAttachmentHeader(nil), m.attachments...), // own copy: wire forms mutate attachment flags
 		Filepath:    m.filepath,
 	}
 }
@@ -841,13 +841,14 @@ type addToBatch struct {
 	From       FMsgAddress
 	TimeAdded  float64
 	Recipients []FMsgAddress
+	Hash       []byte // batch message hash once persisted (SPEC §11); nil before first delivery
 }
 
 // loadAddToBatches returns every add-to batch for a message, each with its
 // sender, timestamp and recipients, ordered by when it was added.
 func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 	rows, err := tx.Query(`
-		SELECT b.id, b.add_to_from, b.time_added, a.addr
+		SELECT b.id, b.add_to_from, b.time_added, b.sha256, a.addr
 		FROM msg_add_to_batch b
 		LEFT JOIN msg_add_to a ON a.batch_id = b.id
 		WHERE b.msg_id = $1
@@ -864,8 +865,9 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 		var id int64
 		var fromStr string
 		var timeAdded float64
+		var hash []byte
 		var addr sql.NullString
-		if err := rows.Scan(&id, &fromStr, &timeAdded, &addr); err != nil {
+		if err := rows.Scan(&id, &fromStr, &timeAdded, &hash, &addr); err != nil {
 			return nil, fmt.Errorf("scan add-to batch row: %w", err)
 		}
 		idx, ok := byID[id]
@@ -874,7 +876,7 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid add_to_from address %s: %w", fromStr, err)
 			}
-			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded})
+			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded, Hash: hash})
 			idx = len(batches) - 1
 			byID[id] = idx
 		}
