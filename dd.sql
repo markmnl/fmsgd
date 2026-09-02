@@ -26,6 +26,7 @@ create table if not exists msg (
 	no_reply		boolean				not null default false,
 	is_important	boolean				not null default false,
 	is_deflate		boolean				not null default false,
+	is_terminal		boolean				not null default false, -- SPEC §3 bit 6: leaf message, nothing may reference it via pid
     time_sent     	double precision,             -- time sending host recieved message for sending, message timestamp field, NULL means message not ready for sending i.e. draft
     from_addr     	varchar(255)    	not null,
     topic         	varchar(255)    	not null,
@@ -38,6 +39,7 @@ create table if not exists msg (
 );
 create index if not exists msg_lower_idx on msg ((lower(from_addr)));
 alter table msg add column if not exists wire_header bytea; -- upgrade path for databases created before this column
+alter table msg add column if not exists is_terminal boolean not null default false; -- upgrade path (SPEC v0.6.0)
 
 create table if not exists msg_to (
 	id				bigserial			primary key,
@@ -102,19 +104,22 @@ create table if not exists msg_attachment (
 );
 
 -- keep protocol parent hash populated for locally-created replies that set
--- the relational parent id. A reply cannot reference a draft parent, and any
--- explicit psha256 must match the referenced parent's sha256.
+-- the relational parent id. A reply cannot reference a draft parent or a
+-- terminal parent (SPEC v0.6.0 §3: a Sending Host must not transmit a reply
+-- to a terminal message, so refuse to create one), and any explicit psha256
+-- must match the referenced parent's sha256.
 create or replace function populate_msg_psha256_from_pid() returns trigger as $$
 declare
     parent_time_sent double precision;
     parent_sha256 bytea;
+    parent_is_terminal boolean;
 begin
     if NEW.pid is null then
         return NEW;
     end if;
 
-    select parent.time_sent, parent.sha256
-    into parent_time_sent, parent_sha256
+    select parent.time_sent, parent.sha256, parent.is_terminal
+    into parent_time_sent, parent_sha256, parent_is_terminal
     from msg parent
     where parent.id = NEW.pid;
 
@@ -124,6 +129,10 @@ begin
 
     if parent_time_sent is null then
         raise exception 'cannot set pid %: parent message is a draft', NEW.pid;
+    end if;
+
+    if parent_is_terminal then
+        raise exception 'cannot set pid %: parent message is terminal', NEW.pid;
     end if;
 
     if parent_sha256 is null or octet_length(parent_sha256) = 0 then
@@ -152,6 +161,22 @@ drop trigger if exists trg_msg_populate_psha256 on msg;
 create trigger trg_msg_populate_psha256
     before insert or update of pid, psha256 on msg
     for each row execute function populate_msg_psha256_from_pid();
+
+-- recipients cannot be added to a terminal message (SPEC §12): refuse to
+-- create a batch for one, so the sender never has such a unit to transmit.
+create or replace function prevent_add_to_terminal_msg() returns trigger as $$
+begin
+    if exists (select 1 from msg where id = NEW.msg_id and is_terminal) then
+        raise exception 'cannot add recipients to message %: it is terminal', NEW.msg_id;
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_add_to_batch_terminal on msg_add_to_batch;
+create trigger trg_msg_add_to_batch_terminal
+    before insert on msg_add_to_batch
+    for each row execute function prevent_add_to_terminal_msg();
 
 -- once a message has replies, it must remain referenceable by protocol hash.
 create or replace function prevent_referenced_msg_from_becoming_unreferenceable() returns trigger as $$

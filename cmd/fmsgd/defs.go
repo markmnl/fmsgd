@@ -15,4 +15,5 @@ const (
 	FlagImportant  = fmsg.FlagImportant
 	FlagNoReply    = fmsg.FlagNoReply
 	FlagDeflate    = fmsg.FlagDeflate
+	FlagTerminal   = fmsg.FlagTerminal
 )

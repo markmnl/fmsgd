@@ -18,15 +18,16 @@ import (
 	"strings"
 )
 
-// Flag bit assignments per SPEC.md.
-// Bits 6–7 are reserved and must be zero on the wire.
+// Flag bit assignments per SPEC.md §3.
+// Bit 7 is reserved and must be zero on the wire.
 const (
 	FlagHasPid     uint8 = 1      // bit 0: pid field present; message is a reply
 	FlagHasAddTo   uint8 = 1 << 1 // bit 1: add-to addresses present
 	FlagCommonType uint8 = 1 << 2 // bit 2: type encoded as common type ID, not string
 	FlagImportant  uint8 = 1 << 3 // bit 3: sender marks message as important
-	FlagNoReply    uint8 = 1 << 4 // bit 4: sender will discard replies
+	FlagNoReply    uint8 = 1 << 4 // bit 4: sender will discard replies (advisory)
 	FlagDeflate    uint8 = 1 << 5 // bit 5: message body is zlib-deflate compressed
+	FlagTerminal   uint8 = 1 << 6 // bit 6: leaf message; no message may reference it via pid (enforced by hosts)
 )
 
 // Address is an fmsg address of the form @user@domain.

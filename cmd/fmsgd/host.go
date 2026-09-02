@@ -57,7 +57,7 @@ const (
 
 	RejectCodeAccept uint8 = 200
 
-	messageReservedBitsMask    uint8 = 0b11000000
+	messageReservedBitsMask    uint8 = 0b10000000 // bit 7 (SPEC §3); bit 6 is terminal
 	attachmentReservedBitsMask uint8 = 0b11111100
 )
 
@@ -349,11 +349,11 @@ func isMessageRetrievable(msg *FMsgHeader) bool {
 	if len(msg.Pid) == 0 {
 		return false
 	}
-	parentID, err := lookupMsgIdByHash(msg.Pid)
+	parentID, err := lookupMsgIdByHashFn(msg.Pid)
 	if err != nil || parentID == 0 {
 		return false
 	}
-	parentMsg, err := getMsgByID(parentID)
+	parentMsg, err := getMsgByIDFn(parentID)
 	if err != nil {
 		return false
 	}
@@ -498,6 +498,15 @@ func validateMessageFlags(c net.Conn, flags uint8) error {
 		}
 		return fmt.Errorf("reserved message flag bits set: %#08b", flags)
 	}
+	// An add-to message duplicates the original's flags, so terminal set on
+	// an add-to means the original is terminal and cannot be referenced
+	// (SPEC §10.3 step 3, §12).
+	if flags&FlagHasAddTo != 0 && flags&FlagTerminal != 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("add-to message has terminal flag set: %#08b", flags)
+	}
 	return nil
 }
 
@@ -586,7 +595,7 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	// Deliberately resolves canonical message hashes only: batches do not
 	// chain, so an add-to whose pid is another batch's hash must not resolve
 	// (SPEC §12).
-	parentID, err := lookupMsgIdByHash(h.Pid)
+	parentID, err := lookupMsgIdByHashFn(h.Pid)
 	if err != nil {
 		return h, err
 	}
@@ -595,12 +604,21 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 		return handleAddToParentNotStored(c, h, hasLocalRecipient)
 	}
 
-	parentMsg, err := getMsgByID(parentID)
+	parentMsg, err := getMsgByIDFn(parentID)
 	if err != nil {
 		return h, err
 	}
 	if parentMsg == nil || !isMessageRetrievable(parentMsg) {
 		return handleAddToParentNotStored(c, h, hasLocalRecipient)
+	}
+
+	// Recipients cannot be added to a terminal message (SPEC §10.3 step 7,
+	// §12).
+	if parentMsg.Flags&FlagTerminal != 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("add-to: parent msg %d is terminal", parentID)
 	}
 
 	if parentMsg.Timestamp-FutureTimeDelta > h.Timestamp {
@@ -627,7 +645,7 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	// A batch this host already recorded is a duplicate (SPEC §10.4 step 1).
 	// The same addresses re-issued at a new time hash differently and are a
 	// distinct batch — a new sibling branch — not a duplicate (SPEC §12).
-	recorded, err := addToBatchRecorded(parentID, batchHash)
+	recorded, err := addToBatchRecordedFn(parentID, batchHash)
 	if err != nil {
 		return h, err
 	}
@@ -652,19 +670,19 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 		return nil
 	}
 
-	parentID, err := lookupMsgIdByHash(h.Pid)
+	parentID, err := lookupMsgIdByHashFn(h.Pid)
 	if err != nil {
 		return err
 	}
 
 	var parentMsg *FMsgHeader
 	if parentID != 0 {
-		parentMsg, err = getMsgByID(parentID)
+		parentMsg, err = getMsgByIDFn(parentID)
 	} else {
 		// A reply may reference an add-to batch message via pid (SPEC §12);
 		// its wire form is reconstructed from the stored shared message and
 		// batch fields (SPEC §11).
-		parentMsg, err = getMsgByBatchHash(h.Pid)
+		parentMsg, err = getMsgByBatchHashFn(h.Pid)
 	}
 	if err != nil {
 		return err
@@ -694,9 +712,25 @@ func validatePidReplyPath(c net.Conn, h *FMsgHeader) error {
 		}
 		return fmt.Errorf("pid reply: sender %s was not a participant of parent", h.From.ToString())
 	}
+	// A terminal message is a leaf: nothing may reference it via pid (SPEC
+	// §10.3 step 7).
+	if parentMsg.Flags&FlagTerminal != 0 {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return err
+		}
+		return fmt.Errorf("pid reply: parent %s is terminal", hex.EncodeToString(h.Pid))
+	}
 
 	return nil
 }
+
+// Store lookups used by the header validation paths. Overridable in tests.
+var (
+	lookupMsgIdByHashFn  = lookupMsgIdByHash
+	getMsgByIDFn         = getMsgByID
+	getMsgByBatchHashFn  = getMsgByBatchHash
+	addToBatchRecordedFn = addToBatchRecorded
+)
 
 func readVersionOrChallenge(c net.Conn, r *bufio.Reader, h *FMsgHeader) (bool, error) {
 	v, err := r.ReadByte()
