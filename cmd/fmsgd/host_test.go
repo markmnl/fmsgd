@@ -216,6 +216,9 @@ func TestFlagConstants(t *testing.T) {
 	if FlagDeflate != 32 {
 		t.Errorf("FlagDeflate = %d, want 32 (bit 5)", FlagDeflate)
 	}
+	if FlagTerminal != 64 {
+		t.Errorf("FlagTerminal = %d, want 64 (bit 6)", FlagTerminal)
+	}
 }
 
 func encodeUInt8String(t *testing.T, s string) []byte {
@@ -482,7 +485,7 @@ func TestReadAttachmentHeadersRejectsTooBig(t *testing.T) {
 
 func TestValidateMessageFlagsRejectsReservedBits(t *testing.T) {
 	c := &testConn{}
-	err := validateMessageFlags(c, 1<<6)
+	err := validateMessageFlags(c, 1<<7)
 	if err == nil {
 		t.Fatalf("expected error for reserved message flag bit")
 	}
@@ -724,8 +727,8 @@ func TestReadAttachmentHeadersReadsExpandedSizeForCompressedAttachment(t *testin
 	})
 
 	h := &FMsgHeader{Size: 0}
-	b := []byte{1}                      // 1 attachment
-	b = append(b, 1<<1)                 // attachment flags: zlib-deflate (bit 1)
+	b := []byte{1}      // 1 attachment
+	b = append(b, 1<<1) // attachment flags: zlib-deflate (bit 1)
 	b = append(b, encodeUInt8String(t, "text/plain")...)
 	b = append(b, encodeUInt8String(t, "file.txt")...)
 

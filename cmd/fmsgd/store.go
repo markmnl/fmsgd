@@ -506,6 +506,7 @@ func storeMsgDetail(msg *FMsgHeader, localOutcome map[string]uint8) error {
 	, no_reply
 	, is_important
 	, is_deflate
+	, is_terminal
 	, time_sent
 	, from_addr
 	, topic
@@ -515,12 +516,13 @@ func storeMsgDetail(msg *FMsgHeader, localOutcome map[string]uint8) error {
 	, size
 	, filepath
 	, wire_header)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 returning id`,
 		msg.Version,
 		msg.Flags&FlagNoReply != 0,
 		msg.Flags&FlagImportant != 0,
 		msg.Flags&FlagDeflate != 0,
+		msg.Flags&FlagTerminal != 0,
 		msg.Timestamp,
 		msg.From.ToString(),
 		msg.Topic,
@@ -652,6 +654,7 @@ type msgFields struct {
 	version                         int
 	size                            int
 	noReply, isImportant, isDeflate bool
+	isTerminal                      bool   // SPEC §3 bit 6: no message may reference this one via pid
 	parentPid                       []byte // relational parent hash (stored pid column)
 	storedHash                      []byte // stored sha256; empty when not yet persisted
 	from                            FMsgAddress
@@ -667,9 +670,9 @@ func loadMsgFields(tx *sql.Tx, msgID int64) (*msgFields, error) {
 	var m msgFields
 	var fromAddr string
 	if err := tx.QueryRow(`
-		SELECT version, no_reply, is_important, is_deflate, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, is_terminal, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
 		FROM msg WHERE id = $1
-	`, msgID).Scan(&m.version, &m.noReply, &m.isImportant, &m.isDeflate, &m.parentPid, &m.storedHash,
+	`, msgID).Scan(&m.version, &m.noReply, &m.isImportant, &m.isDeflate, &m.isTerminal, &m.parentPid, &m.storedHash,
 		&fromAddr, &m.topic, &m.typ, &m.timeSent, &m.size, &m.filepath); err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
 	}
@@ -739,8 +742,8 @@ func loadRecipientAddrs(tx *sql.Tx, query string, msgID int64) ([]FMsgAddress, e
 	return addrs, rows.Err()
 }
 
-// baseFlags returns the persisted flag bits (no_reply/important/deflate) shared
-// by every wire form of the message.
+// baseFlags returns the persisted flag bits (no_reply/important/deflate/
+// terminal) shared by every wire form of the message.
 func (m *msgFields) baseFlags() uint8 {
 	var f uint8
 	if m.noReply {
@@ -752,7 +755,32 @@ func (m *msgFields) baseFlags() uint8 {
 	if m.isDeflate {
 		f |= FlagDeflate
 	}
+	if m.isTerminal {
+		f |= FlagTerminal
+	}
 	return f
+}
+
+// isStoredMsgTerminal reports whether the stored message identified by hash —
+// a message's canonical hash or one of its add-to batch hashes (SPEC §11) —
+// has the terminal flag set. False when no such message is stored.
+func isStoredMsgTerminal(db *sql.DB, hash []byte) (bool, error) {
+	if len(hash) == 0 {
+		return false, nil
+	}
+	var terminal bool
+	err := db.QueryRow(`
+		SELECT m.is_terminal FROM msg m WHERE m.sha256 = $1
+		UNION ALL
+		SELECT m.is_terminal FROM msg m
+		INNER JOIN msg_add_to_batch b ON b.msg_id = m.id
+		WHERE b.sha256 = $1
+		LIMIT 1
+	`, hash).Scan(&terminal)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return terminal, err
 }
 
 // originalHeader builds the message in its original (non-add-to) wire form,
@@ -772,7 +800,7 @@ func (m *msgFields) originalHeader() *FMsgHeader {
 		Topic:       m.topic,
 		Type:        m.typ,
 		Size:        uint32(m.size),
-		Attachments: m.attachments,
+		Attachments: append([]FMsgAttachmentHeader(nil), m.attachments...), // own copy: wire forms mutate attachment flags
 		Filepath:    m.filepath,
 	}
 }
@@ -813,13 +841,14 @@ type addToBatch struct {
 	From       FMsgAddress
 	TimeAdded  float64
 	Recipients []FMsgAddress
+	Hash       []byte // batch message hash once persisted (SPEC §11); nil before first delivery
 }
 
 // loadAddToBatches returns every add-to batch for a message, each with its
 // sender, timestamp and recipients, ordered by when it was added.
 func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 	rows, err := tx.Query(`
-		SELECT b.id, b.add_to_from, b.time_added, a.addr
+		SELECT b.id, b.add_to_from, b.time_added, b.sha256, a.addr
 		FROM msg_add_to_batch b
 		LEFT JOIN msg_add_to a ON a.batch_id = b.id
 		WHERE b.msg_id = $1
@@ -836,8 +865,9 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 		var id int64
 		var fromStr string
 		var timeAdded float64
+		var hash []byte
 		var addr sql.NullString
-		if err := rows.Scan(&id, &fromStr, &timeAdded, &addr); err != nil {
+		if err := rows.Scan(&id, &fromStr, &timeAdded, &hash, &addr); err != nil {
 			return nil, fmt.Errorf("scan add-to batch row: %w", err)
 		}
 		idx, ok := byID[id]
@@ -846,7 +876,7 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid add_to_from address %s: %w", fromStr, err)
 			}
-			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded})
+			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded, Hash: hash})
 			idx = len(batches) - 1
 			byID[id] = idx
 		}

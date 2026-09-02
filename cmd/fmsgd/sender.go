@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 	"io"
 	"log"
 	"net"
@@ -358,6 +360,57 @@ func (d deflateState) applyTo(h *FMsgHeader) {
 	}
 }
 
+// applyCommonTypes encodes h's type, and each attachment's type, as a Common
+// Media Type ID (SPEC §4) where the type string has one, so the wire carries
+// one byte instead of the string. Standards such as FMSG-005 require the ID
+// form. It reports whether anything changed.
+func applyCommonTypes(h *FMsgHeader) bool {
+	changed := false
+	if id, ok := fmsg.GetCommonMediaTypeID(h.Type); ok && h.Flags&FlagCommonType == 0 {
+		h.Flags |= FlagCommonType
+		h.TypeID = id
+		changed = true
+	}
+	for i := range h.Attachments {
+		att := &h.Attachments[i]
+		if id, ok := fmsg.GetCommonMediaTypeID(att.Type); ok && att.Flags&1 == 0 {
+			att.Flags |= 1 // attachment flag bit 0: common type (SPEC §5)
+			att.TypeID = id
+			changed = true
+		}
+	}
+	return changed
+}
+
+// encodeForWire builds a unit header in its transmitted form: build, apply
+// deflate, then, when commonTypes is set, common type IDs. The message hash
+// covers the header exactly as transmitted, so when storedHash was recorded by
+// an earlier delivery the form that reproduces it wins: a message first sent
+// before this host encoded common type IDs keeps string types for every later
+// delivery. It reports whether common type IDs were used, so a message's
+// add-to batches can follow the original's form.
+func encodeForWire(build func() *FMsgHeader, d deflateState, commonTypes bool, storedHash []byte) (*FMsgHeader, bool, error) {
+	h := build()
+	d.applyTo(h)
+	if !commonTypes || !applyCommonTypes(h) {
+		return h, commonTypes, nil
+	}
+	if len(storedHash) == 0 {
+		return h, true, nil
+	}
+	hash, err := h.GetMessageHash()
+	if err != nil {
+		return nil, false, err
+	}
+	if bytes.Equal(hash, storedHash) {
+		return h, true, nil
+	}
+	// Recorded in string form before this host encoded common type IDs.
+	h = build()
+	d.applyTo(h)
+	return h, false, nil
+}
+
 // removeTempFiles deletes the compression temp files.
 func (d deflateState) removeTempFiles() {
 	for _, p := range d.cleanup {
@@ -462,8 +515,11 @@ func deliverMessage(target pendingTarget) {
 	d := computeDeflate(m, target.MsgID)
 	defer d.removeTempFiles()
 
-	orig := m.originalHeader()
-	d.applyTo(orig)
+	orig, useCommonTypes, err := encodeForWire(m.originalHeader, d, true, m.storedHash)
+	if err != nil {
+		log.Printf("ERROR: sender: building wire header for msg %d: %s", target.MsgID, err)
+		return
+	}
 
 	sharedHash := m.storedHash
 	if len(sharedHash) == 0 {
@@ -481,16 +537,39 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
+	// SPEC §10.2: a host must not transmit a reply to a terminal message, nor
+	// an add-to batch of one. dd.sql refuses to create such rows, so this is
+	// defensive; matching units are recorded as code 1 (invalid, not
+	// retryable) rather than sent, so they stop being picked up.
+	parentTerminal, err := isStoredMsgTerminal(db, m.parentPid)
+	if err != nil {
+		log.Printf("ERROR: sender: checking parent of msg %d for terminal: %s", target.MsgID, err)
+		return
+	}
+
 	// Deliver the original message to its pending msg_to recipients.
-	deliverUnit(db, target, orig, "msg_to", 0)
+	if parentTerminal {
+		log.Printf("ERROR: sender: msg %d references a terminal parent; not sending (SPEC §10.2)", target.MsgID)
+		recordUnitInvalid(db, target, "msg_to", 0)
+	} else {
+		deliverUnit(db, target, orig, "msg_to", 0)
+	}
 
 	// Deliver each add-to batch as its own add-to message (one sender each).
 	for _, b := range batches {
 		if len(b.Recipients) == 0 {
 			continue // degenerate batch; an add-to message needs ≥ 1 recipient
 		}
-		h := m.addToHeader(b, sharedHash)
-		d.applyTo(h)
+		if m.isTerminal {
+			log.Printf("ERROR: sender: msg %d is terminal; not sending add-to batch %d (SPEC §12)", target.MsgID, b.ID)
+			recordUnitInvalid(db, target, "msg_add_to", b.ID)
+			continue
+		}
+		h, _, err := encodeForWire(func() *FMsgHeader { return m.addToHeader(b, sharedHash) }, d, useCommonTypes, b.Hash)
+		if err != nil {
+			log.Printf("ERROR: sender: building add-to wire header for batch %d of msg %d: %s", b.ID, target.MsgID, err)
+			continue
+		}
 		// Persist the batch hash — the batch's identity (SPEC §11) — once,
 		// so replies referencing this batch resolve at this host too, which
 		// must verify messages it sent, not only ones it received. Cached on
@@ -506,6 +585,44 @@ func deliverMessage(target pendingTarget) {
 		}
 		deliverUnit(db, target, h, "msg_add_to", b.ID)
 	}
+}
+
+// recordUnitInvalid records code 1 (invalid) against one delivery unit's
+// pending recipients and notify row for a domain without transmitting
+// anything, for a unit the protocol forbids sending. Code 1 is not retryable,
+// so the rows drop out of findPendingTargets.
+func recordUnitInvalid(db *sql.DB, target pendingTarget, table string, batchID int64) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("ERROR: sender: begin tx: %s", err)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+	now := timeutil.TimestampNow().Float64()
+	locked, err := lockPendingRecipients(tx, table, target.MsgID, target.Domain, batchID, now)
+	if err != nil {
+		log.Printf("ERROR: sender: lock %s rows for msg %d: %s", table, target.MsgID, err)
+		return
+	}
+	var notifyID int64
+	if table == "msg_add_to" {
+		notifyID, err = lockPendingNotify(tx, batchID, target.Domain, now)
+		if err != nil {
+			log.Printf("ERROR: sender: lock notify row for batch %d: %s", batchID, err)
+			return
+		}
+	}
+	if len(locked) == 0 && notifyID == 0 {
+		return
+	}
+	updateLocked(tx, table, locked, target.MsgID, now, int(RejectCodeInvalid), false)
+	updateNotify(tx, notifyID, now, int(RejectCodeInvalid), false)
+	commitOrLog(tx, &committed, target.MsgID)
 }
 
 // markLocalDelivered marks a message's local-domain msg_to recipients delivered

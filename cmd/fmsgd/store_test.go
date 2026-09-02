@@ -225,3 +225,17 @@ func TestInboundRecipientRow(t *testing.T) {
 		t.Fatalf("remote: got (%v, %v), want (nil, %d)", delivered, code, localResponseCodeNotOurDelivery)
 	}
 }
+
+func TestBaseFlagsIncludesTerminal(t *testing.T) {
+	m := &msgFields{noReply: true, isTerminal: true}
+	got := m.baseFlags()
+	if got&FlagTerminal == 0 {
+		t.Fatalf("baseFlags() = %#08b, want terminal bit set", got)
+	}
+	if got&FlagNoReply == 0 {
+		t.Fatalf("baseFlags() = %#08b, want no reply bit set", got)
+	}
+	if (&msgFields{}).baseFlags()&FlagTerminal != 0 {
+		t.Fatalf("baseFlags() set terminal for a non-terminal message")
+	}
+}
