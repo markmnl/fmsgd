@@ -193,7 +193,7 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 	if err != nil {
 		return nil, err
 	}
-	if err = tx.Exec(ctx, `UPDATE msg SET time_sent=$2,sha256=$3,psha256=$4,wire_header=$5,wire_message=$6 WHERE id=$1`, id, timestamp, hash, h.Pid, h.Encode(), string(snapshot)); err != nil {
+	if err = tx.Exec(ctx, `UPDATE msg SET time_sent=$2,sha256=$3,psha256=$4,wire_header=$5,wire_message=$6,is_deflate=$7 WHERE id=$1`, id, timestamp, hash, h.Pid, h.Encode(), string(snapshot), h.Flags&fmsg.FlagDeflate != 0); err != nil {
 		return nil, err
 	}
 	if err = tx.Exec(ctx, `UPDATE msg SET psha256=$2 WHERE pid=$1 AND psha256 IS NULL AND sha256 IS NULL`, id, hash); err != nil {

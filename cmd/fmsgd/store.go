@@ -951,6 +951,23 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	}
 
 	h := m.originalHeader()
+	if m.wire == nil {
+		// When the original arrived through add-to, its batch retains the
+		// exact wire payloads; the API files have already been expanded.
+		batches, err := loadAddToBatches(tx, msgID)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range batches {
+			if len(b.Prepared) > 0 {
+				h, err = fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
 	if len(addTo) > 0 {
 		// The wire pid of an add-to message references the shared message, not
 		// that message's relational parent (SPEC §12).
