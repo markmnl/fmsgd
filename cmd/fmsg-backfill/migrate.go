@@ -276,10 +276,6 @@ func (m *migration) message(id int64) error {
 		if len(b.prepared) > 0 {
 			h, err = fmsg.UnmarshalPrepared(b.prepared, b.hash)
 		} else {
-			if len(b.hash) == 0 && !strings.EqualFold(b.from.Domain, m.domain) &&
-				(received == nil || !bytes.Equal(h.Encode(), received.Encode())) {
-				return fmt.Errorf("remote batch %d has no published hash or exact header", b.id)
-			}
 			h, err = selectTypes(h, b.hash)
 		}
 		if err != nil {
@@ -331,7 +327,7 @@ func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header
 	if err != nil {
 		return nil, err
 	}
-	if chosen, err := selectTypes(h, expected); err == nil {
+	if chosen, err := selectOriginal(h, expected); err == nil {
 		m.files = append(m.files, dir)
 		return chosen, nil
 	}
@@ -340,13 +336,29 @@ func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header
 	if err != nil {
 		return nil, err
 	}
-	chosen, err := selectTypes(h, expected)
+	chosen, err := selectOriginal(h, expected)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 	m.files = append(m.files, dir)
 	return chosen, nil
+}
+
+// Some early local writers hashed a root-form header despite retaining a
+// relational parent link. Preserve that established identity and local link;
+// never select this form for a message without an existing hash to verify.
+func selectOriginal(h *fmsg.Header, expected []byte) (*fmsg.Header, error) {
+	chosen, err := selectTypes(h, expected)
+	if err == nil {
+		return chosen, nil
+	}
+	if len(expected) == 32 && h.Flags&fmsg.FlagHasPid != 0 && h.Flags&fmsg.FlagHasAddTo == 0 {
+		root := h.Clone()
+		root.Flags &^= fmsg.FlagHasPid
+		return selectTypes(root, expected)
+	}
+	return nil, err
 }
 
 func selectTypes(h *fmsg.Header, expected []byte) (*fmsg.Header, error) {

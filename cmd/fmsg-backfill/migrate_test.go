@@ -364,3 +364,38 @@ func TestMigrationExpandedFilesWithOldWireSizes(t *testing.T) {
 		})
 	}
 }
+
+func TestMigrationHistoricalLocalLinkAndUnhashedReceivedBatch(t *testing.T) {
+	db := previousStore(t)
+	parentRaw := rawMessage(t, "example.com", "parent")
+	parentHash := hashOf(t, parentRaw)
+	parent := putOld(t, db, parentRaw, nil, parentHash, nil)
+	childRaw := rawMessage(t, "example.com", "child")
+	historicalHash := hashOf(t, childRaw)
+	child := putOld(t, db, childRaw, parent, historicalHash, nil)
+	batch := putBatch(t, db, parent, oldBatch{from: fmsg.Address{User: "bob", Domain: "example.org"}, time: 1300, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}})
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var pid int64
+	var hash, parentSHA, data []byte
+	if err := db.QueryRow(`SELECT pid,sha256,psha256,wire_message FROM msg WHERE id=$1`, child).Scan(&pid, &hash, &parentSHA, &data); err != nil {
+		t.Fatal(err)
+	}
+	if pid != parent || !bytes.Equal(hash, historicalHash) || !bytes.Equal(parentSHA, parentHash) {
+		t.Fatal("historical identity or local thread link changed")
+	}
+	h, err := fmsg.UnmarshalPrepared(data, historicalHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Flags&fmsg.FlagHasPid != 0 {
+		t.Fatal("changed historical root-form identity")
+	}
+	if err := db.QueryRow(`SELECT sha256,wire_message FROM msg_add_to_batch WHERE id=$1`, batch).Scan(&hash, &data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmsg.UnmarshalPrepared(data, hash); err != nil {
+		t.Fatal(err)
+	}
+}
