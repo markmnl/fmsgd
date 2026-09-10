@@ -132,6 +132,22 @@ func TestStandaloneMigration(t *testing.T) {
 	oldHash := hashOf(t, oldString)
 	published := putOld(t, db, oldString, nil, oldHash, nil)
 
+	localCompressed := rawMessage(t, "example.com", strings.Repeat("published compressed ", 300))
+	localWire := prepared(t, localCompressed)
+	localHash := hashOf(t, localWire)
+	compressed := putOld(t, db, localCompressed, nil, localHash, nil)
+	publishedBatch := oldBatch{from: oldString.From, time: 1301, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}}
+	publishedBatch.hash = hashOf(t, batchHeader(oldString, oldHash, publishedBatch))
+	publishedBatchID := putBatch(t, db, published, publishedBatch)
+
+	// Pending drafts and draft batches remain editable; an existing draft
+	// reply gains its newly finalized parent's protocol identity.
+	var draft int64
+	if err := db.QueryRow(`INSERT INTO msg(version,pid,from_addr,topic,type,size,filepath) VALUES(1,$1,'@alice@example.com','','text/plain',0,'') RETURNING id`, root).Scan(&draft); err != nil {
+		t.Fatal(err)
+	}
+	draftBatch := putBatch(t, db, draft, oldBatch{from: rootRaw.From, time: 1302, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}})
+
 	// Received compression and mixed type encodings must preserve the exact
 	// wire header. Expanded body and attachment files are all the old store has.
 	remote := rawMessage(t, "example.org", strings.Repeat("compressible content ", 400))
@@ -173,7 +189,7 @@ func TestStandaloneMigration(t *testing.T) {
 	}
 	var rootHash []byte
 	var snapshots = make(map[int64][]byte)
-	for _, id := range []int64{root, child, published, received, addToOnly} {
+	for _, id := range []int64{root, child, published, compressed, received, addToOnly} {
 		var hash, data, parent []byte
 		var stamp float64
 		if err := db.QueryRow(`SELECT sha256,wire_message,psha256,time_sent FROM msg WHERE id=$1`, id).Scan(&hash, &data, &parent, &stamp); err != nil {
@@ -187,6 +203,9 @@ func TestStandaloneMigration(t *testing.T) {
 		}
 		if id == published && !bytes.Equal(hash, oldHash) {
 			t.Fatal("published string hash changed")
+		}
+		if id == compressed && !bytes.Equal(hash, localHash) {
+			t.Fatal("published compressed hash changed")
 		}
 		if id == received && !bytes.Equal(hash, remoteHash) {
 			t.Fatal("received hash changed")
@@ -205,7 +224,7 @@ func TestStandaloneMigration(t *testing.T) {
 		}
 		snapshots[id] = data
 	}
-	for _, id := range []int64{localBatch, receivedBatch} {
+	for _, id := range []int64{localBatch, publishedBatchID, receivedBatch} {
 		var hash, data []byte
 		if err := db.QueryRow(`SELECT sha256,wire_message FROM msg_add_to_batch WHERE id=$1`, id).Scan(&hash, &data); err != nil {
 			t.Fatal(err)
@@ -213,10 +232,28 @@ func TestStandaloneMigration(t *testing.T) {
 		if _, err := fmsg.UnmarshalPrepared(data, hash); err != nil {
 			t.Fatal(err)
 		}
+		if id == publishedBatchID && !bytes.Equal(hash, publishedBatch.hash) {
+			t.Fatal("published batch hash changed")
+		}
 		if id == receivedBatch && !bytes.Equal(hash, b.hash) {
 			t.Fatal("received batch identity changed")
 		}
 	}
+	var draftHash, draftParent, draftSnapshot []byte
+	var draftTime *float64
+	if err := db.QueryRow(`SELECT sha256,psha256,wire_message,time_sent FROM msg WHERE id=$1`, draft).Scan(&draftHash, &draftParent, &draftSnapshot, &draftTime); err != nil {
+		t.Fatal(err)
+	}
+	if len(draftHash) != 0 || len(draftSnapshot) != 0 || draftTime != nil || !bytes.Equal(draftParent, rootHash) {
+		t.Fatal("draft identity/state changed")
+	}
+	if err := db.QueryRow(`SELECT sha256,wire_message FROM msg_add_to_batch WHERE id=$1`, draftBatch).Scan(&draftHash, &draftSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(draftHash) != 0 || len(draftSnapshot) != 0 {
+		t.Fatal("prematurely finalized draft batch")
+	}
+
 	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
 		t.Fatal("rerun", err)
 	}
