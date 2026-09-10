@@ -80,6 +80,7 @@ type Header struct {
 	ChallengeCompleted  bool     // fmsgd server field: true if challenge was completed
 	InitialResponseCode uint8    // fmsgd server field: protocol response code (11/64/65)
 	Filepath            string   // path to message body data on disk
+	StoredWire          []byte   `json:"-"` // receive path: durable wire snapshot before expanding API payloads
 	messageHash         []byte
 }
 

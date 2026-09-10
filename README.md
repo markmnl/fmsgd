@@ -140,3 +140,48 @@ sudo systemctl daemon-reload
 sudo systemctl enable fmsgd
 sudo systemctl start fmsgd
 ```
+## Immutable message finalization and upgrades
+
+`fmsg-webapi` finalizes local messages with `pkg/message`: the timestamp, SHA-256,
+exact header, and durable wire payloads are committed together, including local-only
+messages and reactions. The hash covers the encoded wire header and expanded body
+and attachment bytes. Compression and common media type encoding are chosen before
+hashing. Add-to exchanges retain independent hashes and reuse the finalized payload.
+The daemon reuses these representations for federation and challenge responses;
+it refuses a representation that differs from an established hash.
+
+The `wire_message` JSONB columns are versioned internal snapshots containing payload
+paths; they are not API objects. `.fmsg-wire-*` directories beside message content
+must be retained with the message database and data directory. Both services need
+access to the shared files (normally the same service user/group). The API keeps its
+expanded downloadable content separately. New received messages also preserve their
+wire payloads before expanding the downloadable copies.
+
+Upgrade the daemon, API and schema together while message writes and federation are
+paused: install compatible binaries, rerun `dd.sql`, backfill, then resume services.
+The schema refuses a newly committed sent message without a 32-byte hash. It is not
+compatible with an older API that stamps only `time_sent`. Existing hashes are never
+replaced by the migration.
+
+Build the maintenance command with `go build -o fmsg-backfill ./cmd/fmsg-backfill`.
+It uses the same standard `PG*` connection variables as the daemon and must have
+access to the stored file paths. First inspect, then apply:
+
+```sh
+./fmsg-backfill -domain example.com
+./fmsg-backfill -domain example.com -apply
+```
+
+The default invocation lists pending local messages and batches without writing.
+`-apply` preserves timestamps and finalizes parents before children; it can be rerun.
+Missing files, inconsistent already-hashed children, or legacy representations that
+cannot reproduce an existing hash are reported with a nonzero exit status. Resolve
+these records before resuming dependent delivery; hashes are not silently rewritten.
+A process crash before commit may leave an unreferenced `.fmsg-wire-*` directory;
+only remove such directories after checking both snapshot columns for references.
+
+PostgreSQL tests use an isolated temporary schema in the supplied test database:
+
+```sh
+FMSG_TEST_DATABASE_URL=postgres://postgres@localhost/fmsg_test?sslmode=disable go test ./...
+```

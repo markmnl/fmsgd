@@ -364,23 +364,7 @@ func (d deflateState) applyTo(h *FMsgHeader) {
 // Media Type ID (SPEC §4) where the type string has one, so the wire carries
 // one byte instead of the string. Standards such as FMSG-005 require the ID
 // form. It reports whether anything changed.
-func applyCommonTypes(h *FMsgHeader) bool {
-	changed := false
-	if id, ok := fmsg.GetCommonMediaTypeID(h.Type); ok && h.Flags&FlagCommonType == 0 {
-		h.Flags |= FlagCommonType
-		h.TypeID = id
-		changed = true
-	}
-	for i := range h.Attachments {
-		att := &h.Attachments[i]
-		if id, ok := fmsg.GetCommonMediaTypeID(att.Type); ok && att.Flags&1 == 0 {
-			att.Flags |= 1 // attachment flag bit 0: common type (SPEC §5)
-			att.TypeID = id
-			changed = true
-		}
-	}
-	return changed
-}
+func applyCommonTypes(h *FMsgHeader) bool { return fmsg.ApplyCommonTypes(h) }
 
 // encodeForWire builds a unit header in its transmitted form: build, apply
 // deflate, then, when commonTypes is set, common type IDs. The message hash
@@ -512,22 +496,47 @@ func deliverMessage(target pendingTarget) {
 	// and applyTo changes flags, size and expanded size. Hashing the
 	// undeflated form recorded a sha256 the receiving host never computes,
 	// so cross-host replies bounced with code 6 (parent not found).
-	d := computeDeflate(m, target.MsgID)
-	defer d.removeTempFiles()
-
-	orig, useCommonTypes, err := encodeForWire(m.originalHeader, d, true, m.storedHash)
-	if err != nil {
-		log.Printf("ERROR: sender: building wire header for msg %d: %s", target.MsgID, err)
-		return
-	}
-
+	var d deflateState
+	defer func() { d.removeTempFiles() }()
+	var orig *FMsgHeader
+	useCommonTypes := true
 	sharedHash := m.storedHash
-	if len(sharedHash) == 0 {
-		sharedHash, err = orig.GetMessageHash()
-		if err != nil {
-			log.Printf("ERROR: sender: computing message hash for msg %d: %s", target.MsgID, err)
+	if m.wire != nil {
+		orig = m.wire.Clone()
+	} else {
+		// A message received only as an add-to has no original header, but
+		// its stored batches remain independently deliverable.
+		hasPreparedBatch := false
+		for _, b := range batches {
+			if len(b.Prepared) > 0 {
+				hasPreparedBatch = true
+				break
+			}
+		}
+		if !hasPreparedBatch {
+			d = computeDeflate(m, target.MsgID)
+			orig, useCommonTypes, err = encodeForWire(m.originalHeader, d, true, m.storedHash)
+			if err != nil {
+				log.Printf("ERROR: sender: building msg %d: %s", target.MsgID, err)
+				return
+			}
+		}
+	}
+	if orig != nil {
+		actual, hashErr := orig.GetMessageHash()
+		if hashErr != nil {
+			log.Printf("ERROR: sender: hash msg %d: %s", target.MsgID, hashErr)
 			return
 		}
+		if len(sharedHash) > 0 && !bytes.Equal(actual, sharedHash) {
+			log.Printf("ERROR: sender: immutable hash mismatch for msg %d", target.MsgID)
+			return
+		}
+		sharedHash = actual
+	}
+	if len(sharedHash) != 32 {
+		log.Printf("ERROR: sender: missing identity for msg %d", target.MsgID)
+		return
 	}
 
 	// Persist the shared hash (so replies/add-to referencing this message
@@ -548,10 +557,15 @@ func deliverMessage(target pendingTarget) {
 	}
 
 	// Deliver the original message to its pending msg_to recipients.
+	parentPending, err := parentPendingForDomain(db, m.parentPid, target.Domain)
+	if err != nil {
+		log.Printf("ERROR: sender: checking pending parent of %d: %s", target.MsgID, err)
+		return
+	}
 	if parentTerminal {
 		log.Printf("ERROR: sender: msg %d references a terminal parent; not sending (SPEC §10.2)", target.MsgID)
 		recordUnitInvalid(db, target, "msg_to", 0)
-	} else {
+	} else if orig != nil && !parentPending {
 		deliverUnit(db, target, orig, "msg_to", 0)
 	}
 
@@ -565,7 +579,13 @@ func deliverMessage(target pendingTarget) {
 			recordUnitInvalid(db, target, "msg_add_to", b.ID)
 			continue
 		}
-		h, _, err := encodeForWire(func() *FMsgHeader { return m.addToHeader(b, sharedHash) }, d, useCommonTypes, b.Hash)
+		var h *FMsgHeader
+		var err error
+		if len(b.Prepared) > 0 {
+			h, err = fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
+		} else {
+			h, _, err = encodeForWire(func() *FMsgHeader { return m.addToHeader(b, sharedHash) }, d, useCommonTypes, b.Hash)
+		}
 		if err != nil {
 			log.Printf("ERROR: sender: building add-to wire header for batch %d of msg %d: %s", b.ID, target.MsgID, err)
 			continue
@@ -579,12 +599,46 @@ func deliverMessage(target pendingTarget) {
 			log.Printf("ERROR: sender: computing batch hash for batch %d of msg %d: %s", b.ID, target.MsgID, err)
 			continue
 		}
+		if len(b.Hash) > 0 && !bytes.Equal(batchHash, b.Hash) {
+			log.Printf("ERROR: sender: immutable batch hash mismatch for %d", b.ID)
+			continue
+		}
 		if err := ensureBatchHash(db, b.ID, batchHash); err != nil {
 			log.Printf("ERROR: sender: %s", err)
 			continue
 		}
 		deliverUnit(db, target, h, "msg_add_to", b.ID)
 	}
+}
+
+// Hashes exist before network delivery now. Keep a reply queued while this
+// host still owes the target domain its parent (including a selected batch),
+// instead of racing that delivery and receiving a terminal parent-not-found.
+func parentPendingForDomain(db *sql.DB, hash []byte, domain string) (bool, error) {
+	if len(hash) == 0 {
+		return false, nil
+	}
+	var pending bool
+	err := db.QueryRow(`
+	 WITH parent AS (
+	   SELECT m.id, NULL::bigint AS batch_id FROM msg m WHERE m.sha256=$1
+	   UNION ALL SELECT b.msg_id,b.id FROM msg_add_to_batch b WHERE b.sha256=$1
+	 ), deliveries AS (
+	   SELECT t.time_delivered AS delivered,t.response_code AS code
+	   FROM parent p JOIN msg_to t ON t.msg_id=p.id
+	   WHERE p.batch_id IS NULL AND lower(split_part(t.addr,'@',3))=lower($2)
+	   UNION ALL
+	   SELECT a.time_delivered,a.response_code FROM parent p JOIN msg_add_to a ON a.msg_id=p.id
+	   WHERE (p.batch_id IS NULL OR a.batch_id=p.batch_id) AND lower(split_part(a.addr,'@',3))=lower($2)
+	   UNION ALL
+	   SELECT n.time_notified,n.response_code FROM parent p
+	   JOIN msg_add_to_batch b ON b.msg_id=p.id JOIN msg_add_to_notify n ON n.batch_id=b.id
+	   WHERE (p.batch_id IS NULL OR b.id=p.batch_id) AND lower(n.domain)=lower($2)
+	 )
+	 SELECT EXISTS(SELECT 1 FROM deliveries WHERE delivered IS NULL AND (code IS NULL OR code=ANY($3)))
+	 AND NOT EXISTS(SELECT 1 FROM deliveries WHERE delivered IS NOT NULL)
+	`, hash, domain, pq.Array(retryableResponseCodes)).Scan(&pending)
+	return pending, err
 }
 
 // recordUnitInvalid records code 1 (invalid) against one delivery unit's

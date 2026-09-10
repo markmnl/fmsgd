@@ -1582,6 +1582,13 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	acceptedTo := []FMsgAddress{}
 	acceptedAddTo := []FMsgAddress{}
 	var primaryFilepath string
+	var wireDir string
+	wireStored := false
+	defer func() {
+		if !wireStored && wireDir != "" {
+			_ = os.RemoveAll(wireDir)
+		}
+	}()
 	for i, addr := range addrs {
 		code, err := validateMsgRecvForAddr(h, &addr, dupHash)
 		if err != nil {
@@ -1617,6 +1624,17 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		}
 		if primaryFilepath == "" {
 			primaryFilepath = fp
+			if len(h.StoredWire) == 0 {
+				wire, dir, preserveErr := fmsg.Preserve(h, filepath.Dir(fp))
+				if preserveErr != nil {
+					return preserveErr
+				}
+				wireDir = dir
+				h.StoredWire, err = fmsg.MarshalPrepared(wire)
+				if err != nil {
+					return err
+				}
+			}
 			if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
 				log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
 				codes[i] = RejectCodeUserUndisclosed
@@ -1638,7 +1656,7 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 
 	stored := storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, localOutcome, primaryFilepath)
 	if stored {
-		cleanupOnReturn = false
+		wireStored = true
 	}
 
 	return rejectAccept(c, codes)

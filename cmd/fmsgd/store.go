@@ -2,7 +2,9 @@ package main
 
 import (
 	"database/sql"
+
 	"fmt"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 	"log"
 	"strings"
 
@@ -318,6 +320,9 @@ func getMsgByBatchHash(batchHash []byte) (*FMsgHeader, error) {
 	}
 	for i := range batches {
 		if batches[i].ID == batchID {
+			if len(batches[i].Prepared) > 0 {
+				return fmsg.UnmarshalPrepared(batches[i].Prepared, batches[i].Hash)
+			}
 			sharedHash, err := m.sharedHash()
 			if err != nil {
 				return nil, err
@@ -375,7 +380,7 @@ func addToBatchRecorded(msgID int64, batchHash []byte) (bool, error) {
 func insertAddToBatch(tx *sql.Tx, msgID int64, addToFrom string, now float64, batchHash []byte) (int64, error) {
 	var batchID int64
 	err := tx.QueryRow(`insert into msg_add_to_batch (msg_id, add_to_from, time_added, sha256)
-values ($1, $2, $3, $4) returning id`, msgID, addToFrom, now, batchHash).Scan(&batchID)
+values ($1, $2, $3, NULL) returning id`, msgID, addToFrom, now).Scan(&batchID)
 	return batchID, err
 }
 
@@ -445,7 +450,20 @@ on conflict (batch_id, addr) do nothing`, msgID, batchID, addr.ToString(), deliv
 			return err
 		}
 	}
-	return nil
+	return sealReceivedBatch(tx, batchID, msg, batchHash)
+}
+
+func sealReceivedBatch(tx *sql.Tx, id int64, h *FMsgHeader, hash []byte) error {
+	data := h.StoredWire
+	if len(data) == 0 {
+		var err error
+		data, err = fmsg.MarshalPrepared(h)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(`UPDATE msg_add_to_batch SET sha256=$2,wire_message=$3 WHERE id=$1`, id, hash, string(data))
+	return err
 }
 
 // inboundRecipientRow maps one wire recipient of a received message to its
@@ -523,11 +541,11 @@ returning id`,
 		msg.Flags&FlagImportant != 0,
 		msg.Flags&FlagDeflate != 0,
 		msg.Flags&FlagTerminal != 0,
-		msg.Timestamp,
+		nil, // assembled as a draft, finalized below in this transaction
 		msg.From.ToString(),
 		msg.Topic,
 		msg.Type,
-		msgHash,
+		nil,
 		parentHash,
 		int(msg.Size),
 		msg.Filepath,
@@ -583,6 +601,9 @@ values ($1, $2, $3, $4, $5)`)
 				return err
 			}
 		}
+		if err := sealReceivedBatch(tx, batchID, msg, batchHash); err != nil {
+			return err
+		}
 	}
 
 	if len(msg.Attachments) > 0 {
@@ -601,6 +622,13 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 		}
 	}
 
+	var snapshot any
+	if msg.Flags&FlagHasAddTo == 0 && len(msg.StoredWire) > 0 {
+		snapshot = string(msg.StoredWire)
+	}
+	if _, err := tx.Exec(`UPDATE msg SET time_sent=$2,sha256=$3,wire_message=$4 WHERE id=$1`, msgID, msg.Timestamp, msgHash, snapshot); err != nil {
+		return err
+	}
 	if err := resolveMsgParentLinks(tx, msgID, msgHash, parentHash, requiresStoredParent(msg)); err != nil {
 		return err
 	}
@@ -656,6 +684,7 @@ type msgFields struct {
 	noReply, isImportant, isDeflate bool
 	isTerminal                      bool   // SPEC §3 bit 6: no message may reference this one via pid
 	parentPid                       []byte // relational parent hash (stored pid column)
+	wire                            *FMsgHeader
 	storedHash                      []byte // stored sha256; empty when not yet persisted
 	from                            FMsgAddress
 	to                              []FMsgAddress
@@ -669,14 +698,22 @@ type msgFields struct {
 func loadMsgFields(tx *sql.Tx, msgID int64) (*msgFields, error) {
 	var m msgFields
 	var fromAddr string
+	var prepared []byte
 	if err := tx.QueryRow(`
-		SELECT version, no_reply, is_important, is_deflate, is_terminal, psha256, sha256, from_addr, topic, type, time_sent, size, filepath
+		SELECT version, no_reply, is_important, is_deflate, is_terminal, psha256, sha256, from_addr, topic, type, time_sent, size, filepath, wire_message
 		FROM msg WHERE id = $1
 	`, msgID).Scan(&m.version, &m.noReply, &m.isImportant, &m.isDeflate, &m.isTerminal, &m.parentPid, &m.storedHash,
-		&fromAddr, &m.topic, &m.typ, &m.timeSent, &m.size, &m.filepath); err != nil {
+		&fromAddr, &m.topic, &m.typ, &m.timeSent, &m.size, &m.filepath, &prepared); err != nil {
 		return nil, fmt.Errorf("load msg %d: %w", msgID, err)
 	}
 
+	if len(prepared) > 0 {
+		var err error
+		m.wire, err = fmsg.UnmarshalPrepared(prepared, m.storedHash)
+		if err != nil {
+			return nil, fmt.Errorf("load prepared msg %d: %w", msgID, err)
+		}
+	}
 	from, err := parseAddress([]byte(fromAddr))
 	if err != nil {
 		return nil, fmt.Errorf("invalid from address %s: %w", fromAddr, err)
@@ -786,6 +823,9 @@ func isStoredMsgTerminal(db *sql.DB, hash []byte) (bool, error) {
 // originalHeader builds the message in its original (non-add-to) wire form,
 // whose pid (if any) references the relational parent.
 func (m *msgFields) originalHeader() *FMsgHeader {
+	if m.wire != nil {
+		return m.wire.Clone()
+	}
 	flags := m.baseFlags()
 	if len(m.parentPid) > 0 {
 		flags |= FlagHasPid
@@ -841,6 +881,7 @@ type addToBatch struct {
 	From       FMsgAddress
 	TimeAdded  float64
 	Recipients []FMsgAddress
+	Prepared   []byte
 	Hash       []byte // batch message hash once persisted (SPEC §11); nil before first delivery
 }
 
@@ -848,7 +889,7 @@ type addToBatch struct {
 // sender, timestamp and recipients, ordered by when it was added.
 func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 	rows, err := tx.Query(`
-		SELECT b.id, b.add_to_from, b.time_added, b.sha256, a.addr
+		SELECT b.id, b.add_to_from, b.time_added, b.sha256, b.wire_message, a.addr
 		FROM msg_add_to_batch b
 		LEFT JOIN msg_add_to a ON a.batch_id = b.id
 		WHERE b.msg_id = $1
@@ -866,8 +907,9 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 		var fromStr string
 		var timeAdded float64
 		var hash []byte
+		var prepared []byte
 		var addr sql.NullString
-		if err := rows.Scan(&id, &fromStr, &timeAdded, &hash, &addr); err != nil {
+		if err := rows.Scan(&id, &fromStr, &timeAdded, &hash, &prepared, &addr); err != nil {
 			return nil, fmt.Errorf("scan add-to batch row: %w", err)
 		}
 		idx, ok := byID[id]
@@ -876,7 +918,7 @@ func loadAddToBatches(tx *sql.Tx, msgID int64) ([]addToBatch, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid add_to_from address %s: %w", fromStr, err)
 			}
-			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded, Hash: hash})
+			batches = append(batches, addToBatch{ID: id, From: *from, TimeAdded: timeAdded, Hash: hash, Prepared: prepared})
 			idx = len(batches) - 1
 			byID[id] = idx
 		}

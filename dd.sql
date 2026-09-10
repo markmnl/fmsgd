@@ -190,7 +190,7 @@ begin
             raise exception 'cannot clear sha256 for message %: it has replies', NEW.id;
         end if;
 
-        if OLD.sha256 is distinct from NEW.sha256 then
+        if OLD.sha256 is not null and OLD.sha256 is distinct from NEW.sha256 then
             raise exception 'cannot change sha256 for message %: it has replies', NEW.id;
         end if;
     end if;
@@ -387,3 +387,108 @@ create constraint trigger trg_recipients_added
     after insert on msg_add_to_batch
     deferrable initially deferred
     for each row execute function notify_recipients_added();
+
+-- Durable protocol representations, shared by the API finalizer and daemon.
+-- NULL on legacy rows; received add-to variants belong to their batch only.
+alter table msg add column if not exists wire_message jsonb;
+alter table msg_add_to_batch add column if not exists wire_message jsonb;
+create index if not exists msg_add_to_batch_sha256_idx on msg_add_to_batch (sha256) where sha256 is not null;
+create index if not exists msg_pid_idx on msg (pid) where pid is not null;
+
+-- Preserve protocol identity; local relational pid links and delivery/read
+-- metadata are bookkeeping and may still change. Legacy NULL hashes may be
+-- filled once without changing the timestamp, including parents with replies.
+create or replace function protect_msg_identity() returns trigger as $$
+begin
+    if OLD.time_sent is not null then
+        if NEW.time_sent is distinct from OLD.time_sent then
+            raise exception 'sent message timestamp is immutable';
+        end if;
+        if OLD.sha256 is not null and
+           (NEW.sha256 is distinct from OLD.sha256 or
+            row(NEW.version,NEW.psha256,NEW.no_reply,NEW.is_important,NEW.is_terminal,
+                NEW.is_deflate,NEW.from_addr,NEW.topic,NEW.type,NEW.size,NEW.filepath)
+            is distinct from
+            row(OLD.version,OLD.psha256,OLD.no_reply,OLD.is_important,OLD.is_terminal,
+                OLD.is_deflate,OLD.from_addr,OLD.topic,OLD.type,OLD.size,OLD.filepath) or
+            (OLD.wire_header is not null and NEW.wire_header is distinct from OLD.wire_header) or
+            (OLD.wire_message is not null and NEW.wire_message is distinct from OLD.wire_message)) then
+            raise exception 'sent message content and hash are immutable';
+        end if;
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+drop trigger if exists trg_msg_identity on msg;
+create trigger trg_msg_identity before update on msg for each row execute function protect_msg_identity();
+
+-- Validate at commit so receiving hosts can assemble rows and recipients in
+-- one transaction. Existing unhashed rows are backfilled by fmsg-backfill.
+create or replace function require_sent_msg_hash() returns trigger as $$
+begin
+    if TG_OP='UPDATE' then
+        if OLD.time_sent is not distinct from NEW.time_sent and OLD.sha256 is not distinct from NEW.sha256 then return null; end if;
+    end if;
+    if exists (select 1 from msg where id=NEW.id and time_sent is not null
+               and (sha256 is null or octet_length(sha256) <> 32)) then
+        raise exception 'sent message % requires a 32-byte sha256', NEW.id;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+drop trigger if exists trg_msg_require_hash on msg;
+create constraint trigger trg_msg_require_hash after insert or update on msg
+    deferrable initially deferred for each row execute function require_sent_msg_hash();
+
+create or replace function protect_msg_parts() returns trigger as $$
+declare
+    message_id bigint;
+    frozen boolean;
+begin
+    -- Delivery and read receipts do not change a protocol recipient.
+    if TG_OP='UPDATE' then
+        if TG_TABLE_NAME='msg_to' then
+            if row(NEW.id,NEW.msg_id,NEW.addr) is not distinct from row(OLD.id,OLD.msg_id,OLD.addr) then return NEW; end if;
+        end if;
+        if TG_TABLE_NAME='msg_add_to' then
+            if row(NEW.id,NEW.msg_id,NEW.batch_id,NEW.addr) is not distinct from row(OLD.id,OLD.msg_id,OLD.batch_id,OLD.addr) then return NEW; end if;
+        end if;
+    end if;
+    if TG_OP='DELETE' then message_id=OLD.msg_id; else message_id=NEW.msg_id; end if;
+    if TG_OP='UPDATE' and NEW.msg_id <> OLD.msg_id then raise exception 'cannot move message parts'; end if;
+    if TG_TABLE_NAME='msg_add_to' then
+        if TG_OP='DELETE' then
+            select sha256 is not null into frozen from msg_add_to_batch where id=OLD.batch_id for update;
+        else
+            if TG_OP='UPDATE' and NEW.batch_id <> OLD.batch_id then raise exception 'cannot move batch recipients'; end if;
+            select sha256 is not null into frozen from msg_add_to_batch where id=NEW.batch_id and msg_id=message_id for update;
+            if not found then raise exception 'batch does not belong to message'; end if;
+        end if;
+    else
+        select time_sent is not null and sha256 is not null into frozen from msg where id=message_id for update;
+    end if;
+    if frozen then raise exception 'finalized message parts are immutable'; end if;
+    if TG_OP='DELETE' then return OLD; end if;
+    return NEW;
+end;
+$$ language plpgsql;
+-- AFTER INSERT allows an ON CONFLICT DO NOTHING receipt to remain a no-op.
+drop trigger if exists trg_msg_to_content on msg_to;
+create trigger trg_msg_to_content after insert or update or delete on msg_to for each row execute function protect_msg_parts();
+drop trigger if exists trg_msg_attachment_content on msg_attachment;
+create trigger trg_msg_attachment_content after insert or update or delete on msg_attachment for each row execute function protect_msg_parts();
+drop trigger if exists trg_msg_add_to_content on msg_add_to;
+create trigger trg_msg_add_to_content after insert or update or delete on msg_add_to for each row execute function protect_msg_parts();
+
+create or replace function protect_batch_identity() returns trigger as $$
+begin
+    if OLD.sha256 is not null and
+       row(NEW.msg_id,NEW.add_to_from,NEW.time_added,NEW.sha256,NEW.wire_message)
+       is distinct from row(OLD.msg_id,OLD.add_to_from,OLD.time_added,OLD.sha256,OLD.wire_message) then
+        raise exception 'finalized add-to batch is immutable';
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+drop trigger if exists trg_batch_identity on msg_add_to_batch;
+create trigger trg_batch_identity before update on msg_add_to_batch for each row execute function protect_batch_identity();
