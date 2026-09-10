@@ -55,3 +55,14 @@ hash, err := h.GetMessageHash()
 mtype, ok := fmsg.GetCommonMediaType(id)   // ID → "text/plain"
 id, ok    := fmsg.GetCommonMediaTypeID(mt) // "text/plain" → ID
 ```
+
+### Finalize locally authored messages
+
+`Prepare(header)` chooses compression and common type encoding, copies all wire
+payloads into a durable directory beside the body, and hashes the final form.
+Input files contain expanded bytes. Keep the returned directory after committing
+the message; remove it if the transaction fails. `MarshalPrepared` and
+`UnmarshalPrepared` persist and verify that exact representation. `Preserve` copies
+an incoming wire representation without changing its encoding. Database writers
+can use `github.com/markmnl/fmsgd/pkg/message` to finalize messages and batches in
+their own transaction.

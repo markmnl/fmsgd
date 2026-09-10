@@ -140,3 +140,63 @@ sudo systemctl daemon-reload
 sudo systemctl enable fmsgd
 sudo systemctl start fmsgd
 ```
+## Immutable message finalization and upgrades
+
+`fmsg-webapi` finalizes local messages with `pkg/message`: the timestamp, SHA-256,
+exact header, and durable wire payloads are committed together, including local-only
+messages and reactions. The hash covers the encoded wire header and expanded body
+and attachment bytes. Compression and common media type encoding are chosen before
+hashing. Add-to exchanges retain independent hashes and reuse the finalized payload.
+The daemon reuses these representations for federation and challenge responses;
+it refuses a representation that differs from an established hash.
+
+The `wire_message` JSONB columns are versioned internal snapshots containing payload
+paths; they are not API objects. `.fmsg-wire-*` directories beside message content
+must be retained with the message database and data directory. Both services need
+access to the shared files (normally the same service user/group). The API keeps its
+expanded downloadable content separately. New received messages also preserve their
+wire payloads before expanding the downloadable copies.
+
+`dd.sql` bootstraps a new, empty database. The daemon and API require finalized
+sent messages and do not repair old rows during normal operation.
+
+For an existing installation, build the single standalone migration binary:
+
+```sh
+CGO_ENABLED=0 go build -o fmsg-backfill ./cmd/fmsg-backfill
+```
+
+The binary embeds the schema changes; no SQL scripts, source checkout or running
+services are needed on the target host. It upgrades the pre-finalization schema
+(with `wire_header` and add-to batch hashes) and can also verify a completed migration.
+It uses the standard `PG*` connection variables. Run it as the service account with
+write access to the database and every stored payload path, including shared volumes.
+
+Stop both services and back up the message database and data directory together.
+Then validate and apply the conversion before starting the matching daemon and API:
+
+```sh
+./fmsg-backfill -domain example.com
+./fmsg-backfill -domain example.com -apply
+```
+
+The default is a full dry run: it reconstructs and verifies every sent message and
+batch, then rolls back schema/data changes and removes staged files. `-apply` commits
+the schema and data together in one transaction. It preserves timestamps, message IDs
+and all published hashes, finalizes local-only parents before replies, and prepares
+existing federated messages for later delivery. A successful run installs the strict
+schema; **do not rerun `dd.sql` against the existing database**.
+
+Missing files, inconsistent reply identities or representations that cannot reproduce
+a published hash fail the entire migration. Old received compression must be
+reconstructible with the exact declared wire size; otherwise recover the original wire
+payload before upgrading. Resolve reported records and rerun while services remain
+stopped. The command is separate from the daemon and is not bundled in its image.
+A process crash before commit may leave an unreferenced `.fmsg-wire-*` directory;
+only remove such directories after checking both snapshot columns for references.
+
+PostgreSQL tests use an isolated temporary schema in the supplied test database:
+
+```sh
+FMSG_TEST_DATABASE_URL=postgres://postgres@localhost/fmsg_test?sslmode=disable go test ./...
+```
