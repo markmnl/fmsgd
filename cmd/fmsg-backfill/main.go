@@ -118,8 +118,9 @@ func finalize(ctx context.Context, db *sql.DB, id, batch int64) error {
 	defer tx.Rollback()
 	var files message.Files
 	committed := false
+	commitAttempted := false
 	defer func() {
-		if !committed {
+		if !committed && !commitAttempted {
 			files.Cleanup()
 		}
 	}()
@@ -131,6 +132,7 @@ func finalize(ctx context.Context, db *sql.DB, id, batch int64) error {
 	if err != nil {
 		return err
 	}
+	commitAttempted = true
 	err = tx.Commit()
 	committed = err == nil
 	return err

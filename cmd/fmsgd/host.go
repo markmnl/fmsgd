@@ -1654,10 +1654,11 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		localOutcome[strings.ToLower(addrs[i].ToString())] = codes[i]
 	}
 
-	stored := storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, localOutcome, primaryFilepath)
-	if stored {
-		wireStored = true
-	}
+	// If a commit acknowledgement is lost, storage may have succeeded.
+	// Retain the durable wire files once storage is attempted; an orphan is
+	// preferable to deleting bytes referenced by a committed identity.
+	wireStored = len(acceptedTo)+len(acceptedAddTo) > 0
+	storeAcceptedMessage(h, codes, acceptedTo, acceptedAddTo, localOutcome, primaryFilepath)
 
 	return rejectAccept(c, codes)
 }

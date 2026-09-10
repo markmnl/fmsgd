@@ -46,8 +46,8 @@ func (t SQLTx) Exec(c context.Context, q string, a ...any) error {
 	return e
 }
 
-// Files tracks newly prepared directories. Call Cleanup on rollback, including
-// commit failure. Successful commits retain these files for future federation.
+// Files tracks newly prepared directories. Clean up only after definite rollback.
+// Retain files on an ambiguous commit error: the database may have committed.
 type Files []string
 
 func (f Files) Cleanup() {
