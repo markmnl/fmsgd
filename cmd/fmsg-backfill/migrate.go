@@ -39,7 +39,7 @@ type oldBatch struct {
 }
 
 func address(s string) (fmsg.Address, error) {
-	p := strings.Split(s, "@")
+	p := strings.SplitN(s, "@", 3)
 	if len(p) != 3 || p[0] != "" || p[1] == "" || p[2] == "" || len(s) > 255 {
 		return fmsg.Address{}, fmt.Errorf("invalid stored address %q", s)
 	}
@@ -176,12 +176,17 @@ func (m *migration) message(id int64) error {
 			return fmt.Errorf("parent %d: %w", *s.pid, err)
 		}
 		if len(s.h.Pid) == 0 {
-			if len(s.hash) > 0 {
-				return fmt.Errorf("hashed reply has no parent hash; cannot change its identity")
-			}
 			if err = m.tx.QueryRow(`SELECT sha256 FROM msg WHERE id=$1`, *s.pid).Scan(&s.h.Pid); err != nil {
 				return err
 			}
+		}
+	}
+	// Old receivers sometimes kept wire sizes beside already expanded files.
+	// For published identities the full hash remains the authority: use actual
+	// expanded lengths when reconstructing, and only persist them after verification.
+	if len(s.hash) == 32 && len(s.prepared) == 0 {
+		if err = expandedSizes(s.h); err != nil {
+			return err
 		}
 	}
 	batches, err := m.batches(id)
@@ -231,7 +236,7 @@ func (m *migration) message(id int64) error {
 			if len(s.hash) == 0 && !strings.EqualFold(s.h.From.Domain, m.domain) {
 				return fmt.Errorf("remote message has no published hash or wire header")
 			}
-			base, err = m.reconstruct(s.h, s.hash)
+			base, err = m.reconstruct(s.h, s.hash, batches)
 		}
 	}
 	if err != nil {
@@ -259,6 +264,32 @@ func (m *migration) message(id int64) error {
 	if base == nil || len(s.hash) != 32 {
 		return fmt.Errorf("missing canonical identity or payload representation")
 	}
+	// Early receivers stamped the arrival time on the batch row. An exact
+	// retained wire header supplies the sending timestamp. Only repair an
+	// unambiguous, unhashed batch; existing batch identities remain authoritative.
+	if received != nil && received.Flags&fmsg.FlagHasAddTo != 0 {
+		candidate := -1
+		matches := 0
+		exact := false
+		for i, b := range batches {
+			h := batchHeader(base, s.hash, b)
+			if bytes.Equal(h.Encode(), received.Encode()) {
+				exact = true
+				break
+			}
+			h.Timestamp = received.Timestamp
+			if len(b.hash) == 0 && bytes.Equal(h.Encode(), received.Encode()) {
+				candidate = i
+				matches++
+			}
+		}
+		if !exact && matches == 1 {
+			batches[candidate].time = received.Timestamp
+			if _, err = m.tx.Exec(`UPDATE msg_add_to_batch SET time_added=$2 WHERE id=$1`, batches[candidate].id, received.Timestamp); err != nil {
+				return err
+			}
+		}
+	}
 	matchedReceived := received == nil || received.Flags&fmsg.FlagHasAddTo == 0
 	for _, b := range batches {
 		h := batchHeader(base, s.hash, b)
@@ -268,10 +299,6 @@ func (m *migration) message(id int64) error {
 		if len(b.prepared) > 0 {
 			h, err = fmsg.UnmarshalPrepared(b.prepared, b.hash)
 		} else {
-			if len(b.hash) == 0 && !strings.EqualFold(b.from.Domain, m.domain) &&
-				(received == nil || !bytes.Equal(h.Encode(), received.Encode())) {
-				return fmt.Errorf("remote batch %d has no published hash or exact header", b.id)
-			}
 			h, err = selectTypes(h, b.hash)
 		}
 		if err != nil {
@@ -295,6 +322,14 @@ func (m *migration) message(id int64) error {
 	if !matchedReceived {
 		return fmt.Errorf("received wire header has no matching add-to batch")
 	}
+	if _, err = m.tx.Exec(`UPDATE msg SET size=$2 WHERE id=$1`, id, s.h.Size); err != nil {
+		return err
+	}
+	for _, a := range s.h.Attachments {
+		if _, err = m.tx.Exec(`UPDATE msg_attachment SET filesize=$3 WHERE msg_id=$1 AND filename=$2`, id, a.Filename, a.Size); err != nil {
+			return err
+		}
+	}
 	m.done[id] = true
 	return nil
 }
@@ -310,12 +345,20 @@ func batchHeader(base *fmsg.Header, hash []byte, b oldBatch) *fmsg.Header {
 // Local sends previously selected compression and common types during the
 // first network delivery. Try those historical forms only in this tool, and
 // accept a candidate only if it reproduces the entire existing message hash.
-func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header, error) {
-	h, dir, err := fmsg.Prepare(raw)
+func (m *migration) reconstruct(raw *fmsg.Header, expected []byte, batches []oldBatch) (*fmsg.Header, error) {
+	input := raw.Clone()
+	// Early local notes could have an empty recipient list. Preserve their
+	// recorded bytes; normal send validation still requires recipients.
+	if len(input.To) == 0 {
+		input.To = []fmsg.Address{input.From}
+	}
+	h, dir, err := fmsg.Prepare(input)
 	if err != nil {
 		return nil, err
 	}
-	if chosen, err := selectTypes(h, expected); err == nil {
+	h = h.Clone()
+	h.To = raw.To
+	if chosen, err := selectHistorical(h, expected, batches); err == nil {
 		m.files = append(m.files, dir)
 		return chosen, nil
 	}
@@ -324,13 +367,48 @@ func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header
 	if err != nil {
 		return nil, err
 	}
-	chosen, err := selectTypes(h, expected)
+	chosen, err := selectHistorical(h, expected, batches)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 	m.files = append(m.files, dir)
 	return chosen, nil
+}
+
+// An early sender could cache a canonical hash after adding batch fields but
+// before setting the pid flag. Only retain that form if recorded batch fields
+// reproduce the already published hash; never create this encoding for new IDs.
+func selectHistorical(h *fmsg.Header, expected []byte, batches []oldBatch) (*fmsg.Header, error) {
+	chosen, err := selectOriginal(h, expected)
+	if err == nil || len(expected) != 32 {
+		return chosen, err
+	}
+	for _, b := range batches {
+		candidate := h.Clone()
+		candidate.Flags = (candidate.Flags | fmsg.FlagHasAddTo) &^ fmsg.FlagHasPid
+		candidate.AddToFrom, candidate.AddTo = &b.from, b.to
+		if chosen, e := selectTypes(candidate, expected); e == nil {
+			return chosen, nil
+		}
+	}
+	return nil, err
+}
+
+// Some early local writers hashed a root-form header despite retaining a
+// relational parent link. Preserve that established identity and local link;
+// never select this form for a message without an existing hash to verify.
+func selectOriginal(h *fmsg.Header, expected []byte) (*fmsg.Header, error) {
+	chosen, err := selectTypes(h, expected)
+	if err == nil {
+		return chosen, nil
+	}
+	if len(expected) == 32 && h.Flags&fmsg.FlagHasPid != 0 && h.Flags&fmsg.FlagHasAddTo == 0 {
+		root := h.Clone()
+		root.Flags &^= fmsg.FlagHasPid
+		return selectTypes(root, expected)
+	}
+	return nil, err
 }
 
 func selectTypes(h *fmsg.Header, expected []byte) (*fmsg.Header, error) {
@@ -387,4 +465,29 @@ func bytesOrNull(b []byte) any {
 		return nil
 	}
 	return b
+}
+
+func expandedSizes(h *fmsg.Header) error {
+	size := func(path string) (uint32, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > int64(^uint32(0)) {
+			return 0, fmt.Errorf("invalid payload size: %s", path)
+		}
+		return uint32(info.Size()), nil
+	}
+	var err error
+	h.Size, err = size(h.Filepath)
+	if err != nil {
+		return err
+	}
+	for i := range h.Attachments {
+		h.Attachments[i].Size, err = size(h.Attachments[i].Filepath)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -326,3 +326,167 @@ func TestDecodeHeaderRejectsTruncation(t *testing.T) {
 		t.Fatal("accepted trailing data")
 	}
 }
+
+func TestMigrationExpandedFilesWithOldWireSizes(t *testing.T) {
+	for _, retainHeader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("header=%v", retainHeader), func(t *testing.T) {
+			db := previousStore(t)
+			raw := rawMessage(t, "example.org", strings.Repeat("body compression ", 200))
+			att := rawMessage(t, "example.org", strings.Repeat("attachment compression ", 200))
+			raw.Attachments = []fmsg.AttachmentHeader{{Type: "text/plain;charset=UTF-8", Filename: "note.txt", Size: att.Size, Filepath: att.Filepath}}
+			wire := prepared(t, raw)
+			published := hashOf(t, wire)
+			bodySize, attSize := raw.Size, raw.Attachments[0].Size
+			raw.Size = wire.Size
+			raw.Attachments[0].Size = wire.Attachments[0].Size
+			var header []byte
+			if retainHeader {
+				header = wire.Encode()
+			}
+			id := putOld(t, db, raw, nil, published, header)
+			if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			var gotBody, gotAtt uint32
+			var hash, snapshot []byte
+			if err := db.QueryRow(`SELECT size,sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&gotBody, &hash, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT filesize FROM msg_attachment WHERE msg_id=$1`, id).Scan(&gotAtt); err != nil {
+				t.Fatal(err)
+			}
+			if gotBody != bodySize || gotAtt != attSize || !bytes.Equal(hash, published) {
+				t.Fatal("expanded metadata or published hash changed")
+			}
+			if _, err := fmsg.UnmarshalPrepared(snapshot, published); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestMigrationHistoricalLocalLinkAndUnhashedReceivedBatch(t *testing.T) {
+	db := previousStore(t)
+	parentRaw := rawMessage(t, "example.com", "parent")
+	parentHash := hashOf(t, parentRaw)
+	parent := putOld(t, db, parentRaw, nil, parentHash, nil)
+	childRaw := rawMessage(t, "example.com", "child")
+	historicalHash := hashOf(t, childRaw)
+	child := putOld(t, db, childRaw, parent, historicalHash, nil)
+	batch := putBatch(t, db, parent, oldBatch{from: fmsg.Address{User: "bob", Domain: "example.org"}, time: 1300, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}})
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var pid int64
+	var hash, parentSHA, data []byte
+	if err := db.QueryRow(`SELECT pid,sha256,psha256,wire_message FROM msg WHERE id=$1`, child).Scan(&pid, &hash, &parentSHA, &data); err != nil {
+		t.Fatal(err)
+	}
+	if pid != parent || !bytes.Equal(hash, historicalHash) || !bytes.Equal(parentSHA, parentHash) {
+		t.Fatal("historical identity or local thread link changed")
+	}
+	h, err := fmsg.UnmarshalPrepared(data, historicalHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Flags&fmsg.FlagHasPid != 0 {
+		t.Fatal("changed historical root-form identity")
+	}
+	if err := db.QueryRow(`SELECT sha256,wire_message FROM msg_add_to_batch WHERE id=$1`, batch).Scan(&hash, &data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmsg.UnmarshalPrepared(data, hash); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigrationPreservesEarlyLocalNotesAndLiteralRecipients(t *testing.T) {
+	db := previousStore(t)
+	raw := rawMessage(t, "example.com", "local note")
+	raw.To = nil
+	hash := hashOf(t, raw)
+	note := putOld(t, db, raw, nil, hash, nil)
+	bad := rawMessage(t, "example.com", "literal recipient")
+	bad.To = []fmsg.Address{{User: "alice", Domain: "example.org,@bob@example.com"}}
+	literal := putOld(t, db, bad, nil, nil, nil)
+	child := rawMessage(t, "example.com", "local child")
+	childHash := hashOf(t, child)
+	parentRaw := rawMessage(t, "example.com", "unhashed local parent")
+	parent := putOld(t, db, parentRaw, nil, nil, nil)
+	reply := putOld(t, db, child, parent, childHash, nil)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{note, literal, reply} {
+		var got, data []byte
+		if err := db.QueryRow(`SELECT sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&got, &data); err != nil {
+			t.Fatal(err)
+		}
+		h, err := fmsg.UnmarshalPrepared(data, got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id == note && (!bytes.Equal(got, hash) || len(h.To) != 0) {
+			t.Fatal("local note changed")
+		}
+		if id == literal && h.To[0].ToString() != bad.To[0].ToString() {
+			t.Fatal("literal recipient changed")
+		}
+		if id == reply && !bytes.Equal(got, childHash) {
+			t.Fatal("historical child identity changed")
+		}
+	}
+}
+
+func TestMigrationRecoversRecordedBatchWireTime(t *testing.T) {
+	db := previousStore(t)
+	raw := rawMessage(t, "example.org", "forwarded")
+	base := prepared(t, raw)
+	canonical := hashOf(t, base)
+	b := oldBatch{from: raw.From, time: 1300, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}}
+	wire := batchHeader(base, canonical, b)
+	hash := hashOf(t, wire)
+	raw.Timestamp = 1300
+	id := putOld(t, db, raw, nil, canonical, wire.Encode())
+	b.time = 1302
+	bid := putBatch(t, db, id, b)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var stamp float64
+	var got []byte
+	if err := db.QueryRow(`SELECT time_added,sha256 FROM msg_add_to_batch WHERE id=$1`, bid).Scan(&stamp, &got); err != nil {
+		t.Fatal(err)
+	}
+	if stamp != 1300 || !bytes.Equal(got, hash) {
+		t.Fatal("recorded wire identity not restored")
+	}
+}
+
+func TestMigrationPreservesEarlyHashWithBatchFields(t *testing.T) {
+	db := previousStore(t)
+	parent := rawMessage(t, "example.com", "parent")
+	parentID := putOld(t, db, parent, nil, nil, nil)
+	raw := rawMessage(t, "example.com", "reply")
+	raw.Topic = ""
+	b := oldBatch{from: raw.From, to: []fmsg.Address{{User: "carol", Domain: "remote.example"}}, time: raw.Timestamp}
+	old := raw.Clone()
+	old.Flags = fmsg.FlagHasAddTo
+	old.AddToFrom, old.AddTo = &b.from, b.to
+	hash := hashOf(t, old)
+	id := putOld(t, db, raw, parentID, hash, nil)
+	putBatch(t, db, id, b)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var got, snapshot []byte
+	if err := db.QueryRow(`SELECT sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&got, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, hash) {
+		t.Fatal("changed historical identity")
+	}
+	if _, err := fmsg.UnmarshalPrepared(snapshot, hash); err != nil {
+		t.Fatal(err)
+	}
+}
