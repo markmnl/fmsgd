@@ -157,26 +157,41 @@ access to the shared files (normally the same service user/group). The API keeps
 expanded downloadable content separately. New received messages also preserve their
 wire payloads before expanding the downloadable copies.
 
-Upgrade the daemon, API and schema together while message writes and federation are
-paused: install compatible binaries, rerun `dd.sql`, backfill, then resume services.
-The schema refuses a newly committed sent message without a 32-byte hash. It is not
-compatible with an older API that stamps only `time_sent`. Existing hashes are never
-replaced by the migration.
+`dd.sql` bootstraps a new, empty database. The daemon and API require finalized
+sent messages and do not repair old rows during normal operation.
 
-Build the maintenance command with `go build -o fmsg-backfill ./cmd/fmsg-backfill`.
-It uses the same standard `PG*` connection variables as the daemon and must have
-access to the stored file paths. First inspect, then apply:
+For an existing installation, build the single standalone migration binary:
+
+```sh
+CGO_ENABLED=0 go build -o fmsg-backfill ./cmd/fmsg-backfill
+```
+
+The binary embeds the schema changes; no SQL scripts, source checkout or running
+services are needed on the target host. It upgrades the pre-finalization schema
+(with `wire_header` and add-to batch hashes) and can also verify a completed migration.
+It uses the standard `PG*` connection variables. Run it as the service account with
+write access to the database and every stored payload path, including shared volumes.
+
+Stop both services and back up the message database and data directory together.
+Then validate and apply the conversion before starting the matching daemon and API:
 
 ```sh
 ./fmsg-backfill -domain example.com
 ./fmsg-backfill -domain example.com -apply
 ```
 
-The default invocation lists pending local messages and batches without writing.
-`-apply` preserves timestamps and finalizes parents before children; it can be rerun.
-Missing files, inconsistent already-hashed children, or legacy representations that
-cannot reproduce an existing hash are reported with a nonzero exit status. Resolve
-these records before resuming dependent delivery; hashes are not silently rewritten.
+The default is a full dry run: it reconstructs and verifies every sent message and
+batch, then rolls back schema/data changes and removes staged files. `-apply` commits
+the schema and data together in one transaction. It preserves timestamps, message IDs
+and all published hashes, finalizes local-only parents before replies, and prepares
+existing federated messages for later delivery. A successful run installs the strict
+schema; **do not rerun `dd.sql` against the existing database**.
+
+Missing files, inconsistent reply identities or representations that cannot reproduce
+a published hash fail the entire migration. Old received compression must be
+reconstructible with the exact declared wire size; otherwise recover the original wire
+payload before upgrading. Resolve reported records and rerun while services remain
+stopped. The command is separate from the daemon and is not bundled in its image.
 A process crash before commit may leave an unreferenced `.fmsg-wire-*` directory;
 only remove such directories after checking both snapshot columns for references.
 

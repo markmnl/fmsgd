@@ -85,43 +85,38 @@ func seal(t *testing.T, db *sql.DB, id int64) []byte {
 	}
 	return hash
 }
-func TestFinalizeBackfillAndImmutability(t *testing.T) {
-	db, dd := testStore(t)
-	// Simulate the old local-only writer, then migrate with existing replies.
-	if _, err := db.Exec(`DROP TRIGGER trg_msg_require_hash ON msg`); err != nil {
-		t.Fatal(err)
-	}
+func TestFinalizeAndImmutability(t *testing.T) {
+	db, _ := testStore(t)
 	root := insertDraft(t, db, nil, "root")
-	if _, err := db.Exec(`UPDATE msg SET time_sent=100 WHERE id=$1`, root); err != nil {
-		t.Fatal(err)
-	}
-	child := insertDraft(t, db, root, "child")
-	if _, err := db.Exec(`UPDATE msg SET time_sent=101 WHERE id=$1`, child); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(dd); err != nil {
-		t.Fatal(err)
-	}
 	hash := seal(t, db, root)
+	child := insertDraft(t, db, root, "child")
 	childHash := seal(t, db, child)
 	if len(hash) != 32 || len(childHash) != 32 {
 		t.Fatal("missing identities")
-	}
-	if got := seal(t, db, root); !bytes.Equal(hash, got) {
-		t.Fatal("backfill is not idempotent")
 	}
 	var stamp float64
 	var parent []byte
 	if err := db.QueryRow(`SELECT time_sent,psha256 FROM msg WHERE id=$1`, child).Scan(&stamp, &parent); err != nil {
 		t.Fatal(err)
 	}
-	if stamp != 101 || !bytes.Equal(parent, hash) {
-		t.Fatal("backfill altered timestamp or lost parent")
+	if stamp != 1234.5 || !bytes.Equal(parent, hash) {
+		t.Fatal("finalization lost timestamp or parent")
 	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files Files
+	if _, err = Finalize(context.Background(), SQLTx{tx}, root, 999, &files); err == nil {
+		t.Fatal("accepted an already finalized message")
+	}
+	tx.Rollback()
 	for _, query := range []string{
 		`UPDATE msg SET time_sent=102 WHERE id=$1`,
 		`UPDATE msg SET topic='changed' WHERE id=$1`,
 		`UPDATE msg SET sha256=NULL WHERE id=$1`,
+		`UPDATE msg SET wire_message=NULL WHERE id=$1`,
+		`UPDATE msg SET wire_header=NULL WHERE id=$1`,
 		`UPDATE msg_to SET addr='@mallory@example.com' WHERE msg_id=$1`,
 		`INSERT INTO msg_to(msg_id,addr) VALUES($1,'@carol@example.com')`,
 		`DELETE FROM msg_to WHERE msg_id=$1`,

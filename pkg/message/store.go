@@ -3,7 +3,6 @@
 package message
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -139,19 +138,15 @@ func load(ctx context.Context, tx Tx, id int64) (*stored, error) {
 	return s, err
 }
 
-// Finalize stamps and hashes a draft, or backfills an unhashed sent message at
-// its original time. Parents must already have identities. Existing hashes
-// are never replaced. The caller must check ownership/draft status separately.
+// Finalize stamps and hashes a draft. Parents must already have identities.
+// The caller must check ownership separately.
 func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Files) ([]byte, error) {
 	s, err := load(ctx, tx, id)
 	if err != nil {
 		return nil, err
 	}
-	if len(s.hash) > 0 {
-		return s.hash, nil
-	}
-	if s.time != nil {
-		timestamp = *s.time
+	if s.time != nil || len(s.hash) != 0 {
+		return nil, fmt.Errorf("message %d is already finalized", id)
 	}
 	s.h.Timestamp = timestamp
 	if s.pid != nil {
@@ -160,7 +155,7 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 			return nil, fmt.Errorf("parent unavailable: %w", err)
 		}
 		if len(parentHash) != 32 {
-			return nil, fmt.Errorf("parent %d needs hash backfill first", *s.pid)
+			return nil, fmt.Errorf("parent %d has no finalized identity", *s.pid)
 		}
 		if len(s.h.Pid) == 0 {
 			s.h.Pid = parentHash
@@ -168,17 +163,6 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 	}
 	if len(s.h.Pid) > 0 && len(s.h.Pid) != 32 {
 		return nil, fmt.Errorf("invalid parent hash")
-	}
-	if s.time != nil {
-		// A previously hashed child with a missing parent hash cannot be
-		// repaired without changing an established protocol identity.
-		var inconsistent bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM msg WHERE pid=$1 AND sha256 IS NOT NULL AND psha256 IS NULL)`, id).Scan(&inconsistent); err != nil {
-			return nil, err
-		}
-		if inconsistent {
-			return nil, fmt.Errorf("message %d has hashed children without parent hashes; manual repair required", id)
-		}
 	}
 	h, dir, err := fmsg.Prepare(s.h)
 	if err != nil {
@@ -194,9 +178,6 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 		return nil, err
 	}
 	if err = tx.Exec(ctx, `UPDATE msg SET time_sent=$2,sha256=$3,psha256=$4,wire_header=$5,wire_message=$6,is_deflate=$7 WHERE id=$1`, id, timestamp, hash, h.Pid, h.Encode(), string(snapshot), h.Flags&fmsg.FlagDeflate != 0); err != nil {
-		return nil, err
-	}
-	if err = tx.Exec(ctx, `UPDATE msg SET psha256=$2 WHERE pid=$1 AND psha256 IS NULL AND sha256 IS NULL`, id, hash); err != nil {
 		return nil, err
 	}
 	rows, err := tx.Query(ctx, `SELECT id FROM msg_add_to_batch WHERE msg_id=$1 AND sha256 IS NULL ORDER BY id`, id)
@@ -222,7 +203,7 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 		if err = tx.Exec(ctx, `UPDATE msg_add_to_batch SET time_added=GREATEST(time_added,$2) WHERE id=$1 AND sha256 IS NULL`, b, timestamp); err != nil {
 			return nil, err
 		}
-		if _, err = FinalizeBatch(ctx, tx, id, b, files); err != nil {
+		if _, err = FinalizeBatch(ctx, tx, id, b); err != nil {
 			return nil, err
 		}
 	}
@@ -231,7 +212,7 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 
 // FinalizeBatch seals one add-to exchange. Its payload representation is copied
 // from the original (or a received batch), never recompressed independently.
-func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64, files *Files) ([]byte, error) {
+func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64) ([]byte, error) {
 	s, err := load(ctx, tx, id)
 	if err != nil {
 		return nil, err
@@ -240,7 +221,7 @@ func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64, files *Files) 
 		return nil, nil
 	} // a draft's batches finalize with its send
 	if len(s.hash) != 32 {
-		return nil, fmt.Errorf("message %d needs hash backfill first", id)
+		return nil, fmt.Errorf("message %d has no finalized identity", id)
 	}
 	var from string
 	var timestamp float64
@@ -261,34 +242,6 @@ func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64, files *Files) 
 		err = tx.QueryRow(ctx, `SELECT wire_message,sha256 FROM msg_add_to_batch WHERE msg_id=$1 AND wire_message IS NOT NULL ORDER BY id LIMIT 1`, id).Scan(&snapshot, &batchHash)
 		if err == nil {
 			h, err = fmsg.UnmarshalPrepared(snapshot, batchHash)
-		} else {
-			// Legacy local rows can be upgraded only if preparation reproduces
-			// their existing identity. Do not replace a published hash.
-			var dir string
-			h, dir, err = fmsg.Prepare(s.h)
-			if err == nil {
-				*files = append(*files, dir)
-				var got []byte
-				got, err = h.GetMessageHash()
-				if err == nil && !bytes.Equal(got, s.hash) {
-					h = h.Clone()
-					h.Flags &^= fmsg.FlagCommonType
-					for i := range h.Attachments {
-						h.Attachments[i].Flags &^= 1
-					}
-					got, err = h.GetMessageHash()
-					if err == nil && !bytes.Equal(got, s.hash) {
-						err = fmt.Errorf("cannot reproduce legacy message %d; existing hash preserved", id)
-					}
-				}
-				if err == nil {
-					var data []byte
-					data, err = fmsg.MarshalPrepared(h)
-					if err == nil {
-						err = tx.Exec(ctx, `UPDATE msg SET wire_message=$2 WHERE id=$1`, id, string(data))
-					}
-				}
-			}
 		}
 	}
 	if err != nil {

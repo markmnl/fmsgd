@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
@@ -287,121 +286,6 @@ func updateNotify(tx *sql.Tx, notifyID int64, now float64, code int, notified bo
 	}
 }
 
-// deflatePart is one compressed payload (message body or attachment).
-type deflatePart struct {
-	path     string
-	size     uint32
-	expanded uint32
-}
-
-// deflateState captures the result of compressing a message's body and
-// attachments once, so the same compressed payload can be applied to every
-// outgoing wire header — the original message and each add-to batch share the
-// shared message data (SPEC §12).
-type deflateState struct {
-	body     deflatePart
-	bodyUsed bool
-	atts     []deflatePart
-	cleanup  []string // temp files to remove once delivery completes
-}
-
-// computeDeflate compresses the message body and each attachment of m where
-// worthwhile. Apply the result to a unit header with applyTo; remove its temp
-// files with removeTempFiles after delivery.
-func computeDeflate(m *msgFields, msgID int64) deflateState {
-	var d deflateState
-	d.atts = make([]deflatePart, len(m.attachments))
-
-	if shouldCompress(m.typ, uint32(m.size)) {
-		dp, cs, ok, derr := tryCompress(m.filepath, uint32(m.size))
-		if derr != nil {
-			log.Printf("WARN: sender: compress msg data for msg %d: %s", msgID, derr)
-		} else if ok {
-			log.Printf("INFO: sender: compressed msg %d data: %d -> %d bytes", msgID, m.size, cs)
-			d.body = deflatePart{path: dp, size: cs, expanded: uint32(m.size)}
-			d.bodyUsed = true
-			d.cleanup = append(d.cleanup, dp)
-		}
-	}
-	for i := range m.attachments {
-		att := m.attachments[i]
-		if !shouldCompress(att.Type, att.Size) {
-			continue
-		}
-		dp, cs, ok, derr := tryCompress(att.Filepath, att.Size)
-		if derr != nil {
-			log.Printf("WARN: sender: compress attachment %s for msg %d: %s", att.Filename, msgID, derr)
-		} else if ok {
-			log.Printf("INFO: sender: compressed msg %d attachment %s: %d -> %d bytes", msgID, att.Filename, att.Size, cs)
-			d.atts[i] = deflatePart{path: dp, size: cs, expanded: att.Size}
-			d.cleanup = append(d.cleanup, dp)
-		}
-	}
-	return d
-}
-
-// applyTo rewrites h's body and attachment fields to send the compressed
-// payloads, setting the corresponding deflate flags.
-func (d deflateState) applyTo(h *FMsgHeader) {
-	if d.bodyUsed {
-		h.Filepath = d.body.path
-		h.ExpandedSize = d.body.expanded
-		h.Size = d.body.size
-		h.Flags |= FlagDeflate
-	}
-	for i := range h.Attachments {
-		if i >= len(d.atts) || d.atts[i].path == "" {
-			continue
-		}
-		h.Attachments[i].Filepath = d.atts[i].path
-		h.Attachments[i].ExpandedSize = d.atts[i].expanded
-		h.Attachments[i].Size = d.atts[i].size
-		h.Attachments[i].Flags |= 1 << 1
-	}
-}
-
-// applyCommonTypes encodes h's type, and each attachment's type, as a Common
-// Media Type ID (SPEC §4) where the type string has one, so the wire carries
-// one byte instead of the string. Standards such as FMSG-005 require the ID
-// form. It reports whether anything changed.
-func applyCommonTypes(h *FMsgHeader) bool { return fmsg.ApplyCommonTypes(h) }
-
-// encodeForWire builds a unit header in its transmitted form: build, apply
-// deflate, then, when commonTypes is set, common type IDs. The message hash
-// covers the header exactly as transmitted, so when storedHash was recorded by
-// an earlier delivery the form that reproduces it wins: a message first sent
-// before this host encoded common type IDs keeps string types for every later
-// delivery. It reports whether common type IDs were used, so a message's
-// add-to batches can follow the original's form.
-func encodeForWire(build func() *FMsgHeader, d deflateState, commonTypes bool, storedHash []byte) (*FMsgHeader, bool, error) {
-	h := build()
-	d.applyTo(h)
-	if !commonTypes || !applyCommonTypes(h) {
-		return h, commonTypes, nil
-	}
-	if len(storedHash) == 0 {
-		return h, true, nil
-	}
-	hash, err := h.GetMessageHash()
-	if err != nil {
-		return nil, false, err
-	}
-	if bytes.Equal(hash, storedHash) {
-		return h, true, nil
-	}
-	// Recorded in string form before this host encoded common type IDs.
-	h = build()
-	d.applyTo(h)
-	return h, false, nil
-}
-
-// removeTempFiles deletes the compression temp files.
-func (d deflateState) removeTempFiles() {
-	for _, p := range d.cleanup {
-		_ = os.Remove(p)
-	}
-}
-
 // lockPendingRecipients locks (FOR UPDATE SKIP LOCKED) the undelivered,
 // retryable rows in `table` for one message on `domain`, returning the locked
 // addresses. For msg_add_to it locks only rows in batchID, so each add-to batch
@@ -490,61 +374,9 @@ func deliverMessage(target pendingTarget) {
 	}
 	rtx.Rollback()
 
-	// Compress the shared payload once; every unit header reuses it. Deflate
-	// must be applied BEFORE the shared hash is computed: the message hash
-	// covers the header fields exactly as transmitted (SPEC "Message hash"),
-	// and applyTo changes flags, size and expanded size. Hashing the
-	// undeflated form recorded a sha256 the receiving host never computes,
-	// so cross-host replies bounced with code 6 (parent not found).
-	var d deflateState
-	defer func() { d.removeTempFiles() }()
-	var orig *FMsgHeader
-	useCommonTypes := true
-	sharedHash := m.storedHash
-	if m.wire != nil {
-		orig = m.wire.Clone()
-	} else {
-		// A message received only as an add-to has no original header, but
-		// its stored batches remain independently deliverable.
-		hasPreparedBatch := false
-		for _, b := range batches {
-			if len(b.Prepared) > 0 {
-				hasPreparedBatch = true
-				break
-			}
-		}
-		if !hasPreparedBatch {
-			d = computeDeflate(m, target.MsgID)
-			orig, useCommonTypes, err = encodeForWire(m.originalHeader, d, true, m.storedHash)
-			if err != nil {
-				log.Printf("ERROR: sender: building msg %d: %s", target.MsgID, err)
-				return
-			}
-		}
-	}
-	if orig != nil {
-		actual, hashErr := orig.GetMessageHash()
-		if hashErr != nil {
-			log.Printf("ERROR: sender: hash msg %d: %s", target.MsgID, hashErr)
-			return
-		}
-		if len(sharedHash) > 0 && !bytes.Equal(actual, sharedHash) {
-			log.Printf("ERROR: sender: immutable hash mismatch for msg %d", target.MsgID)
-			return
-		}
-		sharedHash = actual
-	}
-	if len(sharedHash) != 32 {
-		log.Printf("ERROR: sender: missing identity for msg %d", target.MsgID)
-		return
-	}
-
-	// Persist the shared hash (so replies/add-to referencing this message
-	// resolve) and link any pending children — once for the whole message.
-	if err := ensureSharedHash(db, target.MsgID, sharedHash); err != nil {
-		log.Printf("ERROR: sender: %s", err)
-		return
-	}
+	// Sending never changes an identity or its representation. Messages that
+	// first arrived through add-to have batch snapshots but no original header.
+	orig := m.wire
 
 	// SPEC §10.2: a host must not transmit a reply to a terminal message, nor
 	// an add-to batch of one. dd.sql refuses to create such rows, so this is
@@ -579,32 +411,9 @@ func deliverMessage(target pendingTarget) {
 			recordUnitInvalid(db, target, "msg_add_to", b.ID)
 			continue
 		}
-		var h *FMsgHeader
-		var err error
-		if len(b.Prepared) > 0 {
-			h, err = fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
-		} else {
-			h, _, err = encodeForWire(func() *FMsgHeader { return m.addToHeader(b, sharedHash) }, d, useCommonTypes, b.Hash)
-		}
+		h, err := fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
 		if err != nil {
-			log.Printf("ERROR: sender: building add-to wire header for batch %d of msg %d: %s", b.ID, target.MsgID, err)
-			continue
-		}
-		// Persist the batch hash — the batch's identity (SPEC §11) — once,
-		// so replies referencing this batch resolve at this host too, which
-		// must verify messages it sent, not only ones it received. Cached on
-		// h, so the challenge response reuses this computation.
-		batchHash, err := h.GetMessageHash()
-		if err != nil {
-			log.Printf("ERROR: sender: computing batch hash for batch %d of msg %d: %s", b.ID, target.MsgID, err)
-			continue
-		}
-		if len(b.Hash) > 0 && !bytes.Equal(batchHash, b.Hash) {
-			log.Printf("ERROR: sender: immutable batch hash mismatch for %d", b.ID)
-			continue
-		}
-		if err := ensureBatchHash(db, b.ID, batchHash); err != nil {
-			log.Printf("ERROR: sender: %s", err)
+			log.Printf("ERROR: sender: load finalized batch %d of msg %d: %s", b.ID, target.MsgID, err)
 			continue
 		}
 		deliverUnit(db, target, h, "msg_add_to", b.ID)
@@ -697,34 +506,6 @@ func markLocalDelivered(target pendingTarget) {
 	`, now, target.MsgID, target.Domain); err != nil {
 		log.Printf("ERROR: sender: marking local recipients delivered for msg %d: %s", target.MsgID, err)
 	}
-}
-
-// ensureBatchHash persists an add-to batch's message hash when not yet stored.
-// Like ensureSharedHash for the canonical hash, this is what lets replies that
-// reference the batch via pid resolve on the host that originated the batch
-// (SPEC §11: a host verifies messages it sent, not only ones it received).
-func ensureBatchHash(db *sql.DB, batchID int64, batchHash []byte) error {
-	if _, err := db.Exec(`UPDATE msg_add_to_batch SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`, batchHash, batchID); err != nil {
-		return fmt.Errorf("storing sha256 for add-to batch %d: %w", batchID, err)
-	}
-	return nil
-}
-
-// ensureSharedHash persists the message's canonical hash when not yet stored and
-// resolves any pending child (reply/add-to) links that reference it.
-func ensureSharedHash(db *sql.DB, msgID int64, sharedHash []byte) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE msg SET sha256 = $1 WHERE id = $2 AND sha256 IS NULL`, sharedHash, msgID); err != nil {
-		return fmt.Errorf("storing sha256 for msg %d: %w", msgID, err)
-	}
-	if err := resolvePendingChildLinks(txParentLinkStore{tx: tx}, msgID, sharedHash); err != nil {
-		return fmt.Errorf("resolving child pids for msg %d: %w", msgID, err)
-	}
-	return tx.Commit()
 }
 
 // deliverUnit sends one wire message — the original message or a single add-to

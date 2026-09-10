@@ -1,8 +1,25 @@
--- PostgreSQL bootstrap schema for a new, empty fmsg message database.
--- Existing installations use the standalone fmsg-backfill binary before
--- starting this version. This file is not an upgrade script.
+/****************************************************************
+ *
+ * PostgreSQL database objects data definition for fmsgd
+ *
+ * This script is IDEMPOTENT: every statement is safe to re-run
+ * (create table/index if not exists, alter table add column if
+ * not exists, create or replace function, drop trigger if exists
+ * before create trigger). Migrating an existing database is
+ * therefore just re-running the whole script, e.g.:
+ *
+ *   psql -d fmsgd -v ON_ERROR_STOP=1 -f dd.sql
+ *
+ * Keep it that way: add new objects and columns only with
+ * idempotent statements, and name indexes explicitly to match
+ * PostgreSQL's default generated names so indexes that already
+ * exist unnamed on live databases are recognised, not duplicated.
+ *
+ ****************************************************************/
 
-create table msg (
+-- database with encoding UTF8 should already be created and connected
+
+create table if not exists msg (
     id            	bigserial       	primary key,
 	version			int					not null,
     pid           	bigint          	references msg (id),
@@ -18,12 +35,13 @@ create table msg (
     psha256       	bytea,
 	size			int					not null, -- spec allows uint32 but we don't enforced by FMSG_MAX_MSG_SIZE
     filepath      	text            	not null,
-    wire_header   	bytea,                        -- exact protocol header (fields 1-13)
-    wire_message    jsonb                         -- durable original wire representation; null for drafts or originals received only through add-to
+    wire_header   	bytea                         -- received messages: the exact wire header bytes (fields 1-13), so any hash can always be faithfully recomputed (SPEC §11); null for locally-authored messages
 );
-create index msg_lower_idx on msg ((lower(from_addr)));
+create index if not exists msg_lower_idx on msg ((lower(from_addr)));
+alter table msg add column if not exists wire_header bytea; -- upgrade path for databases created before this column
+alter table msg add column if not exists is_terminal boolean not null default false; -- upgrade path (SPEC v0.6.0)
 
-create table msg_to (
+create table if not exists msg_to (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	addr			varchar(255)		not null,
@@ -34,7 +52,7 @@ create table msg_to (
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (msg_id, addr)
 );
-create index msg_to_lower_idx on msg_to ((lower(addr)));
+create index if not exists msg_to_lower_idx on msg_to ((lower(addr)));
 
 -- Each add-to delivery for a shared message is one batch: a single sender
 -- (add_to_from) added a set of recipients at a point in time. Storing batches
@@ -42,18 +60,19 @@ create index msg_to_lower_idx on msg_to ((lower(addr)));
 -- which a single flat recipient list cannot preserve (SPEC §12). A batch's
 -- identity is its message hash (sha256), which covers the batch's time: the
 -- same addresses re-issued at a new time are a distinct batch, not a
--- duplicate (SPEC §11/§12). Batches of a draft finalize when it is sent.
-create table msg_add_to_batch (
+-- duplicate (SPEC §11/§12). sha256 is null for rows recorded before this
+-- column existed and for locally originated batches not yet hashed.
+create table if not exists msg_add_to_batch (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	add_to_from		varchar(255)		not null,           -- sender that added this batch's recipients
 	time_added		double precision	not null,           -- the batch message's wire time field (for locally originated batches, when the batch was created)
-	sha256			bytea,                                  -- finalized batch identity (SPEC §11)
-    wire_message    jsonb                                   -- durable batch wire representation
+	sha256			bytea                                   -- batch message hash: the batch's identity (SPEC §11)
 );
-create index msg_add_to_batch_msg_id_idx on msg_add_to_batch (msg_id);
+alter table msg_add_to_batch add column if not exists sha256 bytea;
+create index if not exists msg_add_to_batch_msg_id_idx on msg_add_to_batch (msg_id);
 
-create table msg_add_to (
+create table if not exists msg_add_to (
 	id				bigserial			primary key,
 	msg_id			bigint				not null references msg (id),
 	batch_id		bigint				not null references msg_add_to_batch (id), -- batch this recipient was added in
@@ -65,10 +84,15 @@ create table msg_add_to (
     attempt_count   int             not null default 0, -- number of failed delivery attempts; used for exponential back-off
 	unique (batch_id, addr)
 );
-create index msg_add_to_lower_idx on msg_add_to ((lower(addr)));
-create index msg_add_to_batch_id_idx on msg_add_to (batch_id);
+-- An address is unique within a batch, not across batches: distinct batches
+-- may re-add the same address (each batch is its own sibling branch, SPEC
+-- §12). Migrate existing databases off the old per-message constraint.
+alter table msg_add_to drop constraint if exists msg_add_to_msg_id_addr_key;
+create unique index if not exists msg_add_to_batch_id_addr_key on msg_add_to (batch_id, addr);
+create index if not exists msg_add_to_lower_idx on msg_add_to ((lower(addr)));
+create index if not exists msg_add_to_batch_id_idx on msg_add_to (batch_id);
 
-create table msg_attachment (
+create table if not exists msg_attachment (
     msg_id        	bigint          references msg (id),
     position      	smallint        not null default 0,
     flags         	smallint        not null default 0,
@@ -79,38 +103,12 @@ create table msg_attachment (
     primary key (msg_id, filename)
 );
 
--- Sender-side state for add-to participant notification (SPEC §10.2): an
--- add-to message is sent to every participant domain of the message being
--- added to -- the domains of from and every to address as well as the new
--- recipients' -- so all participants learn recipients were added, not only
--- the domains hosting the new recipients. Domains hosting a recipient of the
--- batch itself learn through normal recipient delivery; every other
--- participant domain gets one row here per batch and receives the add-to as
--- a notification-only exchange completing at code 11. Rows are created by
--- the Web API when recipients are added through it (the local domain itself
--- needs no row -- this database is its record).
-create table msg_add_to_notify (
-    id                bigserial        primary key,
-    batch_id          bigint           not null references msg_add_to_batch (id),
-    domain            varchar(255)     not null,
-    time_notified     double precision,   -- time remote host acknowledged the batch; null means pending
-    time_last_attempt double precision,   -- time of last failed attempt; drives exponential back-off
-    response_code     smallint,           -- response code of last attempt
-    attempt_count     int              not null default 0,
-    unique (batch_id, domain)
-);
-
-create index msg_add_to_batch_sha256_idx on msg_add_to_batch (sha256) where sha256 is not null;
-create index msg_pid_idx on msg (pid) where pid is not null;
-
--- Functions and triggers.
-
 -- keep protocol parent hash populated for locally-created replies that set
 -- the relational parent id. A reply cannot reference a draft parent or a
 -- terminal parent (SPEC v0.6.0 §3: a Sending Host must not transmit a reply
 -- to a terminal message, so refuse to create one), and any explicit psha256
 -- must match the referenced parent's sha256.
-create function populate_msg_psha256_from_pid() returns trigger as $$
+create or replace function populate_msg_psha256_from_pid() returns trigger as $$
 declare
     parent_time_sent double precision;
     parent_sha256 bytea;
@@ -137,8 +135,9 @@ begin
         raise exception 'cannot set pid %: parent message is terminal', NEW.pid;
     end if;
 
-    if parent_sha256 is null or octet_length(parent_sha256) <> 32 then
-        raise exception 'parent message % has no finalized identity', NEW.pid;
+    if parent_sha256 is null or octet_length(parent_sha256) = 0 then
+        -- parent was delivered locally only and has no sha256 yet; psha256 cannot be populated
+        return NEW;
     end if;
 
     if NEW.psha256 is null or octet_length(NEW.psha256) = 0 then
@@ -158,13 +157,14 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_msg_populate_psha256 on msg;
 create trigger trg_msg_populate_psha256
     before insert or update of pid, psha256 on msg
     for each row execute function populate_msg_psha256_from_pid();
 
 -- recipients cannot be added to a terminal message (SPEC §12): refuse to
 -- create a batch for one, so the sender never has such a unit to transmit.
-create function prevent_add_to_terminal_msg() returns trigger as $$
+create or replace function prevent_add_to_terminal_msg() returns trigger as $$
 begin
     if exists (select 1 from msg where id = NEW.msg_id and is_terminal) then
         raise exception 'cannot add recipients to message %: it is terminal', NEW.msg_id;
@@ -173,9 +173,35 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_msg_add_to_batch_terminal on msg_add_to_batch;
 create trigger trg_msg_add_to_batch_terminal
     before insert on msg_add_to_batch
     for each row execute function prevent_add_to_terminal_msg();
+
+-- once a message has replies, it must remain referenceable by protocol hash.
+create or replace function prevent_referenced_msg_from_becoming_unreferenceable() returns trigger as $$
+begin
+    if exists (select 1 from msg child where child.pid = NEW.id) then
+        if NEW.time_sent is null then
+            raise exception 'cannot make message % a draft: it has replies', NEW.id;
+        end if;
+
+        if OLD.sha256 is not null and (NEW.sha256 is null or octet_length(NEW.sha256) = 0) then
+            raise exception 'cannot clear sha256 for message %: it has replies', NEW.id;
+        end if;
+
+        if OLD.sha256 is distinct from NEW.sha256 then
+            raise exception 'cannot change sha256 for message %: it has replies', NEW.id;
+        end if;
+    end if;
+    return NEW;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_msg_prevent_unreferenceable_parent on msg;
+create trigger trg_msg_prevent_unreferenceable_parent
+    before update of time_sent, sha256 on msg
+    for each row execute function prevent_referenced_msg_from_becoming_unreferenceable();
 
 -- Notify the sender's outgoing worker (channel new_msg_to) whenever new
 -- delivery work appears. One function serves all three triggers, dispatching
@@ -188,7 +214,7 @@ create trigger trg_msg_add_to_batch_terminal
 --                          message whose recipient rows follow in the same
 --                          transaction); notify that recipient.
 -- The payload is advisory only: the worker re-polls fully on any wake-up.
-create function notify_msg_sent() returns trigger as $$
+create or replace function notify_msg_sent() returns trigger as $$
 begin
     if TG_TABLE_NAME = 'msg' then
         if OLD.time_sent is null and NEW.time_sent is not null then
@@ -206,14 +232,17 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_msg_to_insert on msg_to;
 create trigger trg_msg_to_insert
     after insert on msg_to
     for each row execute function notify_msg_sent();
 
+drop trigger if exists trg_msg_add_to_insert on msg_add_to;
 create trigger trg_msg_add_to_insert
     after insert on msg_add_to
     for each row execute function notify_msg_sent();
 
+drop trigger if exists trg_msg_sent on msg;
 create trigger trg_msg_sent
     after update on msg
     for each row execute function notify_msg_sent();
@@ -230,7 +259,7 @@ create trigger trg_msg_sent
 -- msg row is written before its msg_to/msg_add_to rows (FK ordering), so a
 -- plain row trigger would see no recipients. At commit every recipient row in
 -- the transaction is visible.
-create function notify_new_msg() returns trigger as $$
+create or replace function notify_new_msg() returns trigger as $$
 begin
     if (TG_OP = 'INSERT' and NEW.time_sent is not null) or
        (TG_OP = 'UPDATE' and OLD.time_sent is null and NEW.time_sent is not null) then
@@ -244,6 +273,7 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_new_msg on msg;
 create constraint trigger trg_new_msg
     after insert or update on msg
     deferrable initially deferred
@@ -260,7 +290,7 @@ create constraint trigger trg_new_msg
 -- it's the sender whose UI needs to react. Unlike trg_new_msg this does not
 -- need to be deferred: the msg row referenced by msg_id already exists (FK)
 -- by the time msg_to/msg_add_to is updated.
-create function notify_delivered() returns trigger as $$
+create or replace function notify_delivered() returns trigger as $$
 begin
     perform pg_notify('delivered', NEW.msg_id::text || ',' || m.from_addr)
     from msg m where m.id = NEW.msg_id;
@@ -268,22 +298,45 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_msg_to_delivered on msg_to;
 create trigger trg_msg_to_delivered
     after update of time_delivered on msg_to
     for each row
     when (OLD.time_delivered is null and NEW.time_delivered is not null)
     execute function notify_delivered();
 
+drop trigger if exists trg_msg_add_to_delivered on msg_add_to;
 create trigger trg_msg_add_to_delivered
     after update of time_delivered on msg_add_to
     for each row
     when (OLD.time_delivered is null and NEW.time_delivered is not null)
     execute function notify_delivered();
 
+-- Sender-side state for add-to participant notification (SPEC §10.2): an
+-- add-to message is sent to every participant domain of the message being
+-- added to -- the domains of from and every to address as well as the new
+-- recipients' -- so all participants learn recipients were added, not only
+-- the domains hosting the new recipients. Domains hosting a recipient of the
+-- batch itself learn through normal recipient delivery; every other
+-- participant domain gets one row here per batch and receives the add-to as
+-- a notification-only exchange completing at code 11. Rows are created by
+-- the Web API when recipients are added through it (the local domain itself
+-- needs no row -- this database is its record).
+create table if not exists msg_add_to_notify (
+    id                bigserial        primary key,
+    batch_id          bigint           not null references msg_add_to_batch (id),
+    domain            varchar(255)     not null,
+    time_notified     double precision,   -- time remote host acknowledged the batch; null means pending
+    time_last_attempt double precision,   -- time of last failed attempt; drives exponential back-off
+    response_code     smallint,           -- response code of last attempt
+    attempt_count     int              not null default 0,
+    unique (batch_id, domain)
+);
+
 -- Wake the sender's outgoing worker (channel new_msg_to) for a pending
 -- participant notification, mirroring notify_msg_sent for recipient rows.
 -- The payload is advisory only: the worker re-polls fully on any wake-up.
-create function notify_add_to_notify_pending() returns trigger as $$
+create or replace function notify_add_to_notify_pending() returns trigger as $$
 begin
     perform pg_notify('new_msg_to', b.msg_id::text || ',' || NEW.domain)
     from msg_add_to_batch b
@@ -293,6 +346,7 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_msg_add_to_notify_insert on msg_add_to_notify;
 create trigger trg_msg_add_to_notify_insert
     after insert on msg_add_to_notify
     for each row execute function notify_add_to_notify_pending();
@@ -309,7 +363,7 @@ create trigger trg_msg_add_to_notify_insert
 -- new_msg. Like trg_new_msg this is a deferred constraint trigger: the
 -- batch's own msg_add_to rows are inserted after the batch row, so only at
 -- commit is the full recipient set visible.
-create function notify_recipients_added() returns trigger as $$
+create or replace function notify_recipients_added() returns trigger as $$
 begin
     if not exists (select 1 from msg where id = NEW.msg_id and time_sent is not null) then
         return NEW;
@@ -328,110 +382,8 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists trg_recipients_added on msg_add_to_batch;
 create constraint trigger trg_recipients_added
     after insert on msg_add_to_batch
     deferrable initially deferred
     for each row execute function notify_recipients_added();
-
--- Sent protocol fields are immutable. Relational pid links and delivery/read
--- metadata remain bookkeeping and may change.
-create function protect_msg_identity() returns trigger as $$
-begin
-    if OLD.time_sent is not null and
-       row(NEW.time_sent,NEW.sha256,NEW.version,NEW.psha256,NEW.no_reply,
-           NEW.is_important,NEW.is_terminal,NEW.is_deflate,NEW.from_addr,
-           NEW.topic,NEW.type,NEW.size,NEW.filepath,NEW.wire_header,NEW.wire_message)
-       is distinct from
-       row(OLD.time_sent,OLD.sha256,OLD.version,OLD.psha256,OLD.no_reply,
-           OLD.is_important,OLD.is_terminal,OLD.is_deflate,OLD.from_addr,
-           OLD.topic,OLD.type,OLD.size,OLD.filepath,OLD.wire_header,OLD.wire_message) then
-        raise exception 'sent message content, timestamp and hash are immutable';
-    end if;
-    return NEW;
-end;
-$$ language plpgsql;
-create trigger trg_msg_identity before update on msg for each row execute function protect_msg_identity();
-
--- Validate after all rows in the transaction have been assembled. An original
--- first received via add-to has its payload representation on the received batch.
-create function require_sent_msg_hash() returns trigger as $$
-begin
-    if exists (select 1 from msg m where m.id=NEW.id and m.time_sent is not null
-               and (m.sha256 is null or octet_length(m.sha256) <> 32 or
-                    (m.wire_message is null and not exists (
-                        select 1 from msg_add_to_batch b where b.msg_id=m.id
-                        and b.sha256 is not null and b.wire_message is not null)))) then
-        raise exception 'sent message % requires a 32-byte sha256 and a wire representation', NEW.id;
-    end if;
-    if exists (select 1 from msg_add_to_batch b join msg m on m.id=b.msg_id
-               where m.id=NEW.id and m.time_sent is not null
-               and (b.sha256 is null or octet_length(b.sha256) <> 32 or b.wire_message is null)) then
-        raise exception 'sent message % has an unfinalized add-to batch', NEW.id;
-    end if;
-    return null;
-end;
-$$ language plpgsql;
-create constraint trigger trg_msg_require_hash after insert or update on msg
-    deferrable initially deferred for each row execute function require_sent_msg_hash();
-
-create function require_sent_batch_hash() returns trigger as $$
-begin
-    if exists (select 1 from msg_add_to_batch b join msg m on m.id=b.msg_id
-               where b.id=NEW.id and m.time_sent is not null
-               and (b.sha256 is null or octet_length(b.sha256) <> 32 or b.wire_message is null)) then
-        raise exception 'sent batch % requires a 32-byte sha256 and a wire representation', NEW.id;
-    end if;
-    return null;
-end;
-$$ language plpgsql;
-create constraint trigger trg_batch_require_hash after insert or update on msg_add_to_batch
-    deferrable initially deferred for each row execute function require_sent_batch_hash();
-
-create function protect_msg_parts() returns trigger as $$
-declare
-    message_id bigint;
-    frozen boolean;
-begin
-    -- Delivery and read receipts do not change a protocol recipient.
-    if TG_OP='UPDATE' then
-        if TG_TABLE_NAME='msg_to' then
-            if row(NEW.id,NEW.msg_id,NEW.addr) is not distinct from row(OLD.id,OLD.msg_id,OLD.addr) then return NEW; end if;
-        end if;
-        if TG_TABLE_NAME='msg_add_to' then
-            if row(NEW.id,NEW.msg_id,NEW.batch_id,NEW.addr) is not distinct from row(OLD.id,OLD.msg_id,OLD.batch_id,OLD.addr) then return NEW; end if;
-        end if;
-    end if;
-    if TG_OP='DELETE' then message_id=OLD.msg_id; else message_id=NEW.msg_id; end if;
-    if TG_OP='UPDATE' and NEW.msg_id <> OLD.msg_id then raise exception 'cannot move message parts'; end if;
-    if TG_TABLE_NAME='msg_add_to' then
-        if TG_OP='DELETE' then
-            select sha256 is not null into frozen from msg_add_to_batch where id=OLD.batch_id for update;
-        else
-            if TG_OP='UPDATE' and NEW.batch_id <> OLD.batch_id then raise exception 'cannot move batch recipients'; end if;
-            select sha256 is not null into frozen from msg_add_to_batch where id=NEW.batch_id and msg_id=message_id for update;
-            if not found then raise exception 'batch does not belong to message'; end if;
-        end if;
-    else
-        select time_sent is not null into frozen from msg where id=message_id for update;
-    end if;
-    if frozen then raise exception 'finalized message parts are immutable'; end if;
-    if TG_OP='DELETE' then return OLD; end if;
-    return NEW;
-end;
-$$ language plpgsql;
--- AFTER INSERT allows an ON CONFLICT DO NOTHING receipt to remain a no-op.
-create trigger trg_msg_to_content after insert or update or delete on msg_to for each row execute function protect_msg_parts();
-create trigger trg_msg_attachment_content after insert or update or delete on msg_attachment for each row execute function protect_msg_parts();
-create trigger trg_msg_add_to_content after insert or update or delete on msg_add_to for each row execute function protect_msg_parts();
-
-create function protect_batch_identity() returns trigger as $$
-begin
-    if OLD.sha256 is not null and
-       row(NEW.msg_id,NEW.add_to_from,NEW.time_added,NEW.sha256,NEW.wire_message)
-       is distinct from row(OLD.msg_id,OLD.add_to_from,OLD.time_added,OLD.sha256,OLD.wire_message) then
-        raise exception 'finalized add-to batch is immutable';
-    end if;
-    return NEW;
-end;
-$$ language plpgsql;
-create trigger trg_batch_identity before update on msg_add_to_batch for each row execute function protect_batch_identity();
