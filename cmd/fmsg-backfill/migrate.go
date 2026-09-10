@@ -39,7 +39,7 @@ type oldBatch struct {
 }
 
 func address(s string) (fmsg.Address, error) {
-	p := strings.Split(s, "@")
+	p := strings.SplitN(s, "@", 3)
 	if len(p) != 3 || p[0] != "" || p[1] == "" || p[2] == "" || len(s) > 255 {
 		return fmsg.Address{}, fmt.Errorf("invalid stored address %q", s)
 	}
@@ -176,9 +176,6 @@ func (m *migration) message(id int64) error {
 			return fmt.Errorf("parent %d: %w", *s.pid, err)
 		}
 		if len(s.h.Pid) == 0 {
-			if len(s.hash) > 0 {
-				return fmt.Errorf("hashed reply has no parent hash; cannot change its identity")
-			}
 			if err = m.tx.QueryRow(`SELECT sha256 FROM msg WHERE id=$1`, *s.pid).Scan(&s.h.Pid); err != nil {
 				return err
 			}
@@ -267,6 +264,32 @@ func (m *migration) message(id int64) error {
 	if base == nil || len(s.hash) != 32 {
 		return fmt.Errorf("missing canonical identity or payload representation")
 	}
+	// Early receivers stamped the arrival time on the batch row. An exact
+	// retained wire header supplies the sending timestamp. Only repair an
+	// unambiguous, unhashed batch; existing batch identities remain authoritative.
+	if received != nil && received.Flags&fmsg.FlagHasAddTo != 0 {
+		candidate := -1
+		matches := 0
+		exact := false
+		for i, b := range batches {
+			h := batchHeader(base, s.hash, b)
+			if bytes.Equal(h.Encode(), received.Encode()) {
+				exact = true
+				break
+			}
+			h.Timestamp = received.Timestamp
+			if len(b.hash) == 0 && bytes.Equal(h.Encode(), received.Encode()) {
+				candidate = i
+				matches++
+			}
+		}
+		if !exact && matches == 1 {
+			batches[candidate].time = received.Timestamp
+			if _, err = m.tx.Exec(`UPDATE msg_add_to_batch SET time_added=$2 WHERE id=$1`, batches[candidate].id, received.Timestamp); err != nil {
+				return err
+			}
+		}
+	}
 	matchedReceived := received == nil || received.Flags&fmsg.FlagHasAddTo == 0
 	for _, b := range batches {
 		h := batchHeader(base, s.hash, b)
@@ -323,10 +346,18 @@ func batchHeader(base *fmsg.Header, hash []byte, b oldBatch) *fmsg.Header {
 // first network delivery. Try those historical forms only in this tool, and
 // accept a candidate only if it reproduces the entire existing message hash.
 func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header, error) {
-	h, dir, err := fmsg.Prepare(raw)
+	input := raw.Clone()
+	// Early local notes could have an empty recipient list. Preserve their
+	// recorded bytes; normal send validation still requires recipients.
+	if len(input.To) == 0 {
+		input.To = []fmsg.Address{input.From}
+	}
+	h, dir, err := fmsg.Prepare(input)
 	if err != nil {
 		return nil, err
 	}
+	h = h.Clone()
+	h.To = raw.To
 	if chosen, err := selectOriginal(h, expected); err == nil {
 		m.files = append(m.files, dir)
 		return chosen, nil

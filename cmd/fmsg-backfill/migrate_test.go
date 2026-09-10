@@ -399,3 +399,66 @@ func TestMigrationHistoricalLocalLinkAndUnhashedReceivedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMigrationPreservesEarlyLocalNotesAndLiteralRecipients(t *testing.T) {
+	db := previousStore(t)
+	raw := rawMessage(t, "example.com", "local note")
+	raw.To = nil
+	hash := hashOf(t, raw)
+	note := putOld(t, db, raw, nil, hash, nil)
+	bad := rawMessage(t, "example.com", "literal recipient")
+	bad.To = []fmsg.Address{{User: "alice", Domain: "example.org,@bob@example.com"}}
+	literal := putOld(t, db, bad, nil, nil, nil)
+	child := rawMessage(t, "example.com", "local child")
+	childHash := hashOf(t, child)
+	parentRaw := rawMessage(t, "example.com", "unhashed local parent")
+	parent := putOld(t, db, parentRaw, nil, nil, nil)
+	reply := putOld(t, db, child, parent, childHash, nil)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{note, literal, reply} {
+		var got, data []byte
+		if err := db.QueryRow(`SELECT sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&got, &data); err != nil {
+			t.Fatal(err)
+		}
+		h, err := fmsg.UnmarshalPrepared(data, got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id == note && (!bytes.Equal(got, hash) || len(h.To) != 0) {
+			t.Fatal("local note changed")
+		}
+		if id == literal && h.To[0].ToString() != bad.To[0].ToString() {
+			t.Fatal("literal recipient changed")
+		}
+		if id == reply && !bytes.Equal(got, childHash) {
+			t.Fatal("historical child identity changed")
+		}
+	}
+}
+
+func TestMigrationRecoversRecordedBatchWireTime(t *testing.T) {
+	db := previousStore(t)
+	raw := rawMessage(t, "example.org", "forwarded")
+	base := prepared(t, raw)
+	canonical := hashOf(t, base)
+	b := oldBatch{from: raw.From, time: 1300, to: []fmsg.Address{{User: "carol", Domain: "example.com"}}}
+	wire := batchHeader(base, canonical, b)
+	hash := hashOf(t, wire)
+	raw.Timestamp = 1300
+	id := putOld(t, db, raw, nil, canonical, wire.Encode())
+	b.time = 1302
+	bid := putBatch(t, db, id, b)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var stamp float64
+	var got []byte
+	if err := db.QueryRow(`SELECT time_added,sha256 FROM msg_add_to_batch WHERE id=$1`, bid).Scan(&stamp, &got); err != nil {
+		t.Fatal(err)
+	}
+	if stamp != 1300 || !bytes.Equal(got, hash) {
+		t.Fatal("recorded wire identity not restored")
+	}
+}
