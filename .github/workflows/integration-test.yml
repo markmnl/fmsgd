@@ -11,15 +11,26 @@ jobs:
       - name: Trigger and wait for integration test
         env:
           GH_TOKEN: ${{ secrets.FMSG_DOCKER_PAT }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          FMSGD_REF="${{ github.event.pull_request.head.ref }}"
+          FMSGD_REF="$PR_BRANCH"
+          matching_ref() {
+            if gh api "repos/markmnl/$1/git/ref/heads/$PR_BRANCH" >/dev/null 2>&1; then
+              printf '%s\n' "$PR_BRANCH"
+            else
+              echo main
+            fi
+          }
+          DOCKER_REF=$(matching_ref fmsg-docker)
+          WEBAPI_REF=$(matching_ref fmsg-webapi)
+          DISPATCH_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          # Trigger the integration test workflow in fmsg-docker,
-          # passing the PR branch so it builds fmsgd from the PR
+          # Coordinated schema/API changes use their companion branches.
           gh workflow run integration-test.yml \
             --repo markmnl/fmsg-docker \
-            --ref main \
-            -f fmsgd_ref="$FMSGD_REF"
+            --ref "$DOCKER_REF" \
+            -f fmsgd_ref="$FMSGD_REF" \
+            -f fmsg_webapi_ref="$WEBAPI_REF"
 
           echo "Triggered integration test for fmsgd_ref=$FMSGD_REF, polling for run..."
 
@@ -30,9 +41,12 @@ jobs:
             RUN_ID=$(gh run list \
               --repo markmnl/fmsg-docker \
               --workflow integration-test.yml \
+              --event workflow_dispatch \
+              --branch "$DOCKER_REF" \
+              --created ">=$DISPATCH_STARTED" \
               --limit 10 \
               --json databaseId,displayTitle \
-              --jq ".[] | select(.displayTitle | contains(\"$FMSGD_REF\")) | .databaseId" \
+            | jq -r --arg ref "$FMSGD_REF" '.[] | select(.displayTitle | contains($ref)) | .databaseId' \
             | head -1)
             if [ -n "$RUN_ID" ]; then
               break
