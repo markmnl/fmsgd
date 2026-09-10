@@ -326,3 +326,41 @@ func TestDecodeHeaderRejectsTruncation(t *testing.T) {
 		t.Fatal("accepted trailing data")
 	}
 }
+
+func TestMigrationExpandedFilesWithOldWireSizes(t *testing.T) {
+	for _, retainHeader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("header=%v", retainHeader), func(t *testing.T) {
+			db := previousStore(t)
+			raw := rawMessage(t, "example.org", strings.Repeat("body compression ", 200))
+			att := rawMessage(t, "example.org", strings.Repeat("attachment compression ", 200))
+			raw.Attachments = []fmsg.AttachmentHeader{{Type: "text/plain;charset=UTF-8", Filename: "note.txt", Size: att.Size, Filepath: att.Filepath}}
+			wire := prepared(t, raw)
+			published := hashOf(t, wire)
+			bodySize, attSize := raw.Size, raw.Attachments[0].Size
+			raw.Size = wire.Size
+			raw.Attachments[0].Size = wire.Attachments[0].Size
+			var header []byte
+			if retainHeader {
+				header = wire.Encode()
+			}
+			id := putOld(t, db, raw, nil, published, header)
+			if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			var gotBody, gotAtt uint32
+			var hash, snapshot []byte
+			if err := db.QueryRow(`SELECT size,sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&gotBody, &hash, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT filesize FROM msg_attachment WHERE msg_id=$1`, id).Scan(&gotAtt); err != nil {
+				t.Fatal(err)
+			}
+			if gotBody != bodySize || gotAtt != attSize || !bytes.Equal(hash, published) {
+				t.Fatal("expanded metadata or published hash changed")
+			}
+			if _, err := fmsg.UnmarshalPrepared(snapshot, published); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

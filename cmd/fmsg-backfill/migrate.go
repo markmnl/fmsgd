@@ -184,6 +184,14 @@ func (m *migration) message(id int64) error {
 			}
 		}
 	}
+	// Old receivers sometimes kept wire sizes beside already expanded files.
+	// For published identities the full hash remains the authority: use actual
+	// expanded lengths when reconstructing, and only persist them after verification.
+	if len(s.hash) == 32 && len(s.prepared) == 0 {
+		if err = expandedSizes(s.h); err != nil {
+			return err
+		}
+	}
 	batches, err := m.batches(id)
 	if err != nil {
 		return err
@@ -295,6 +303,14 @@ func (m *migration) message(id int64) error {
 	if !matchedReceived {
 		return fmt.Errorf("received wire header has no matching add-to batch")
 	}
+	if _, err = m.tx.Exec(`UPDATE msg SET size=$2 WHERE id=$1`, id, s.h.Size); err != nil {
+		return err
+	}
+	for _, a := range s.h.Attachments {
+		if _, err = m.tx.Exec(`UPDATE msg_attachment SET filesize=$3 WHERE msg_id=$1 AND filename=$2`, id, a.Filename, a.Size); err != nil {
+			return err
+		}
+	}
 	m.done[id] = true
 	return nil
 }
@@ -387,4 +403,29 @@ func bytesOrNull(b []byte) any {
 		return nil
 	}
 	return b
+}
+
+func expandedSizes(h *fmsg.Header) error {
+	size := func(path string) (uint32, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > int64(^uint32(0)) {
+			return 0, fmt.Errorf("invalid payload size: %s", path)
+		}
+		return uint32(info.Size()), nil
+	}
+	var err error
+	h.Size, err = size(h.Filepath)
+	if err != nil {
+		return err
+	}
+	for i := range h.Attachments {
+		h.Attachments[i].Size, err = size(h.Attachments[i].Filepath)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
