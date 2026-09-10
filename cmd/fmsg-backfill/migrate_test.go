@@ -462,3 +462,31 @@ func TestMigrationRecoversRecordedBatchWireTime(t *testing.T) {
 		t.Fatal("recorded wire identity not restored")
 	}
 }
+
+func TestMigrationPreservesEarlyHashWithBatchFields(t *testing.T) {
+	db := previousStore(t)
+	parent := rawMessage(t, "example.com", "parent")
+	parentID := putOld(t, db, parent, nil, nil, nil)
+	raw := rawMessage(t, "example.com", "reply")
+	raw.Topic = ""
+	b := oldBatch{from: raw.From, to: []fmsg.Address{{User: "carol", Domain: "remote.example"}}, time: raw.Timestamp}
+	old := raw.Clone()
+	old.Flags = fmsg.FlagHasAddTo
+	old.AddToFrom, old.AddTo = &b.from, b.to
+	hash := hashOf(t, old)
+	id := putOld(t, db, raw, parentID, hash, nil)
+	putBatch(t, db, id, b)
+	if err := migrate(context.Background(), db, "example.com", true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var got, snapshot []byte
+	if err := db.QueryRow(`SELECT sha256,wire_message FROM msg WHERE id=$1`, id).Scan(&got, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, hash) {
+		t.Fatal("changed historical identity")
+	}
+	if _, err := fmsg.UnmarshalPrepared(snapshot, hash); err != nil {
+		t.Fatal(err)
+	}
+}

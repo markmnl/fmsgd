@@ -236,7 +236,7 @@ func (m *migration) message(id int64) error {
 			if len(s.hash) == 0 && !strings.EqualFold(s.h.From.Domain, m.domain) {
 				return fmt.Errorf("remote message has no published hash or wire header")
 			}
-			base, err = m.reconstruct(s.h, s.hash)
+			base, err = m.reconstruct(s.h, s.hash, batches)
 		}
 	}
 	if err != nil {
@@ -345,7 +345,7 @@ func batchHeader(base *fmsg.Header, hash []byte, b oldBatch) *fmsg.Header {
 // Local sends previously selected compression and common types during the
 // first network delivery. Try those historical forms only in this tool, and
 // accept a candidate only if it reproduces the entire existing message hash.
-func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header, error) {
+func (m *migration) reconstruct(raw *fmsg.Header, expected []byte, batches []oldBatch) (*fmsg.Header, error) {
 	input := raw.Clone()
 	// Early local notes could have an empty recipient list. Preserve their
 	// recorded bytes; normal send validation still requires recipients.
@@ -358,7 +358,7 @@ func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header
 	}
 	h = h.Clone()
 	h.To = raw.To
-	if chosen, err := selectOriginal(h, expected); err == nil {
+	if chosen, err := selectHistorical(h, expected, batches); err == nil {
 		m.files = append(m.files, dir)
 		return chosen, nil
 	}
@@ -367,13 +367,32 @@ func (m *migration) reconstruct(raw *fmsg.Header, expected []byte) (*fmsg.Header
 	if err != nil {
 		return nil, err
 	}
-	chosen, err := selectOriginal(h, expected)
+	chosen, err := selectHistorical(h, expected, batches)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
 	m.files = append(m.files, dir)
 	return chosen, nil
+}
+
+// An early sender could cache a canonical hash after adding batch fields but
+// before setting the pid flag. Only retain that form if recorded batch fields
+// reproduce the already published hash; never create this encoding for new IDs.
+func selectHistorical(h *fmsg.Header, expected []byte, batches []oldBatch) (*fmsg.Header, error) {
+	chosen, err := selectOriginal(h, expected)
+	if err == nil || len(expected) != 32 {
+		return chosen, err
+	}
+	for _, b := range batches {
+		candidate := h.Clone()
+		candidate.Flags = (candidate.Flags | fmsg.FlagHasAddTo) &^ fmsg.FlagHasPid
+		candidate.AddToFrom, candidate.AddTo = &b.from, b.to
+		if chosen, e := selectTypes(candidate, expected); e == nil {
+			return chosen, nil
+		}
+	}
+	return nil, err
 }
 
 // Some early local writers hashed a root-form header despite retaining a
