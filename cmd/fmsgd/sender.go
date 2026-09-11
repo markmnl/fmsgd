@@ -310,7 +310,7 @@ func lockPendingRecipients(tx *sql.Tx, table string, msgID int64, domain string,
 		  AND (r.response_code IS NULL OR r.response_code = ANY($5))
 		  AND (r.time_last_attempt IS NULL OR ($2 - r.time_last_attempt) > LEAST($3 * POWER(2.0, GREATEST(r.attempt_count - 1, 0)::float), $4))
 		  AND ($2 - %s) < $4`, table, joinBatch, ageRef)
-	args := []interface{}{msgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes)}
+	args := []any{msgID, now, RetryInterval, RetryMaxAge, pq.Array(retryableResponseCodes)}
 	if table == "msg_add_to" {
 		q += " AND r.batch_id = $6"
 		args = append(args, batchID)

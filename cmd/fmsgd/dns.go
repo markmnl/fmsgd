@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -127,11 +128,9 @@ func verifyDomainIP(domain string) {
 		log.Panicf("ERROR: failed to lookup fmsg.%s: %s", domain, err)
 	}
 
-	for _, ip := range authorisedIPs {
-		if externalIP.Equal(ip) {
-			log.Printf("INFO: external IP %s found in fmsg.%s authorised IPs", externalIP, domain)
-			return
-		}
+	if slices.ContainsFunc(authorisedIPs, externalIP.Equal) {
+		log.Printf("INFO: external IP %s found in fmsg.%s authorised IPs", externalIP, domain)
+		return
 	}
 
 	log.Panicf("ERROR: external IP %s not found in fmsg.%s authorised IPs %v", externalIP, domain, authorisedIPs)

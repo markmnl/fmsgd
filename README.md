@@ -1,4 +1,5 @@
-[![Go 1.25](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml/badge.svg)](https://github.com/markmnl/fmsgd/actions/workflows/go1.25.yml)
+[![Build & Test](https://github.com/markmnl/fmsgd/actions/workflows/build-test.yml/badge.svg?branch=main)](https://github.com/markmnl/fmsgd/actions/workflows/build-test.yml?query=branch%3Amain)
+[![Go 1.27+](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 
 # fmsgd
 
@@ -6,7 +7,7 @@ Implementation of [fmsg](https://github.com/markmnl/fmsg) host written in Go! Us
 
 ## Building from source
 
-Tested with Go 1.25 on Linux and Windows, AMD64 and ARM
+Requires Go 1.27 or newer.
 
 1. Clone this repository
 2. Run `go build ./cmd/fmsgd/`
