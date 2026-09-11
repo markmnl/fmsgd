@@ -1,6 +1,6 @@
 module github.com/markmnl/fmsgd
 
-go 1.25
+go 1.27.0
 
 require (
 	github.com/caitlinelfring/go-env-default v1.1.0

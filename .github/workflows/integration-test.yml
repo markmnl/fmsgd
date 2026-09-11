@@ -23,6 +23,8 @@ jobs:
           }
           DOCKER_REF=$(matching_ref fmsg-docker)
           WEBAPI_REF=$(matching_ref fmsg-webapi)
+          ID_REF=$(matching_ref fmsgid)
+          CLI_REF=$(matching_ref fmsg-cli)
           DISPATCH_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
           # Coordinated schema/API changes use their companion branches.
@@ -30,7 +32,9 @@ jobs:
             --repo markmnl/fmsg-docker \
             --ref "$DOCKER_REF" \
             -f fmsgd_ref="$FMSGD_REF" \
-            -f fmsg_webapi_ref="$WEBAPI_REF"
+            -f fmsg_webapi_ref="$WEBAPI_REF" \
+            -f fmsgid_ref="$ID_REF" \
+            -f fmsg_cli_ref="$CLI_REF"
 
           echo "Triggered integration test for fmsgd_ref=$FMSGD_REF, polling for run..."
 

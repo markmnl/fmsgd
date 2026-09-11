@@ -1,13 +1,16 @@
-name: Go 1.25 Build and Test
+name: Build & Test
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
     services:
@@ -25,15 +28,18 @@ jobs:
     env:
       FMSG_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
-    - name: Set up Go
-      uses: actions/setup-go@v3
-      with:
-        go-version: '1.25'
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
 
-    - name: Build
-      run: go build -v ./...
+      - name: Build
+        run: go build ./...
 
-    - name: Test
-      run: go test -race ./...
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
