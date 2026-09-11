@@ -378,8 +378,8 @@ func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 	// domains are recorded with localResponseCodeNotOurDelivery so the
 	// sender's pending queries never treat them as our delivery work.
 	for _, addr := range msg.To {
-		var delivered interface{}
-		var code interface{}
+		var delivered any
+		var code any
 		if addr.Domain == Domain {
 			delivered = now
 		} else {
@@ -416,8 +416,8 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 	}
 
 	for _, addr := range msg.AddTo {
-		var delivered interface{}
-		var code interface{}
+		var delivered any
+		var code any
 		if addr.Domain == Domain {
 			delivered = now
 		} else {
@@ -450,7 +450,7 @@ func sealReceivedBatch(tx *sql.Tx, id int64, h *FMsgHeader, hash []byte) error {
 // this host rejected keep the per-recipient code it responded; recipients on
 // other domains are recorded for participant checks and faithful message
 // reconstruction (SPEC §10.3/§11) but are another host's delivery duty.
-func inboundRecipientRow(addr FMsgAddress, localOutcome map[string]uint8, now float64) (delivered interface{}, code interface{}) {
+func inboundRecipientRow(addr FMsgAddress, localOutcome map[string]uint8, now float64) (delivered any, code any) {
 	c, ok := localOutcome[strings.ToLower(addr.ToString())]
 	if !ok {
 		return nil, int16(localResponseCodeNotOurDelivery)

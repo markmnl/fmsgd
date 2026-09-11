@@ -317,7 +317,7 @@ func TestMigrationFailureRollsBackEverything(t *testing.T) {
 func TestDecodeHeaderRejectsTruncation(t *testing.T) {
 	h := prepared(t, rawMessage(t, "example.com", strings.Repeat("content ", 200)))
 	data := h.Encode()
-	for i := 0; i < len(data); i++ {
+	for i := range data {
 		if _, err := decodeHeader(data[:i]); err == nil {
 			t.Fatalf("accepted prefix %d", i)
 		}

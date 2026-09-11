@@ -69,7 +69,7 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool)
 	}
 	uri := fmt.Sprintf("%s/fmsgid/%s", IDURI, part)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"address": addr.ToString(),
 		"ts":      timestamp,
 		"size":    size}

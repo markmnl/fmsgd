@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -559,10 +560,8 @@ func verifySenderIP(c net.Conn, senderDomain string) error {
 		return fmt.Errorf("DNS verification failed")
 	}
 
-	for _, ip := range authorisedIPs {
-		if remoteIP.Equal(ip) {
-			return nil
-		}
+	if slices.ContainsFunc(authorisedIPs, remoteIP.Equal) {
+		return nil
 	}
 
 	log.Printf("WARN: remote IP %s not in authorised IPs for fmsg.%s", remoteIP.String(), senderDomain)

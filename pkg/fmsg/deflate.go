@@ -71,10 +71,7 @@ const deflateSampleSize = 8192
 // and reports whether the ratio looks promising (compressed < 80% of input).
 // src is seeked back to the start on return.
 func probeSample(src *os.File, srcSize uint32) (bool, error) {
-	sampleLen := int64(deflateSampleSize)
-	if int64(srcSize) < sampleLen {
-		sampleLen = int64(srcSize)
-	}
+	sampleLen := min(int64(srcSize), int64(deflateSampleSize))
 
 	var buf bytes.Buffer
 	zw := zlib.NewWriter(&buf)
