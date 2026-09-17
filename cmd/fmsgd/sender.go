@@ -508,6 +508,21 @@ func markLocalDelivered(target pendingTarget) {
 	}
 }
 
+// dialTargetIPs returns only a successfully connected TLS connection. Failed
+// dials return a nil *tls.Conn, which must not be retained in a net.Conn interface.
+func dialTargetIPs(targetIPs []net.IP, port int, tlsConf *tls.Config) net.Conn {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	for _, ip := range targetIPs {
+		addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
+		if err == nil {
+			return conn
+		}
+		log.Printf("WARN: sender: connect to %s failed: %s", addr, err)
+	}
+	return nil
+}
+
 // deliverUnit sends one wire message — the original message or a single add-to
 // batch — to target.Domain over its own connection, recording per-recipient
 // outcomes. It owns its transaction: it locks this unit's pending recipients in
@@ -592,17 +607,8 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		return
 	}
 
-	var conn net.Conn
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	tlsConf := buildClientTLSConfig("fmsg." + target.Domain)
-	for _, ip := range targetIPs {
-		addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", RemotePort))
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
-		if err == nil {
-			break
-		}
-		log.Printf("WARN: sender: connect to %s failed: %s", addr, err)
-	}
+	conn := dialTargetIPs(targetIPs, RemotePort, tlsConf)
 	if conn == nil {
 		log.Printf("ERROR: sender: could not connect to any IP for fmsg.%s", target.Domain)
 		return
