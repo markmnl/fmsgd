@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -1690,6 +1691,24 @@ func abortConn(c net.Conn) {
 type responseTrackingConn struct {
 	net.Conn
 	wroteResponse bool
+	bytesRead     int64
+}
+
+func (c *responseTrackingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.bytesRead += int64(n)
+	return n, err
+}
+
+// closedWithoutData reports whether the peer went away before sending any
+// message bytes: it connected (and possibly completed the TLS handshake),
+// then closed or reset the connection. TCP health checks, load balancer
+// probes and port scanners do this constantly, so it isn't worth a warning.
+func closedWithoutData(c *responseTrackingConn, err error) bool {
+	if c.bytesRead > 0 {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func (c *responseTrackingConn) Write(b []byte) (int, error) {
@@ -1713,6 +1732,10 @@ func handleConn(c net.Conn) {
 	// read header
 	header, r, err := readHeader(tc)
 	if err != nil {
+		if closedWithoutData(tc, err) {
+			abortConn(c)
+			return
+		}
 		log.Printf("WARN: reading header from, %s: %s", c.RemoteAddr().String(), err)
 		if tc.wroteResponse {
 			_ = c.Close()
