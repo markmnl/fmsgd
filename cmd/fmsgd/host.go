@@ -1703,7 +1703,8 @@ func (c *responseTrackingConn) Read(b []byte) (int, error) {
 // closedWithoutData reports whether the peer went away before sending any
 // message bytes: it connected (and possibly completed the TLS handshake),
 // then closed or reset the connection. TCP health checks, load balancer
-// probes and port scanners do this constantly, so it isn't worth a warning.
+// probes and port scanners do this constantly, so it is logged at INFO
+// rather than as a warning.
 func closedWithoutData(c *responseTrackingConn, err error) bool {
 	if c.bytesRead > 0 {
 		return false
@@ -1733,6 +1734,7 @@ func handleConn(c net.Conn) {
 	header, r, err := readHeader(tc)
 	if err != nil {
 		if closedWithoutData(tc, err) {
+			log.Printf("INFO: %s closed the connection without sending data", c.RemoteAddr().String())
 			abortConn(c)
 			return
 		}

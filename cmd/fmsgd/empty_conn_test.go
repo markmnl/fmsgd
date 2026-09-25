@@ -87,6 +87,9 @@ func TestHandleConnTCPProbeDoesNotWarn(t *testing.T) {
 	if strings.Contains(logs, "WARN") {
 		t.Fatalf("TCP connect-and-close should not warn, got:\n%s", logs)
 	}
+	if !strings.Contains(logs, "INFO: 127.0.0.1:") || !strings.Contains(logs, "closed the connection without sending data") {
+		t.Fatalf("TCP connect-and-close should be logged at INFO with the peer address, got:\n%s", logs)
+	}
 }
 
 func TestHandleConnTLSProbeDoesNotWarn(t *testing.T) {
@@ -99,6 +102,9 @@ func TestHandleConnTLSProbeDoesNotWarn(t *testing.T) {
 	})
 	if strings.Contains(logs, "WARN") {
 		t.Fatalf("TLS handshake-and-close should not warn, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "INFO: 127.0.0.1:") || !strings.Contains(logs, "closed the connection without sending data") {
+		t.Fatalf("TLS handshake-and-close should be logged at INFO with the peer address, got:\n%s", logs)
 	}
 }
 
