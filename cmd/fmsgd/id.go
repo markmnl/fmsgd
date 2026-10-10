@@ -52,15 +52,15 @@ func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
 	return &detail, nil
 }
 
-func postMsgStatSend(addr *FMsgAddress, timestamp float64, size int) error {
+func postMsgStatSend(addr *FMsgAddress, timestamp float64, size int64) error {
 	return postMsgStat(addr, timestamp, size, true)
 }
 
-func postMsgStatRecv(addr *FMsgAddress, timestamp float64, size int) error {
+func postMsgStatRecv(addr *FMsgAddress, timestamp float64, size int64) error {
 	return postMsgStat(addr, timestamp, size, false)
 }
 
-func postMsgStat(addr *FMsgAddress, timestamp float64, size int, isSending bool) error {
+func postMsgStat(addr *FMsgAddress, timestamp float64, size int64, isSending bool) error {
 	var part string
 	if isSending {
 		part = "send"

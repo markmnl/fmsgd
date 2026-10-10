@@ -1253,21 +1253,48 @@ func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress, msgHash []byte) (c
 		return RejectCodeUserNotAccepting, nil
 	}
 
-	// check user limits
-	if detail.LimitRecvCountPer1d > -1 && detail.RecvCountPer1d+1 > detail.LimitRecvCountPer1d {
-		log.Printf("WARN: Message rejected: RecvCountPer1d would exceed LimitRecvCountPer1d %d", detail.LimitRecvCountPer1d)
-		return RejectCodeUserFull, nil
-	}
-	if detail.LimitRecvSizePer1d > -1 && detail.RecvSizePer1d+int64(h.Size) > detail.LimitRecvSizePer1d {
-		log.Printf("WARN: Message rejected: RecvSizePer1d would exceed LimitRecvSizePer1d %d", detail.LimitRecvSizePer1d)
-		return RejectCodeUserFull, nil
-	}
-	if detail.LimitRecvSizeTotal > -1 && detail.RecvSizeTotal+int64(h.Size) > detail.LimitRecvSizeTotal {
-		log.Printf("WARN: Message rejected: RecvSizeTotal would exceed LimitRecvSizeTotal %d", detail.LimitRecvSizeTotal)
+	// check user limits against the size that will be recorded once accepted
+	if exceeded := recvLimitExceeded(detail, storedSize(h)); exceeded != "" {
+		log.Printf("WARN: Message rejected: %s", exceeded)
 		return RejectCodeUserFull, nil
 	}
 
 	return RejectCodeAccept, nil
+}
+
+// storedSize is the size a received message takes in storage, and so the size
+// recorded as the recipient's usage: the message body plus every attachment,
+// each expanded (stored decompressed) when sent compressed. Limits are checked
+// against this same size before the message is accepted.
+func storedSize(h *FMsgHeader) int64 {
+	size := int64(h.Size)
+	if h.Flags&FlagDeflate != 0 {
+		size = int64(h.ExpandedSize)
+	}
+	for _, a := range h.Attachments {
+		if a.Flags&(1<<1) != 0 {
+			size += int64(a.ExpandedSize)
+		} else {
+			size += int64(a.Size)
+		}
+	}
+	return size
+}
+
+// recvLimitExceeded checks one more message of size bytes against an
+// address's receive limits (a limit of -1 is unlimited). It returns which
+// limit would be exceeded, or "" when the message fits.
+func recvLimitExceeded(detail *AddressDetail, size int64) string {
+	if detail.LimitRecvCountPer1d > -1 && detail.RecvCountPer1d+1 > detail.LimitRecvCountPer1d {
+		return fmt.Sprintf("RecvCountPer1d would exceed LimitRecvCountPer1d %d", detail.LimitRecvCountPer1d)
+	}
+	if detail.LimitRecvSizePer1d > -1 && detail.RecvSizePer1d+size > detail.LimitRecvSizePer1d {
+		return fmt.Sprintf("RecvSizePer1d would exceed LimitRecvSizePer1d %d", detail.LimitRecvSizePer1d)
+	}
+	if detail.LimitRecvSizeTotal > -1 && detail.RecvSizeTotal+size > detail.LimitRecvSizeTotal {
+		return fmt.Sprintf("RecvSizeTotal would exceed LimitRecvSizeTotal %d", detail.LimitRecvSizeTotal)
+	}
+	return ""
 }
 
 // uniqueFilepath generates a unique file path in the given directory,
@@ -1515,13 +1542,22 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 		return false
 	}
 
-	allAccepted := append(acceptedTo, acceptedAddTo...)
-	for i := range allAccepted {
-		if err := postMsgStatRecv(&allAccepted[i], h.Timestamp, int(h.Size)); err != nil {
-			log.Printf("WARN: Failed to post msg recv stat: %s", err)
+	recordRecvUsage(h, append(acceptedTo, acceptedAddTo...), timeutil.TimestampNow().Float64())
+	return true
+}
+
+// recordRecvUsage records a stored message against each recipient that
+// accepted it: its stored size (body plus attachments), at now — the time this
+// host accepted it, not the sender's timestamp, so a backdated message still
+// counts towards today's limits. A failure is logged: the message is already
+// stored.
+func recordRecvUsage(h *FMsgHeader, accepted []FMsgAddress, now float64) {
+	size := storedSize(h)
+	for i := range accepted {
+		if err := postMsgStatRecv(&accepted[i], now, size); err != nil {
+			log.Printf("WARN: Failed to post msg recv stat for %s: %s", accepted[i].ToString(), err)
 		}
 	}
-	return true
 }
 
 func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) error {
