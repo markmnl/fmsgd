@@ -42,6 +42,10 @@ Requires Go 1.27 or newer.
 
 
 
+## Quotas and usage
+
+For each local recipient of a message from another host, fmsgd asks fmsgid for the address's receive limits and usage, and rejects the recipient with `101` (user full) if one more message of this size would exceed its messages per day, size per day or total size (`-1` is unlimited). The size is the stored size: the message body plus every attachment, decompressed. Once the message is stored, fmsgd records that size for each recipient that accepted it with `POST /fmsgid/recv`, timestamped when this host accepted the message (not the sender's timestamp), so a backdated message still counts towards today. fmsgd doesn't record send usage or mail between local addresses: the client that sends and delivers locally (such as fmsg-webapi) does.
+
 ## Running
 
 An up and running [fmsg Id API](https://github.com/markmnl/fmsgid) needs to be reachable by fmsgd to know users and their quotas for this fmsgd service. See also [fmsg-docker](https://github.com/markmnl/fmsg-docker) - a docker compose stack for a fmsg host including fmsgid, fmsg-webpi and fmsgd.
