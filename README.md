@@ -26,7 +26,7 @@ Requires Go 1.27 or newer.
 | FMSG_TLS_KEY               |         | Path to TLS private key file (PEM).                                                                                                                     |
 | FMSG_TLS_INSECURE_SKIP_VERIFY | false | Set to "true" to skip TLS certificate verification on outgoing connections. For development/testing only.                                               |
 | FMSG_MAX_MSG_SIZE          | 10240   | Bytes. Maximum size above which to reject messages greater than before downloading them.                                                                |
-| FMSG_PORT                  | 4930    | TCP port to listen on                                                                                                                                   |
+| FMSG_PORT                  | 4930    | TCP port to listen on. 4930 is the IANA-registered port for service name `fmsg`.                                                                       |
 | FMSG_MAX_PAST_TIME_DELTA   | 604800  | Seconds. Duration since message timestamp to reject if greater than. Note sending host could have been holding messages waiting for us to be reachable. |
 | FMSG_MAX_FUTURE_TIME_DELTA | 300     | Seconds. Duration from message timestamp to reject if greater than.                                                                                     |
 | FMSG_MIN_DOWNLOAD_RATE     | 5000    | Bytes per second. Used in setting download deadlines while downloading a message.                                                                       |
