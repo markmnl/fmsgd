@@ -137,6 +137,55 @@ func TestFinalizeAndImmutability(t *testing.T) {
 		t.Fatal("committed sent message without hash")
 	}
 }
+
+// A purge transaction may remove a sent message and its parts; nothing else may.
+func TestPurgeRemovesSentMessage(t *testing.T) {
+	db, _ := testStore(t)
+	root := insertDraft(t, db, nil, "root")
+	hash := seal(t, db, root)
+	child := insertDraft(t, db, root, "child")
+	seal(t, db, child)
+	if _, err := db.Exec(`INSERT INTO msg_attachment(msg_id,filename,filesize,filepath) VALUES($1,'a.txt',0,'')`, root); err == nil {
+		t.Fatal("attachment added to a sent message")
+	}
+	if _, err := db.Exec(`DELETE FROM msg_to WHERE msg_id=$1`, root); err == nil {
+		t.Fatal("deleted parts of a sent message without purging")
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`SET LOCAL fmsg.purge = 'on'`,
+		`UPDATE msg SET pid = NULL WHERE pid = ` + fmt.Sprint(root),
+		`DELETE FROM msg_attachment WHERE msg_id = ` + fmt.Sprint(root),
+		`DELETE FROM msg_to WHERE msg_id = ` + fmt.Sprint(root),
+		`DELETE FROM msg WHERE id = ` + fmt.Sprint(root),
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM msg WHERE sha256 = $1`, hash).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("purged message still found by hash: %d, %v", n, err)
+	}
+	// The reply survives, keeping the hash of the parent it was sent to.
+	var parent []byte
+	if err := db.QueryRow(`SELECT psha256 FROM msg WHERE id = $1 AND pid IS NULL`, child).Scan(&parent); err != nil || !bytes.Equal(parent, hash) {
+		t.Fatalf("reply after purge: %x, %v", parent, err)
+	}
+	// Outside a purge, the reply's parts stay immutable.
+	if _, err := db.Exec(`DELETE FROM msg_to WHERE msg_id=$1`, child); err == nil {
+		t.Fatal("deleted parts of a sent message after a purge transaction ended")
+	}
+}
+
 func TestFinalizeDraftBatchesAndRollback(t *testing.T) {
 	db, _ := testStore(t)
 	root := insertDraft(t, db, nil, "root with draft batch")

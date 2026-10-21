@@ -411,6 +411,11 @@ declare
     message_id bigint;
     frozen boolean;
 begin
+    -- A message is removed from this host only on purpose: a transaction that
+    -- sets fmsg.purge (SET LOCAL fmsg.purge = 'on') may delete its parts, so
+    -- the message can then be deleted. Once its row is gone, a reply to it is
+    -- rejected as parent not found.
+    if TG_OP='DELETE' and current_setting('fmsg.purge', true) = 'on' then return OLD; end if;
     -- Delivery and read receipts do not change a protocol recipient.
     if TG_OP='UPDATE' then
         if TG_TABLE_NAME='msg_to' then
