@@ -365,6 +365,26 @@ func isMessageRetrievable(msg *FMsgHeader) bool {
 	return isMessageRetrievable(parentMsg)
 }
 
+// isOriginalParticipant reports whether addr is in the stored message's own
+// from or to. Only these may add recipients to it (SPEC §12): a recipient added
+// by an earlier batch is a participant of that batch, not of the original, and
+// a loaded message's AddToFrom/AddTo aren't its own fields anyway.
+func isOriginalParticipant(msg *FMsgHeader, addr *FMsgAddress) bool {
+	if msg == nil || addr == nil {
+		return false
+	}
+	target := strings.ToLower(addr.ToString())
+	if strings.ToLower(msg.From.ToString()) == target {
+		return true
+	}
+	for i := range msg.To {
+		if strings.ToLower(msg.To[i].ToString()) == target {
+			return true
+		}
+	}
+	return false
+}
+
 func isParentParticipant(parent *FMsgHeader, addr *FMsgAddress) bool {
 	if parent == nil || addr == nil {
 		return false
@@ -626,6 +646,21 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 			return h, err
 		}
 		return h, fmt.Errorf("add-to: time travel detected (parent time %f, current %f)", parentMsg.Timestamp, h.Timestamp)
+	}
+
+	// Only a participant of the stored original may add recipients to it
+	// (SPEC §10.3 step 7, §12). The header's own from and to can't be
+	// trusted for this: an outsider could list themselves in both, have the
+	// original (which they never had) attached to an address they choose.
+	if !isOriginalParticipant(parentMsg, h.AddToFrom) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return h, err
+		}
+		adder := "(none)"
+		if h.AddToFrom != nil {
+			adder = h.AddToFrom.ToString()
+		}
+		return h, fmt.Errorf("add-to: add-to-from %s is not in parent msg %d's from or to", adder, parentID)
 	}
 
 	// Batch identity is the batch message hash — this add-to header combined
