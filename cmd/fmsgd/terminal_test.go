@@ -138,6 +138,46 @@ func TestHandleAddToPathRejectsTerminalParent(t *testing.T) {
 	}
 }
 
+// Only the stored original's from or to may add recipients: an outsider
+// naming themselves in the add-to header's from and to is refused, and so is
+// someone who was only added by an earlier batch.
+func TestHandleAddToPathRejectsNonParticipant(t *testing.T) {
+	mallory := FMsgAddress{User: "mallory", Domain: "evil.example"}
+	parent := storedParentForTest(t, 0)
+	parent.AddToFrom = &testAlice // a loaded parent carries no batch, but don't rely on it
+	parent.AddTo = []FMsgAddress{testCarol}
+	for name, adder := range map[string]FMsgAddress{"outsider": mallory, "added later": testCarol} {
+		t.Run(name, func(t *testing.T) {
+			stubStoredParent(t, parent)
+			h := addToForTest()
+			adder := adder
+			h.From, h.To, h.AddToFrom = adder, []FMsgAddress{testBob}, &adder
+			c := &testConn{}
+			if _, err := handleAddToPath(c, h); err == nil {
+				t.Fatal("expected add-to by a non-participant to be refused")
+			}
+			if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+				t.Fatalf("wrote %v, want single code %d (invalid)", got, RejectCodeInvalid)
+			}
+		})
+	}
+}
+
+// A recipient of the original (in to) may add recipients, as may its sender.
+func TestHandleAddToPathAcceptsRecipientAsAdder(t *testing.T) {
+	stubStoredParent(t, storedParentForTest(t, 0))
+	h := addToForTest()
+	bob := testBob
+	h.AddToFrom = &bob
+	c := &testConn{}
+	if _, err := handleAddToPath(c, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Len() != 0 {
+		t.Fatalf("unexpected bytes written: %v", c.Bytes())
+	}
+}
+
 func TestHandleAddToPathAcceptsNonTerminalParent(t *testing.T) {
 	stubStoredParent(t, storedParentForTest(t, 0))
 	c := &testConn{}
