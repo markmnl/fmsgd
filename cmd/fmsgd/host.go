@@ -1965,6 +1965,9 @@ func main() {
 	// load TLS configuration (must be after loadEnvConfig for FMSG_TLS_INSECURE_SKIP_VERIFY)
 	serverTLSConfig = buildServerTLSConfig()
 
+	// FMSG-006 indicators on UDP, same address and port as TCP
+	startIndicators(listenAddress, Port)
+
 	// start sender in background (small delay so listener is ready first)
 	go func() {
 		time.Sleep(1 * time.Second)
