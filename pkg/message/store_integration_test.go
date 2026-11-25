@@ -260,26 +260,26 @@ func TestFinalizeBatchRejectsCorruptedPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var batch int64
-	if err := db.QueryRow(`INSERT INTO msg_add_to_batch(msg_id,add_to_from,time_added) VALUES($1,'@alice@example.com',1235.5) RETURNING id`, root).Scan(&batch); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO msg_add_to(msg_id,batch_id,addr) VALUES($1,$2,'@carol@example.com')`, root, batch); err != nil {
-		t.Fatal(err)
-	}
-
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
+
+	var batch int64
+	if err := tx.QueryRow(`INSERT INTO msg_add_to_batch(msg_id,add_to_from,time_added) VALUES($1,'@alice@example.com',1235.5) RETURNING id`, root).Scan(&batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO msg_add_to(msg_id,batch_id,addr) VALUES($1,$2,'@carol@example.com')`, root, batch); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := FinalizeBatch(context.Background(), SQLTx{tx}, root, batch); err == nil {
 		t.Fatal("FinalizeBatch accepted corrupted stored payload")
 	}
-	_ = tx.Rollback()
 
 	var batchHash []byte
-	if err := db.QueryRow(`SELECT sha256 FROM msg_add_to_batch WHERE id=$1`, batch).Scan(&batchHash); err != nil {
+	if err := tx.QueryRow(`SELECT sha256 FROM msg_add_to_batch WHERE id=$1`, batch).Scan(&batchHash); err != nil {
 		t.Fatal(err)
 	}
 	if len(batchHash) != 0 {
