@@ -15,11 +15,21 @@ import (
 	"github.com/miekg/dns"
 )
 
-const dnsLookupTimeout = 5 * time.Second
+const (
+	// dnsLookupTimeout bounds a single per-nameserver DNSSEC UDP/TCP exchange.
+	dnsLookupTimeout = 5 * time.Second
+	// resolverLookupTimeout bounds the full non-DNSSEC net.Resolver lookup so
+	// Go's stub resolver retains headroom for retries and nameserver failover
+	// (resolv.conf defaults to 5s per attempt).
+	resolverLookupTimeout = 20 * time.Second
+)
 
 var (
-	dnsClient    = &dns.Client{Timeout: dnsLookupTimeout}
-	dnsTCPClient = &dns.Client{Net: "tcp", Timeout: dnsLookupTimeout}
+	dnsClient           = &dns.Client{Timeout: dnsLookupTimeout}
+	dnsTCPClient        = &dns.Client{Net: "tcp", Timeout: dnsLookupTimeout}
+	lookupIPWithContext = func(ctx context.Context, network, host string) ([]net.IP, error) {
+		return net.DefaultResolver.LookupIP(ctx, network, host)
+	}
 )
 
 func dnssecRequired() bool {
@@ -121,9 +131,9 @@ func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
 		return validateDNSSECResults(fmsgDomain, resA, resAAAA)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolverLookupTimeout)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", fmsgDomain)
+	ips, err := lookupIPWithContext(ctx, "ip", fmsgDomain)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup for %s failed: %w", fmsgDomain, err)
 	}

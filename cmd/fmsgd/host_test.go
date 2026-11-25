@@ -856,6 +856,78 @@ func TestReadAttachmentHeadersRejectsUint32SizeOverflow(t *testing.T) {
 	}
 }
 
+func TestReadAttachmentHeadersInvalidPrecedesTooBig(t *testing.T) {
+	t.Run("wire size exceeds max before later reserved attachment flag", func(t *testing.T) {
+		origMax := MaxMessageSize
+		origExpanded := MaxExpandedSize
+		MaxMessageSize = 100
+		MaxExpandedSize = 100
+		t.Cleanup(func() {
+			MaxMessageSize = origMax
+			MaxExpandedSize = origExpanded
+		})
+
+		h := &FMsgHeader{Size: 10}
+		c := &testConn{}
+		b := []byte{2} // 2 attachments
+
+		// Attachment 1: valid header, size 200 (> MaxMessageSize=100)
+		b = append(b, 0)
+		b = append(b, encodeUInt8String(t, "text/plain")...)
+		b = append(b, encodeUInt8String(t, "big.txt")...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], 200)
+		b = append(b, sz[:]...)
+
+		// Attachment 2: reserved flag bit 2 set -> SPEC §10.3 step 3 (code 1 invalid)
+		b = append(b, 1<<2)
+
+		err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+		if err == nil {
+			t.Fatal("expected error for reserved attachment flag bit")
+		}
+		if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+			t.Fatalf("wrote %v, want single code %d (invalid), not %d (too big)", got, RejectCodeInvalid, RejectCodeTooBig)
+		}
+	})
+
+	t.Run("expanded size exceeds max before later reserved attachment flag", func(t *testing.T) {
+		origMax := MaxMessageSize
+		origExpanded := MaxExpandedSize
+		MaxMessageSize = 1024
+		MaxExpandedSize = 100
+		t.Cleanup(func() {
+			MaxMessageSize = origMax
+			MaxExpandedSize = origExpanded
+		})
+
+		h := &FMsgHeader{Size: 0}
+		c := &testConn{}
+		b := []byte{2} // 2 attachments
+
+		// Attachment 1: compressed, expanded size 200 (> MaxExpandedSize=100)
+		b = append(b, 1<<1)
+		b = append(b, encodeUInt8String(t, "text/plain")...)
+		b = append(b, encodeUInt8String(t, "big.txt")...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], 50)
+		b = append(b, sz[:]...)
+		binary.LittleEndian.PutUint32(sz[:], 200)
+		b = append(b, sz[:]...)
+
+		// Attachment 2: reserved flag bit 2 set -> SPEC §10.3 step 3 (code 1 invalid)
+		b = append(b, 1<<2)
+
+		err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+		if err == nil {
+			t.Fatal("expected error for reserved attachment flag bit")
+		}
+		if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+			t.Fatalf("wrote %v, want single code %d (invalid), not %d (too big)", got, RejectCodeInvalid, RejectCodeTooBig)
+		}
+	})
+}
+
 func TestHandleChallengeTruncatedNoPanic(t *testing.T) {
 	initOutgoing()
 	c := &testConn{}

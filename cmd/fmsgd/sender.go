@@ -62,7 +62,7 @@ type pendingTarget struct {
 // retryable recipients. This is a lightweight read-only query — row-level
 // locks are acquired per-delivery in deliverMessage.
 func findPendingTargets() ([]pendingTarget, error) {
-	db, err := getDB()
+	db, err := getSenderDB()
 	if err != nil {
 		return nil, err
 	}
@@ -191,33 +191,23 @@ func sendMsgData(conn net.Conn, h *FMsgHeader) error {
 // For msg_add_to, rows are scoped by batch_id so independent batches sharing
 // the same recipient address do not overwrite each other.
 func updateRecipient(tx *sql.Tx, table, addr string, msgID, batchID int64, now float64, code int, delivered bool) error {
-	var err error
+	targetTable, scopeCol, scopeID := "msg_to", "msg_id", msgID
 	if table == "msg_add_to" {
-		if delivered {
-			_, err = tx.Exec(`
-				UPDATE msg_add_to SET time_delivered = $1, response_code = $2
-				WHERE batch_id = $3 AND addr = $4
-			`, now, code, batchID, addr)
-		} else {
-			_, err = tx.Exec(`
-				UPDATE msg_add_to SET time_last_attempt = $1, response_code = $2,
-				                      attempt_count = attempt_count + 1
-				WHERE batch_id = $3 AND addr = $4
-			`, now, code, batchID, addr)
-		}
+		targetTable, scopeCol, scopeID = "msg_add_to", "batch_id", batchID
+	}
+
+	var err error
+	if delivered {
+		_, err = tx.Exec(fmt.Sprintf(`
+			UPDATE %s SET time_delivered = $1, response_code = $2
+			WHERE %s = $3 AND addr = $4
+		`, targetTable, scopeCol), now, code, scopeID, addr)
 	} else {
-		if delivered {
-			_, err = tx.Exec(`
-				UPDATE msg_to SET time_delivered = $1, response_code = $2
-				WHERE msg_id = $3 AND addr = $4
-			`, now, code, msgID, addr)
-		} else {
-			_, err = tx.Exec(`
-				UPDATE msg_to SET time_last_attempt = $1, response_code = $2,
-				                  attempt_count = attempt_count + 1
-				WHERE msg_id = $3 AND addr = $4
-			`, now, code, msgID, addr)
-		}
+		_, err = tx.Exec(fmt.Sprintf(`
+			UPDATE %s SET time_last_attempt = $1, response_code = $2,
+			              attempt_count = attempt_count + 1
+			WHERE %s = $3 AND addr = $4
+		`, targetTable, scopeCol), now, code, scopeID, addr)
 	}
 	if err != nil {
 		log.Printf("ERROR: sender: update recipient %s: %s", addr, err)
@@ -374,7 +364,7 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	db, err := getDB()
+	db, err := getSenderDB()
 	if err != nil {
 		log.Printf("ERROR: sender: db open: %s", err)
 		return
@@ -513,7 +503,7 @@ func recordUnitInvalid(db *sql.DB, target pendingTarget, table string, batchID i
 // rather than sending over the network. (findPendingTargets skips the local
 // domain, so this is a defensive path.)
 func markLocalDelivered(target pendingTarget) {
-	db, err := getDB()
+	db, err := getSenderDB()
 	if err != nil {
 		log.Printf("ERROR: sender: db open for local delivery: %s", err)
 		return

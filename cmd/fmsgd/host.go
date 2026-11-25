@@ -1045,19 +1045,6 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 		}
 		totalSize += uint64(attSize)
 
-		if totalSize > uint64(MaxMessageSize) {
-			if err := sendCode(c, RejectCodeTooBig); err != nil {
-				return err
-			}
-			return fmt.Errorf("total message size %d exceeds max %d", totalSize, MaxMessageSize)
-		}
-		if totalExpandedSize > uint64(MaxExpandedSize) {
-			if err := sendCode(c, RejectCodeTooBig); err != nil {
-				return err
-			}
-			return fmt.Errorf("total expanded size %d exceeds MAX_EXPANDED_SIZE %d", totalExpandedSize, MaxExpandedSize)
-		}
-
 		h.Attachments = append(h.Attachments, FMsgAttachmentHeader{
 			Flags:        attFlags,
 			TypeID:       attTypeID,
@@ -2045,6 +2032,7 @@ func main() {
 		log.Fatalf("ERROR: connecting to database: %s\n", err)
 	}
 	defer closeDB()
+	defer closeSenderDB()
 
 	// set DataDir, Domain and IDURL from env
 	setDataDir()

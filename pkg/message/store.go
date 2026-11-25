@@ -236,14 +236,14 @@ func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64) ([]byte, error
 	var h *fmsg.Header
 	var err error
 	if len(prepared) > 0 {
-		h, err = fmsg.UnmarshalPreparedHeader(prepared)
+		h, err = fmsg.UnmarshalPrepared(prepared, msgHash)
 	} else {
 		// A host first receiving this message through add-to holds a batch's
 		// exact payload representation and the original hash carried as pid.
-		var snapshot []byte
-		err = tx.QueryRow(ctx, `SELECT wire_message FROM msg_add_to_batch WHERE msg_id=$1 AND wire_message IS NOT NULL ORDER BY id LIMIT 1`, id).Scan(&snapshot)
+		var snapshot, batchHash []byte
+		err = tx.QueryRow(ctx, `SELECT wire_message,sha256 FROM msg_add_to_batch WHERE msg_id=$1 AND wire_message IS NOT NULL ORDER BY id LIMIT 1`, id).Scan(&snapshot, &batchHash)
 		if err == nil {
-			h, err = fmsg.UnmarshalPreparedHeader(snapshot)
+			h, err = fmsg.UnmarshalPrepared(snapshot, batchHash)
 		}
 	}
 	if err != nil {

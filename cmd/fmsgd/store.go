@@ -13,25 +13,39 @@ import (
 	"github.com/markmnl/fmsgd/pkg/fmsg"
 )
 
-var (
-	dbMu     sync.Mutex
-	sharedDB *sql.DB
+const (
+	dbMaxOpenConns       = 48
+	dbMaxIdleConns       = 16
+	senderDBMaxOpenConns = 32
+	senderDBMaxIdleConns = 8
 )
 
-// getDB returns the process-wide shared *sql.DB connection pool, initializing
-// it lazily on first use.
+var (
+	dbMu       sync.Mutex
+	sharedDB   *sql.DB
+	senderDBMu sync.Mutex
+	senderDB   *sql.DB
+
+	// openDBPool opens a new database pool. Overridable in tests.
+	openDBPool = func() (*sql.DB, error) {
+		return sql.Open("postgres", "")
+	}
+)
+
+// getDB returns the process-wide shared *sql.DB connection pool used by inbound
+// handlers and indicators, initializing it lazily on first use.
 func getDB() (*sql.DB, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 	if sharedDB != nil {
 		return sharedDB, nil
 	}
-	db, err := sql.Open("postgres", "")
+	db, err := openDBPool()
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(48)
-	db.SetMaxIdleConns(16)
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	sharedDB = db
@@ -44,6 +58,38 @@ func closeDB() {
 	db := sharedDB
 	sharedDB = nil
 	dbMu.Unlock()
+	if db != nil {
+		_ = db.Close()
+	}
+}
+
+// getSenderDB returns a dedicated *sql.DB connection pool for the outbound
+// sender, isolated from getDB() so sender transactions held across network I/O
+// cannot starve inbound handlers or indicators.
+func getSenderDB() (*sql.DB, error) {
+	senderDBMu.Lock()
+	defer senderDBMu.Unlock()
+	if senderDB != nil {
+		return senderDB, nil
+	}
+	db, err := openDBPool()
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(senderDBMaxOpenConns)
+	db.SetMaxIdleConns(senderDBMaxIdleConns)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	senderDB = db
+	return senderDB, nil
+}
+
+// closeSenderDB closes the sender *sql.DB connection pool if initialized.
+func closeSenderDB() {
+	senderDBMu.Lock()
+	db := senderDB
+	senderDB = nil
+	senderDBMu.Unlock()
 	if db != nil {
 		_ = db.Close()
 	}
