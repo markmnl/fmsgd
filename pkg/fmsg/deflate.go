@@ -1,12 +1,31 @@
 package fmsg
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
+
+var zlibWriterPool = sync.Pool{
+	New: func() any {
+		return zlib.NewWriter(io.Discard)
+	},
+}
+
+func getZlibWriter(w io.Writer) *zlib.Writer {
+	zw := zlibWriterPool.Get().(*zlib.Writer)
+	zw.Reset(w)
+	return zw
+}
+
+func putZlibWriter(zw *zlib.Writer) {
+	zw.Reset(io.Discard)
+	zlibWriterPool.Put(zw)
+}
 
 // minDeflateSize is the minimum payload size in bytes before compression is
 // attempted.
@@ -74,14 +93,17 @@ func probeSample(src *os.File, srcSize uint32) (bool, error) {
 	sampleLen := min(int64(srcSize), int64(deflateSampleSize))
 
 	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
+	zw := getZlibWriter(&buf)
 	if _, err := io.CopyN(zw, src, sampleLen); err != nil {
 		_ = zw.Close()
+		putZlibWriter(zw)
 		return false, err
 	}
 	if err := zw.Close(); err != nil {
+		putZlibWriter(zw)
 		return false, err
 	}
+	putZlibWriter(zw)
 
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return false, err
@@ -90,7 +112,7 @@ func probeSample(src *os.File, srcSize uint32) (bool, error) {
 	return int64(buf.Len()) < sampleLen*8/10, nil
 }
 
-// tryCompress compresses the file at srcPath using zlib-deflate and writes the
+// TryCompress compresses the file at srcPath using zlib-deflate and writes the
 // result to a temporary file. For files larger than deflateSampleSize it first
 // compresses a prefix sample to estimate compressibility, avoiding a full pass
 // over files that won't compress well. It returns worthwhile=true only when
@@ -98,6 +120,10 @@ func probeSample(src *os.File, srcSize uint32) (bool, error) {
 // reduction). When not worthwhile the temporary file is removed. When
 // worthwhile the caller is responsible for removing the file at dstPath.
 func TryCompress(srcPath string, srcSize uint32) (dstPath string, compressedSize uint32, worthwhile bool, err error) {
+	return tryCompressInDir(srcPath, srcSize, "", false)
+}
+
+func tryCompressInDir(srcPath string, srcSize uint32, dir string, durable bool) (dstPath string, compressedSize uint32, worthwhile bool, err error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return "", 0, false, err
@@ -115,40 +141,66 @@ func TryCompress(srcPath string, srcSize uint32) (dstPath string, compressedSize
 		}
 	}
 
-	dst, err := os.CreateTemp("", "fmsg-deflate-*")
+	pattern := "fmsg-deflate-*"
+	if durable {
+		pattern = ".fmsg-deflate-*"
+	}
+	dst, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return "", 0, false, err
 	}
 	dstName := dst.Name()
 
-	zw := zlib.NewWriter(dst)
+	bw := bufio.NewWriterSize(dst, 32*1024)
+	zw := getZlibWriter(bw)
 	if _, err := io.Copy(zw, src); err != nil {
 		_ = zw.Close()
+		putZlibWriter(zw)
 		_ = dst.Close()
 		_ = os.Remove(dstName)
 		return "", 0, false, err
 	}
 	if err := zw.Close(); err != nil {
+		putZlibWriter(zw)
 		_ = dst.Close()
 		_ = os.Remove(dstName)
 		return "", 0, false, err
+	}
+	putZlibWriter(zw)
+	if err := bw.Flush(); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstName)
+		return "", 0, false, err
+	}
+
+	cSize, err := dst.Seek(0, io.SeekCurrent)
+	if err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstName)
+		return "", 0, false, err
+	}
+	if cSize >= int64(srcSize)*8/10 {
+		_ = dst.Close()
+		_ = os.Remove(dstName)
+		return "", 0, false, nil
+	}
+
+	if durable {
+		if err := dst.Chmod(0640); err != nil {
+			_ = dst.Close()
+			_ = os.Remove(dstName)
+			return "", 0, false, err
+		}
+		if err := dst.Sync(); err != nil {
+			_ = dst.Close()
+			_ = os.Remove(dstName)
+			return "", 0, false, err
+		}
 	}
 	if err := dst.Close(); err != nil {
 		_ = os.Remove(dstName)
 		return "", 0, false, err
 	}
 
-	fi, err := os.Stat(dstName)
-	if err != nil {
-		_ = os.Remove(dstName)
-		return "", 0, false, err
-	}
-
-	cSize := uint32(fi.Size())
-	if cSize >= srcSize*8/10 {
-		_ = os.Remove(dstName)
-		return "", 0, false, nil
-	}
-
-	return dstName, cSize, true, nil
+	return dstName, uint32(cSize), true, nil
 }

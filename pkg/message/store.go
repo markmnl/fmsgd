@@ -213,35 +213,37 @@ func Finalize(ctx context.Context, tx Tx, id int64, timestamp float64, files *Fi
 // FinalizeBatch seals one add-to exchange. Its payload representation is copied
 // from the original (or a received batch), never recompressed independently.
 func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64) ([]byte, error) {
-	s, err := load(ctx, tx, id)
-	if err != nil {
+	var sentTime *float64
+	var msgHash, prepared []byte
+	if err := tx.QueryRow(ctx, `SELECT time_sent,sha256,wire_message FROM msg WHERE id=$1 FOR UPDATE`, id).Scan(&sentTime, &msgHash, &prepared); err != nil {
 		return nil, err
 	}
-	if s.time == nil {
+	if sentTime == nil {
 		return nil, nil
 	} // a draft's batches finalize with its send
-	if len(s.hash) != 32 {
+	if len(msgHash) != 32 {
 		return nil, fmt.Errorf("message %d has no finalized identity", id)
 	}
 	var from string
 	var timestamp float64
 	var existing []byte
-	if err = tx.QueryRow(ctx, `SELECT add_to_from,time_added,sha256 FROM msg_add_to_batch WHERE id=$1 AND msg_id=$2 FOR UPDATE`, batchID, id).Scan(&from, &timestamp, &existing); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT add_to_from,time_added,sha256 FROM msg_add_to_batch WHERE id=$1 AND msg_id=$2 FOR UPDATE`, batchID, id).Scan(&from, &timestamp, &existing); err != nil {
 		return nil, err
 	}
 	if len(existing) > 0 {
 		return existing, nil
 	}
 	var h *fmsg.Header
-	if len(s.prepared) > 0 {
-		h, err = fmsg.UnmarshalPrepared(s.prepared, s.hash)
+	var err error
+	if len(prepared) > 0 {
+		h, err = fmsg.UnmarshalPreparedHeader(prepared)
 	} else {
 		// A host first receiving this message through add-to holds a batch's
 		// exact payload representation and the original hash carried as pid.
-		var snapshot, batchHash []byte
-		err = tx.QueryRow(ctx, `SELECT wire_message,sha256 FROM msg_add_to_batch WHERE msg_id=$1 AND wire_message IS NOT NULL ORDER BY id LIMIT 1`, id).Scan(&snapshot, &batchHash)
+		var snapshot []byte
+		err = tx.QueryRow(ctx, `SELECT wire_message FROM msg_add_to_batch WHERE msg_id=$1 AND wire_message IS NOT NULL ORDER BY id LIMIT 1`, id).Scan(&snapshot)
 		if err == nil {
-			h, err = fmsg.UnmarshalPrepared(snapshot, batchHash)
+			h, err = fmsg.UnmarshalPreparedHeader(snapshot)
 		}
 	}
 	if err != nil {
@@ -249,7 +251,7 @@ func FinalizeBatch(ctx context.Context, tx Tx, id, batchID int64) ([]byte, error
 	}
 	h = h.Clone()
 	h.Flags |= fmsg.FlagHasPid | fmsg.FlagHasAddTo
-	h.Pid = s.hash
+	h.Pid = msgHash
 	h.Timestamp = timestamp
 	h.Topic = ""
 	h.AddTo = nil

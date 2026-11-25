@@ -7,13 +7,13 @@
 package fmsg
 
 import (
-	"bytes"
 	"compress/zlib"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 )
@@ -38,7 +38,7 @@ type Address struct {
 
 // ToString returns the address in @user@domain form.
 func (addr *Address) ToString() string {
-	return fmt.Sprintf("@%s@%s", addr.User, addr.Domain)
+	return "@" + addr.User + "@" + addr.Domain
 }
 
 // AttachmentHeader holds the wire-level metadata for a single attachment.
@@ -86,48 +86,86 @@ type Header struct {
 
 // Encode serialises the message header to wire format as defined in SPEC.md.
 // The returned bytes cover all fields up to and including the attachment
-// headers (fields 1–12 per spec). This method panics on internal buffer errors
-// rather than returning an error.
+// headers (fields 1–13 per spec).
 func (h *Header) Encode() []byte {
-	var b bytes.Buffer
-	b.WriteByte(h.Version)
-	b.WriteByte(h.Flags)
-	if h.Flags&FlagHasPid != 0 {
-		b.Write(h.Pid[:])
+	addToFrom := h.AddToFrom
+	if h.Flags&FlagHasAddTo != 0 && addToFrom == nil {
+		addToFrom = &h.From
 	}
-	str := h.From.ToString()
-	b.WriteByte(byte(len(str)))
-	b.WriteString(str)
-	b.WriteByte(byte(len(h.To)))
-	for _, addr := range h.To {
-		str = addr.ToString()
-		b.WriteByte(byte(len(str)))
-		b.WriteString(str)
+
+	// Pre-size output buffer to avoid repeated reallocations.
+	size := 2 + // version + flags
+		1 + 2 + len(h.From.User) + len(h.From.Domain) + // from
+		1 + // to count
+		8 + // timestamp
+		4 + // size
+		1 // attachment count
+	if h.Flags&FlagHasPid != 0 {
+		size += len(h.Pid)
+	} else {
+		size += 1 + len(h.Topic)
+	}
+	for i := range h.To {
+		size += 3 + len(h.To[i].User) + len(h.To[i].Domain)
+	}
+	if h.Flags&FlagHasAddTo != 0 {
+		size += 3 + len(addToFrom.User) + len(addToFrom.Domain) + 1
+		for i := range h.AddTo {
+			size += 3 + len(h.AddTo[i].User) + len(h.AddTo[i].Domain)
+		}
+	}
+	if h.Flags&FlagCommonType != 0 {
+		size++
+	} else {
+		size += 1 + len(h.Type)
+	}
+	if h.Flags&FlagDeflate != 0 {
+		size += 4
+	}
+	for i := range h.Attachments {
+		att := &h.Attachments[i]
+		size += 1 + 1 + len(att.Filename) + 4
+		if att.Flags&1 != 0 {
+			size++
+		} else {
+			size += 1 + len(att.Type)
+		}
+		if att.Flags&(1<<1) != 0 {
+			size += 4
+		}
+	}
+
+	appendAddr := func(b []byte, a *Address) []byte {
+		b = append(b, byte(2+len(a.User)+len(a.Domain)), '@')
+		b = append(b, a.User...)
+		b = append(b, '@')
+		return append(b, a.Domain...)
+	}
+
+	b := make([]byte, 0, size)
+	b = append(b, h.Version, h.Flags)
+	if h.Flags&FlagHasPid != 0 {
+		b = append(b, h.Pid...)
+	}
+	b = appendAddr(b, &h.From)
+	b = append(b, byte(len(h.To)))
+	for i := range h.To {
+		b = appendAddr(b, &h.To[i])
 	}
 	if h.Flags&FlagHasAddTo != 0 {
 		// add-to-from address (field 6)
-		addToFrom := h.AddToFrom
-		if addToFrom == nil {
-			addToFrom = &h.From
-		}
-		str := addToFrom.ToString()
-		b.WriteByte(byte(len(str)))
-		b.WriteString(str)
+		b = appendAddr(b, addToFrom)
 		// add-to addresses (field 7)
-		b.WriteByte(byte(len(h.AddTo)))
-		for _, addr := range h.AddTo {
-			str = addr.ToString()
-			b.WriteByte(byte(len(str)))
-			b.WriteString(str)
+		b = append(b, byte(len(h.AddTo)))
+		for i := range h.AddTo {
+			b = appendAddr(b, &h.AddTo[i])
 		}
 	}
-	if err := binary.Write(&b, binary.LittleEndian, h.Timestamp); err != nil {
-		panic(err)
-	}
+	b = binary.LittleEndian.AppendUint64(b, math.Float64bits(h.Timestamp))
 	// topic is only present when pid is NOT set
 	if h.Flags&FlagHasPid == 0 {
-		b.WriteByte(byte(len(h.Topic)))
-		b.WriteString(h.Topic)
+		b = append(b, byte(len(h.Topic)))
+		b = append(b, h.Topic...)
 	}
 	if h.Flags&FlagCommonType != 0 {
 		typeID := h.TypeID
@@ -136,25 +174,22 @@ func (h *Header) Encode() []byte {
 				typeID = id
 			}
 		}
-		b.WriteByte(typeID)
+		b = append(b, typeID)
 	} else {
-		b.WriteByte(byte(len(h.Type)))
-		b.WriteString(h.Type)
+		b = append(b, byte(len(h.Type)))
+		b = append(b, h.Type...)
 	}
 	// size (uint32 LE)
-	if err := binary.Write(&b, binary.LittleEndian, h.Size); err != nil {
-		panic(err)
-	}
+	b = binary.LittleEndian.AppendUint32(b, h.Size)
 	// expanded size (uint32 LE) — present iff zlib-deflate flag set
 	if h.Flags&FlagDeflate != 0 {
-		if err := binary.Write(&b, binary.LittleEndian, h.ExpandedSize); err != nil {
-			panic(err)
-		}
+		b = binary.LittleEndian.AppendUint32(b, h.ExpandedSize)
 	}
 	// attachment headers
-	b.WriteByte(byte(len(h.Attachments)))
-	for _, att := range h.Attachments {
-		b.WriteByte(att.Flags)
+	b = append(b, byte(len(h.Attachments)))
+	for i := range h.Attachments {
+		att := &h.Attachments[i]
+		b = append(b, att.Flags)
 		if att.Flags&1 != 0 {
 			typeID := att.TypeID
 			if typeID == 0 {
@@ -162,24 +197,20 @@ func (h *Header) Encode() []byte {
 					typeID = id
 				}
 			}
-			b.WriteByte(typeID)
+			b = append(b, typeID)
 		} else {
-			b.WriteByte(byte(len(att.Type)))
-			b.WriteString(att.Type)
+			b = append(b, byte(len(att.Type)))
+			b = append(b, att.Type...)
 		}
-		b.WriteByte(byte(len(att.Filename)))
-		b.WriteString(att.Filename)
-		if err := binary.Write(&b, binary.LittleEndian, att.Size); err != nil {
-			panic(err)
-		}
+		b = append(b, byte(len(att.Filename)))
+		b = append(b, att.Filename...)
+		b = binary.LittleEndian.AppendUint32(b, att.Size)
 		// attachment expanded size — present iff attachment zlib-deflate flag set
 		if att.Flags&(1<<1) != 0 {
-			if err := binary.Write(&b, binary.LittleEndian, att.ExpandedSize); err != nil {
-				panic(err)
-			}
+			b = binary.LittleEndian.AppendUint32(b, att.ExpandedSize)
 		}
 	}
-	return b.Bytes()
+	return b
 }
 
 // String returns a human-readable summary of the header fields.
@@ -228,9 +259,7 @@ func (h *Header) GetMessageHash() ([]byte, error) {
 		hash := sha256.New()
 
 		headerBytes := h.Encode()
-		if _, err := io.Copy(hash, bytes.NewBuffer(headerBytes)); err != nil {
-			return nil, err
-		}
+		hash.Write(headerBytes)
 
 		if err := hashPayload(hash, h.Filepath, int64(h.Size), h.Flags&FlagDeflate != 0, h.ExpandedSize); err != nil {
 			return nil, err
@@ -266,13 +295,16 @@ func HashPayload(dst io.Writer, filepath string, wireSize int64, deflated bool, 
 		if err != nil {
 			return err
 		}
-		written, err := io.Copy(dst, zr)
-		_ = zr.Close()
+		written, err := io.Copy(dst, io.LimitReader(zr, int64(expandedSize)+1))
+		closeErr := zr.Close()
 		if err != nil {
 			return err
 		}
-		if uint32(written) != expandedSize {
+		if written != int64(expandedSize) {
 			return fmt.Errorf("decompressed size %d does not match declared expanded size %d", written, expandedSize)
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		return nil
 	}
@@ -303,6 +335,14 @@ var commonMediaTypes = map[uint8]string{
 	58: "video/H264", 59: "video/H265", 60: "video/H266", 61: "video/ogg", 62: "video/VP8", 63: "video/VP9", 64: "video/webm",
 }
 
+var commonMediaTypeIDs = func() map[string]uint8 {
+	m := make(map[string]uint8, len(commonMediaTypes))
+	for id, mime := range commonMediaTypes {
+		m[mime] = id
+	}
+	return m
+}()
+
 // GetCommonMediaType returns the MIME type string for a common type ID, or
 // ("", false) if the ID is not in the mapping (should be rejected per spec).
 func GetCommonMediaType(id uint8) (string, bool) {
@@ -313,12 +353,8 @@ func GetCommonMediaType(id uint8) (string, bool) {
 // GetCommonMediaTypeID returns the common type ID for a MIME string, or
 // (0, false) if the string has no assigned ID.
 func GetCommonMediaTypeID(mediaType string) (uint8, bool) {
-	for id, mime := range commonMediaTypes {
-		if mime == mediaType {
-			return id, true
-		}
-	}
-	return 0, false
+	id, ok := commonMediaTypeIDs[mediaType]
+	return id, ok
 }
 
 // getCommonMediaTypeID is the unexported alias used internally by Encode.

@@ -1,21 +1,23 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"github.com/markmnl/fmsgd/pkg/fmsg"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	env "github.com/caitlinelfring/go-env-default"
 	"github.com/levenlabs/golib/timeutil"
 	"github.com/lib/pq"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 )
 
 var RetryInterval float64 = 20
@@ -60,11 +62,10 @@ type pendingTarget struct {
 // retryable recipients. This is a lightweight read-only query — row-level
 // locks are acquired per-delivery in deliverMessage.
 func findPendingTargets() ([]pendingTarget, error) {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	now := timeutil.TimestampNow().Float64()
 
@@ -166,7 +167,7 @@ func sendMsgData(conn net.Conn, h *FMsgHeader) error {
 	}
 	defer fd.Close()
 
-	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int(h.Size), MinUploadRate)))
+	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(totalWirePayloadSize(h), MinUploadRate)))
 	if _, err := io.CopyN(conn, fd, int64(h.Size)); err != nil {
 		return fmt.Errorf("sending data: %w", err)
 	}
@@ -187,30 +188,51 @@ func sendMsgData(conn net.Conn, h *FMsgHeader) error {
 // updateRecipient records a delivery outcome for one address in table.
 // Deliveries set time_delivered; failures set time_last_attempt and increment
 // attempt_count to drive exponential back-off on subsequent retries.
-func updateRecipient(tx *sql.Tx, table, addr string, msgID int64, now float64, code int, delivered bool) {
+// For msg_add_to, rows are scoped by batch_id so independent batches sharing
+// the same recipient address do not overwrite each other.
+func updateRecipient(tx *sql.Tx, table, addr string, msgID, batchID int64, now float64, code int, delivered bool) error {
 	var err error
-	if delivered {
-		_, err = tx.Exec(fmt.Sprintf(`
-			UPDATE %s SET time_delivered = $1, response_code = $2
-			WHERE msg_id = $3 AND addr = $4
-		`, table), now, code, msgID, addr)
+	if table == "msg_add_to" {
+		if delivered {
+			_, err = tx.Exec(`
+				UPDATE msg_add_to SET time_delivered = $1, response_code = $2
+				WHERE batch_id = $3 AND addr = $4
+			`, now, code, batchID, addr)
+		} else {
+			_, err = tx.Exec(`
+				UPDATE msg_add_to SET time_last_attempt = $1, response_code = $2,
+				                      attempt_count = attempt_count + 1
+				WHERE batch_id = $3 AND addr = $4
+			`, now, code, batchID, addr)
+		}
 	} else {
-		_, err = tx.Exec(fmt.Sprintf(`
-			UPDATE %s SET time_last_attempt = $1, response_code = $2,
-			              attempt_count = attempt_count + 1
-			WHERE msg_id = $3 AND addr = $4
-		`, table), now, code, msgID, addr)
+		if delivered {
+			_, err = tx.Exec(`
+				UPDATE msg_to SET time_delivered = $1, response_code = $2
+				WHERE msg_id = $3 AND addr = $4
+			`, now, code, msgID, addr)
+		} else {
+			_, err = tx.Exec(`
+				UPDATE msg_to SET time_last_attempt = $1, response_code = $2,
+				                  attempt_count = attempt_count + 1
+				WHERE msg_id = $3 AND addr = $4
+			`, now, code, msgID, addr)
+		}
 	}
 	if err != nil {
 		log.Printf("ERROR: sender: update recipient %s: %s", addr, err)
 	}
+	return err
 }
 
 // updateLocked applies the same outcome to every locked address in one table.
-func updateLocked(tx *sql.Tx, table string, addrs []string, msgID int64, now float64, code int, delivered bool) {
+func updateLocked(tx *sql.Tx, table string, addrs []string, msgID, batchID int64, now float64, code int, delivered bool) error {
 	for _, a := range addrs {
-		updateRecipient(tx, table, a, msgID, now, code, delivered)
+		if err := updateRecipient(tx, table, a, msgID, batchID, now, code, delivered); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // commitOrLog commits the transaction and marks it as committed.
@@ -224,10 +246,14 @@ func commitOrLog(tx *sql.Tx, committed *bool, msgID int64) {
 
 // recordRetryableFailure marks one delivery unit's locked recipients and
 // locked notify row (if any) for retry.
-func recordRetryableFailure(tx *sql.Tx, committed *bool, table string, locked []string, msgID int64, notifyID int64) {
+func recordRetryableFailure(tx *sql.Tx, committed *bool, table string, locked []string, msgID, batchID, notifyID int64) {
 	now := timeutil.TimestampNow().Float64()
-	updateLocked(tx, table, locked, msgID, now, localResponseCodeNoResponse, false)
-	updateNotify(tx, notifyID, now, localResponseCodeNoResponse, false)
+	if err := updateLocked(tx, table, locked, msgID, batchID, now, localResponseCodeNoResponse, false); err != nil {
+		return
+	}
+	if err := updateNotify(tx, notifyID, now, localResponseCodeNoResponse, false); err != nil {
+		return
+	}
 	commitOrLog(tx, committed, msgID)
 }
 
@@ -264,9 +290,9 @@ func lockPendingNotify(tx *sql.Tx, batchID int64, domain string, now float64) (i
 // updateNotify records a notification outcome for one msg_add_to_notify row.
 // notifyID 0 is a no-op so callers need not branch on whether the unit
 // carried a notify row.
-func updateNotify(tx *sql.Tx, notifyID int64, now float64, code int, notified bool) {
+func updateNotify(tx *sql.Tx, notifyID int64, now float64, code int, notified bool) error {
 	if notifyID == 0 {
-		return
+		return nil
 	}
 	var err error
 	if notified {
@@ -284,6 +310,7 @@ func updateNotify(tx *sql.Tx, notifyID int64, now float64, code int, notified bo
 	if err != nil {
 		log.Printf("ERROR: sender: update notify row %d: %s", notifyID, err)
 	}
+	return err
 }
 
 // lockPendingRecipients locks (FOR UPDATE SKIP LOCKED) the undelivered,
@@ -347,12 +374,11 @@ func deliverMessage(target pendingTarget) {
 		return
 	}
 
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		log.Printf("ERROR: sender: db open: %s", err)
 		return
 	}
-	defer db.Close()
 
 	// Load the message fields and its add-to batches (read-only).
 	rtx, err := db.Begin()
@@ -374,10 +400,6 @@ func deliverMessage(target pendingTarget) {
 	}
 	rtx.Rollback()
 
-	// Sending never changes an identity or its representation. Messages that
-	// first arrived through add-to have batch snapshots but no original header.
-	orig := m.wire
-
 	// SPEC §10.2: a host must not transmit a reply to a terminal message, nor
 	// an add-to batch of one. dd.sql refuses to create such rows, so this is
 	// defensive; matching units are recorded as code 1 (invalid, not
@@ -397,8 +419,8 @@ func deliverMessage(target pendingTarget) {
 	if parentTerminal {
 		log.Printf("ERROR: sender: msg %d references a terminal parent; not sending (SPEC §10.2)", target.MsgID)
 		recordUnitInvalid(db, target, "msg_to", 0)
-	} else if orig != nil && !parentPending {
-		deliverUnit(db, target, orig, "msg_to", 0)
+	} else if len(m.prepared) > 0 && !parentPending {
+		deliverUnit(db, target, m.prepared, m.storedHash, "msg_to", 0)
 	}
 
 	// Deliver each add-to batch as its own add-to message (one sender each).
@@ -411,12 +433,7 @@ func deliverMessage(target pendingTarget) {
 			recordUnitInvalid(db, target, "msg_add_to", b.ID)
 			continue
 		}
-		h, err := fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
-		if err != nil {
-			log.Printf("ERROR: sender: load finalized batch %d of msg %d: %s", b.ID, target.MsgID, err)
-			continue
-		}
-		deliverUnit(db, target, h, "msg_add_to", b.ID)
+		deliverUnit(db, target, b.Prepared, b.Hash, "msg_add_to", b.ID)
 	}
 }
 
@@ -483,8 +500,12 @@ func recordUnitInvalid(db *sql.DB, target pendingTarget, table string, batchID i
 	if len(locked) == 0 && notifyID == 0 {
 		return
 	}
-	updateLocked(tx, table, locked, target.MsgID, now, int(RejectCodeInvalid), false)
-	updateNotify(tx, notifyID, now, int(RejectCodeInvalid), false)
+	if err := updateLocked(tx, table, locked, target.MsgID, batchID, now, int(RejectCodeInvalid), false); err != nil {
+		return
+	}
+	if err := updateNotify(tx, notifyID, now, int(RejectCodeInvalid), false); err != nil {
+		return
+	}
 	commitOrLog(tx, &committed, target.MsgID)
 }
 
@@ -492,12 +513,11 @@ func recordUnitInvalid(db *sql.DB, target pendingTarget, table string, batchID i
 // rather than sending over the network. (findPendingTargets skips the local
 // domain, so this is a defensive path.)
 func markLocalDelivered(target pendingTarget) {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		log.Printf("ERROR: sender: db open for local delivery: %s", err)
 		return
 	}
-	defer db.Close()
 	now := timeutil.TimestampNow().Float64()
 	if _, err := db.Exec(`
 		UPDATE msg_to SET time_delivered = $1, response_code = 200
@@ -523,12 +543,46 @@ func dialTargetIPs(targetIPs []net.IP, port int, tlsConf *tls.Config) net.Conn {
 	return nil
 }
 
+type domainRecip struct {
+	addr     string
+	isLocked bool
+}
+
+// buildDomainRecips builds the per-recipient wire-order list for targetDomain
+// (to-field order, then add-to order per SPEC §10.2 step 6). Only entries
+// belonging to table (msg_to vs msg_add_to) are marked isLocked so an address
+// present in both To and AddTo is never double-updated against the wrong table.
+func buildDomainRecips(h *FMsgHeader, targetDomain, table string, locked []string) []domainRecip {
+	lockedSet := make(map[string]bool, len(locked))
+	for _, a := range locked {
+		lockedSet[strings.ToLower(a)] = true
+	}
+	var domainRecips []domainRecip
+	appendDomain := func(addrs []FMsgAddress, matchTable bool) {
+		for _, addr := range addrs {
+			if !strings.EqualFold(addr.Domain, targetDomain) {
+				continue
+			}
+			s := addr.ToString()
+			domainRecips = append(domainRecips, domainRecip{
+				addr:     s,
+				isLocked: matchTable && lockedSet[strings.ToLower(s)],
+			})
+		}
+	}
+	appendDomain(h.To, table == "msg_to")
+	if h.Flags&FlagHasAddTo != 0 {
+		appendDomain(h.AddTo, table == "msg_add_to")
+	}
+	return domainRecips
+}
+
 // deliverUnit sends one wire message — the original message or a single add-to
 // batch — to target.Domain over its own connection, recording per-recipient
 // outcomes. It owns its transaction: it locks this unit's pending recipients in
 // `table` (msg_add_to rows restricted to batchID; batchID is 0 for the original
 // message) and marks them for retry on early failure.
-func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, batchID int64) {
+func deliverUnit(db *sql.DB, target pendingTarget, prepared, expectedHash []byte, table string, batchID int64) {
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("ERROR: sender: begin tx: %s", err)
@@ -561,10 +615,16 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		return // nothing pending for this unit (or locked by another sender)
 	}
 
+	h, err := fmsg.UnmarshalPrepared(prepared, expectedHash)
+	if err != nil {
+		log.Printf("ERROR: sender: load finalized %s (batch %d) of msg %d: %s", table, batchID, target.MsgID, err)
+		return
+	}
+
 	deferRetry := true
 	defer func() {
 		if deferRetry && !committed {
-			recordRetryableFailure(tx, &committed, table, locked, target.MsgID, notifyID)
+			recordRetryableFailure(tx, &committed, table, locked, target.MsgID, batchID, notifyID)
 		}
 	}()
 
@@ -573,28 +633,7 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 	// recipient of each and so is counted, and answered, twice. Only this
 	// unit's locked recipients are recorded; the recipients carried only to
 	// reconstruct that ordering stay unlocked.
-	lockedSet := make(map[string]bool, len(locked))
-	for _, a := range locked {
-		lockedSet[strings.ToLower(a)] = true
-	}
-	type domainRecip struct {
-		addr     string
-		isLocked bool
-	}
-	var domainRecips []domainRecip
-	appendDomain := func(addrs []FMsgAddress) {
-		for _, addr := range addrs {
-			if !strings.EqualFold(addr.Domain, target.Domain) {
-				continue
-			}
-			s := addr.ToString()
-			domainRecips = append(domainRecips, domainRecip{addr: s, isLocked: lockedSet[strings.ToLower(s)]})
-		}
-	}
-	appendDomain(h.To)
-	if h.Flags&FlagHasAddTo != 0 {
-		appendDomain(h.AddTo)
-	}
+	domainRecips := buildDomainRecips(h, target.Domain, table, locked)
 
 	// --- network delivery ---
 
@@ -623,7 +662,9 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 	defer removeOutgoingIP(hashArr, connectedIP)
 
 	// Step 3: Transmit message header.
-	if _, err := conn.Write(h.Encode()); err != nil {
+	encodedHeader := h.Encode()
+	conn.SetWriteDeadline(time.Now().Add(calcNetIODuration(int64(len(encodedHeader)), MinUploadRate)))
+	if _, err := conn.Write(encodedHeader); err != nil {
 		log.Printf("ERROR: sender: writing header for msg %d: %s", target.MsgID, err)
 		return
 	}
@@ -659,9 +700,13 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 			return
 		}
 		log.Printf("INFO: sender: msg %d add-to accepted by %s (code 11)", target.MsgID, target.Domain)
-		updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), true)
-		updateNotify(tx, notifyID, now, int(initCode[0]), true)
 		deferRetry = false
+		if err := updateLocked(tx, table, locked, target.MsgID, batchID, now, int(initCode[0]), true); err != nil {
+			return
+		}
+		if err := updateNotify(tx, notifyID, now, int(initCode[0]), true); err != nil {
+			return
+		}
 		commitOrLog(tx, &committed, target.MsgID)
 		return
 	default:
@@ -669,9 +714,13 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 			// global rejection
 			log.Printf("WARN: sender: msg %d rejected by %s: %s (%d)",
 				target.MsgID, target.Domain, responseCodeName(initCode[0]), initCode[0])
-			updateLocked(tx, table, locked, target.MsgID, now, int(initCode[0]), false)
-			updateNotify(tx, notifyID, now, int(initCode[0]), false)
 			deferRetry = false
+			if err := updateLocked(tx, table, locked, target.MsgID, batchID, now, int(initCode[0]), false); err != nil {
+				return
+			}
+			if err := updateNotify(tx, notifyID, now, int(initCode[0]), false); err != nil {
+				return
+			}
 			commitOrLog(tx, &committed, target.MsgID)
 		} else {
 			// unexpected code — TERMINATE
@@ -691,6 +740,7 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 	}
 	now = timeutil.TimestampNow().Float64()
 
+	deferRetry = false
 	for i, dr := range domainRecips {
 		if !dr.isLocked {
 			continue
@@ -702,20 +752,51 @@ func deliverUnit(db *sql.DB, target pendingTarget, h *FMsgHeader, table string, 
 		} else {
 			log.Printf("WARN: sender: msg %d to %s: %s (%d)", target.MsgID, dr.addr, responseCodeName(c), c)
 		}
-		updateRecipient(tx, table, dr.addr, target.MsgID, now, int(c), delivered)
+		if err := updateRecipient(tx, table, dr.addr, target.MsgID, batchID, now, int(c), delivered); err != nil {
+			return
+		}
 	}
 
 	// The exchange completed, so a locked notify row is satisfied too: the
 	// domain was informed of the batch through this delivery.
-	updateNotify(tx, notifyID, now, int(initCode[0]), true)
+	if err := updateNotify(tx, notifyID, now, int(initCode[0]), true); err != nil {
+		return
+	}
 
-	deferRetry = false
 	commitOrLog(tx, &committed, target.MsgID)
 }
 
+type inFlightTracker struct {
+	mu     sync.Mutex
+	active map[pendingTarget]struct{}
+}
+
+func newInFlightTracker() *inFlightTracker {
+	return &inFlightTracker{active: make(map[pendingTarget]struct{})}
+}
+
+func (f *inFlightTracker) acquire(t pendingTarget) bool {
+	k := pendingTarget{MsgID: t.MsgID, Domain: strings.ToLower(t.Domain)}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.active[k]; exists {
+		return false
+	}
+	f.active[k] = struct{}{}
+	return true
+}
+
+func (f *inFlightTracker) release(t pendingTarget) {
+	k := pendingTarget{MsgID: t.MsgID, Domain: strings.ToLower(t.Domain)}
+	f.mu.Lock()
+	delete(f.active, k)
+	f.mu.Unlock()
+}
+
 // processPendingMessages finds messages needing delivery and dispatches a
-// goroutine per (message, domain) pair, bounded by the semaphore.
-func processPendingMessages(sem chan struct{}) {
+// goroutine per (message, domain) pair, bounded by the semaphore and
+// deduplicated against currently in-flight targets.
+func processPendingMessages(ctx context.Context, sem chan struct{}, inFlight *inFlightTracker) {
 	targets, err := findPendingTargets()
 	if err != nil {
 		log.Printf("ERROR: sender: finding pending targets: %s", err)
@@ -727,9 +808,20 @@ func processPendingMessages(sem chan struct{}) {
 	log.Printf("INFO: sender: found %d pending target(s)", len(targets))
 
 	for _, t := range targets {
-		sem <- struct{}{} // acquire
+		if !inFlight.acquire(t) {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			inFlight.release(t)
+			return
+		case sem <- struct{}{}:
+		}
 		go func(t pendingTarget) {
-			defer func() { <-sem }()
+			defer func() {
+				<-sem
+				inFlight.release(t)
+			}()
 			deliverMessage(t)
 		}(t)
 	}
@@ -737,12 +829,13 @@ func processPendingMessages(sem chan struct{}) {
 
 // startSender runs the sender loop: polls the database periodically and also
 // listens for PostgreSQL notifications for immediate pickup of new messages.
-func startSender() {
+func startSender(ctx context.Context) {
 	loadSenderEnvConfig()
 	log.Printf("INFO: sender: started (poll=%ds, retry=%.0fs, max_concurrent=%d)",
 		PollInterval, RetryInterval, MaxConcurrentSend)
 
 	sem := make(chan struct{}, MaxConcurrentSend)
+	inFlight := newInFlightTracker()
 
 	// set up PostgreSQL LISTEN for immediate notification
 	notifyCh := make(chan struct{}, 1)
@@ -758,9 +851,20 @@ func startSender() {
 		}
 		defer listener.Close()
 		log.Println("INFO: sender: listening for new_msg_to notifications")
+		pingTimer := time.NewTimer(32 * time.Second)
+		defer pingTimer.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case n := <-listener.Notify:
+				if !pingTimer.Stop() {
+					select {
+					case <-pingTimer.C:
+					default:
+					}
+				}
+				pingTimer.Reset(32 * time.Second)
 				if n != nil {
 					log.Printf("INFO: sender: notification received: %s", n.Extra)
 					select {
@@ -768,7 +872,8 @@ func startSender() {
 					default:
 					}
 				}
-			case <-time.After(32 * time.Second):
+			case <-pingTimer.C:
+				pingTimer.Reset(32 * time.Second)
 				// ping to keep connection alive
 				if err := listener.Ping(); err != nil {
 					log.Printf("ERROR: sender: pg listener ping: %s", err)
@@ -778,19 +883,34 @@ func startSender() {
 	}()
 
 	// initial poll on startup
-	processPendingMessages(sem)
+	processPendingMessages(ctx, sem, inFlight)
 
 	ticker := time.NewTicker(time.Duration(PollInterval) * time.Second)
 	defer ticker.Stop()
+	batchTimer := time.NewTimer(0)
+	if !batchTimer.Stop() {
+		select {
+		case <-batchTimer.C:
+		default:
+		}
+	}
+	defer batchTimer.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
-			processPendingMessages(sem)
+			processPendingMessages(ctx, sem, inFlight)
 		case <-notifyCh:
 			// small delay to batch rapid inserts
-			time.Sleep(256 * time.Millisecond)
-			processPendingMessages(sem)
+			batchTimer.Reset(256 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-batchTimer.C:
+			}
+			processPendingMessages(ctx, sem, inFlight)
 		}
 	}
 }

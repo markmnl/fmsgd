@@ -35,6 +35,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/markmnl/fmsgd/internal/emoji"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 )
 
 const (
@@ -158,24 +159,6 @@ func indicatorParticipants(h *FMsgHeader) []FMsgAddress {
 	return parts
 }
 
-// preparedHeader decodes a stored prepared message (msg.wire_message,
-// msg_add_to_batch.wire_message) for its header fields only. Unlike
-// fmsg.UnmarshalPrepared it does not re-hash the payload from disk: the row
-// was found by its hash, and a datagram must not cost a read of the message.
-func preparedHeader(data []byte) (*FMsgHeader, error) {
-	var s struct {
-		Version int
-		Header  *FMsgHeader
-	}
-	if err := json.Unmarshal(data, &s); err != nil {
-		return nil, err
-	}
-	if s.Version != 1 || s.Header == nil {
-		return nil, fmt.Errorf("unsupported prepared message")
-	}
-	return s.Header, nil
-}
-
 // indicatorSubject is a message an indicator can refer to: the original
 // message or one of its add-to batch messages, with its participants.
 type indicatorSubject struct {
@@ -187,7 +170,7 @@ type indicatorSubject struct {
 // or -1.
 func (s *indicatorSubject) participantIndex(addr FMsgAddress) int {
 	for i, p := range s.Participants {
-		if strings.EqualFold(p.ToString(), addr.ToString()) {
+		if addrEqualFold(p, addr) {
 			return i
 		}
 	}
@@ -296,7 +279,7 @@ func (s sqlIndicatorStore) originalFromBatch(ctx context.Context, msgID int64) (
 	if err != nil {
 		return nil, false, err
 	}
-	h, err := preparedHeader(prepared)
+	h, err := fmsg.UnmarshalPreparedHeader(prepared)
 	if err != nil {
 		return nil, false, err
 	}
@@ -312,7 +295,7 @@ func (s sqlIndicatorStore) subjectByHash(ctx context.Context, hash []byte) (int6
 			parts, ok, err := s.originalFromBatch(ctx, id)
 			return id, parts, ok, err
 		}
-		h, err := preparedHeader(prepared)
+		h, err := fmsg.UnmarshalPreparedHeader(prepared)
 		if err != nil {
 			return 0, nil, false, err
 		}
@@ -328,7 +311,7 @@ func (s sqlIndicatorStore) subjectByHash(ctx context.Context, hash []byte) (int6
 	if err != nil {
 		return 0, nil, false, err
 	}
-	h, err := preparedHeader(prepared)
+	h, err := fmsg.UnmarshalPreparedHeader(prepared)
 	if err != nil {
 		return 0, nil, false, err
 	}
@@ -352,14 +335,20 @@ func (s sqlIndicatorStore) subjectsOf(ctx context.Context, msgID int64) (*indica
 	}
 	defer rows.Close()
 	var batches []indicatorSubject
+	var firstBatchOrigParts []FMsgAddress
 	for rows.Next() {
 		var bHash, bPrepared []byte
 		if err := rows.Scan(&bHash, &bPrepared); err != nil {
 			return nil, nil, err
 		}
-		h, err := preparedHeader(bPrepared)
+		h, err := fmsg.UnmarshalPreparedHeader(bPrepared)
 		if err != nil {
 			return nil, nil, err
+		}
+		if firstBatchOrigParts == nil {
+			firstBatchOrigParts = make([]FMsgAddress, 0, 1+len(h.To))
+			firstBatchOrigParts = append(firstBatchOrigParts, h.From)
+			firstBatchOrigParts = append(firstBatchOrigParts, h.To...)
 		}
 		batches = append(batches, indicatorSubject{Hash: bHash, Participants: indicatorParticipants(h)})
 	}
@@ -370,15 +359,13 @@ func (s sqlIndicatorStore) subjectsOf(ctx context.Context, msgID int64) (*indica
 	var original *indicatorSubject
 	if len(hash) == 32 {
 		if len(prepared) > 0 {
-			h, err := preparedHeader(prepared)
+			h, err := fmsg.UnmarshalPreparedHeader(prepared)
 			if err != nil {
 				return nil, nil, err
 			}
 			original = &indicatorSubject{Hash: hash, Participants: indicatorParticipants(h)}
-		} else if parts, ok, err := s.originalFromBatch(ctx, msgID); err != nil {
-			return nil, nil, err
-		} else if ok {
-			original = &indicatorSubject{Hash: hash, Participants: parts}
+		} else if firstBatchOrigParts != nil {
+			original = &indicatorSubject{Hash: hash, Participants: firstBatchOrigParts}
 		}
 	}
 	return original, batches, nil
@@ -432,13 +419,20 @@ func newSourceLimiter(rate, burst float64, max int) *sourceLimiter {
 	return &sourceLimiter{rate: rate, burst: burst, max: max, buckets: map[string]*tokenBucket{}}
 }
 
+const sourceLimiterMinPruneInterval = time.Second
+
 func (l *sourceLimiter) allow(src string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, ok := l.buckets[src]
 	if !ok {
-		if len(l.buckets) >= l.max || now.Sub(l.lastPrune) >= 10*time.Second {
-			l.prune(now)
+		if l.lastPrune.IsZero() {
+			l.lastPrune = now
+		} else {
+			sincePrune := now.Sub(l.lastPrune)
+			if (len(l.buckets) >= l.max && sincePrune >= sourceLimiterMinPruneInterval) || sincePrune >= 10*time.Second {
+				l.prune(now)
+			}
 		}
 		if len(l.buckets) >= l.max {
 			return false
@@ -514,13 +508,14 @@ func (l *windowLimiter) prune(now time.Time) {
 // ipCache caches fmsg.<domain> resolutions for indicators: positive results
 // for ttl, failures for negTTL. The TCP exchange keeps resolving afresh.
 type ipCache struct {
-	mu      sync.Mutex
-	lookup  func(domain string) ([]net.IP, error)
-	now     func() time.Time
-	ttl     time.Duration
-	negTTL  time.Duration
-	max     int
-	entries map[string]ipCacheEntry
+	mu        sync.Mutex
+	lookup    func(domain string) ([]net.IP, error)
+	now       func() time.Time
+	ttl       time.Duration
+	negTTL    time.Duration
+	max       int
+	entries   map[string]ipCacheEntry
+	lastPrune time.Time
 }
 
 type ipCacheEntry struct {
@@ -534,29 +529,33 @@ func newIPCache(lookup func(string) ([]net.IP, error), now func() time.Time) *ip
 		max: indicatorDNSCacheMax, entries: map[string]ipCacheEntry{}}
 }
 
+const ipCacheMinPruneInterval = time.Second
+
 func (c *ipCache) get(domain string) ([]net.IP, error) {
 	domain = strings.ToLower(domain)
+	now := c.now()
 	c.mu.Lock()
 	e, ok := c.entries[domain]
 	c.mu.Unlock()
-	now := c.now()
 	if ok && now.Before(e.expires) {
 		return e.ips, e.err
 	}
 	ips, err := c.lookup(domain)
-	e = ipCacheEntry{ips: ips, err: err, expires: now.Add(c.ttl)}
+	after := c.now()
+	e = ipCacheEntry{ips: ips, err: err, expires: after.Add(c.ttl)}
 	if err != nil {
-		e.expires = now.Add(c.negTTL)
+		e.expires = after.Add(c.negTTL)
 	}
 	c.mu.Lock()
-	if len(c.entries) >= c.max {
+	if len(c.entries) >= c.max && (c.lastPrune.IsZero() || after.Sub(c.lastPrune) >= ipCacheMinPruneInterval) {
 		for k, old := range c.entries {
-			if !now.Before(old.expires) {
+			if !after.Before(old.expires) {
 				delete(c.entries, k)
 			}
 		}
+		c.lastPrune = after
 	}
-	if len(c.entries) < c.max {
+	if _, exists := c.entries[domain]; exists || len(c.entries) < c.max {
 		c.entries[domain] = e
 	}
 	c.mu.Unlock()
@@ -841,7 +840,7 @@ func (s *indicatorService) sendTo(domain string, b []byte) {
 
 // listen LISTENs on the indicator channel and sends each local participant's
 // indicator, in the order published so the latest state wins.
-func (s *indicatorService) listen(dsn string) {
+func (s *indicatorService) listen(ctx context.Context, dsn string) {
 	listener := pq.NewListener(dsn, 10*time.Second, time.Minute, func(ev pq.ListenerEventType, err error) {
 		if err != nil {
 			log.Printf("ERROR: indicators: pg listener: %s", err)
@@ -852,18 +851,31 @@ func (s *indicatorService) listen(dsn string) {
 		return
 	}
 	defer listener.Close()
+
+	pingTimer := time.NewTimer(32 * time.Second)
+	defer pingTimer.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case n := <-listener.Notify:
+			if !pingTimer.Stop() {
+				select {
+				case <-pingTimer.C:
+				default:
+				}
+			}
+			pingTimer.Reset(32 * time.Second)
 			if n == nil {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), indicatorQueryTimeout)
-			if err := s.handleNotice(ctx, n.Extra); err != nil {
+			qctx, cancel := context.WithTimeout(ctx, indicatorQueryTimeout)
+			if err := s.handleNotice(qctx, n.Extra); err != nil {
 				log.Printf("WARN: indicators: notice %q: %s", n.Extra, err)
 			}
 			cancel()
-		case <-time.After(32 * time.Second):
+		case <-pingTimer.C:
+			pingTimer.Reset(32 * time.Second)
 			if err := listener.Ping(); err != nil {
 				log.Printf("ERROR: indicators: pg listener ping: %s", err)
 			}
@@ -871,11 +883,16 @@ func (s *indicatorService) listen(dsn string) {
 	}
 }
 
-func (s *indicatorService) runFlusher() {
+func (s *indicatorService) runFlusher(ctx context.Context) {
 	t := time.NewTicker(indicatorFlushInterval)
 	defer t.Stop()
-	for range t.C {
-		s.flush()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.flush()
+		}
 	}
 }
 
@@ -883,7 +900,7 @@ func (s *indicatorService) runFlusher() {
 // address and port, and sends local participants' indicators from the same
 // socket, so they leave from an address in this host's fmsg.<domain> set.
 // Failing to start is logged; message exchange is unaffected.
-func startIndicators(listenAddress string, port int) {
+func startIndicators(ctx context.Context, listenAddress string, port int) {
 	if !indicatorsEnabled() {
 		log.Println("INFO: indicators: disabled (FMSG_INDICATORS)")
 		return
@@ -899,16 +916,19 @@ func startIndicators(listenAddress string, port int) {
 		log.Printf("ERROR: indicators: listening on UDP %s: %s", addr, err)
 		return
 	}
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		log.Printf("ERROR: indicators: opening database: %s", err)
 		conn.Close()
 		return
 	}
-	db.SetMaxOpenConns(indicatorRecvWorkers + 2)
 	s := newIndicatorService(sqlIndicatorStore{db}, conn, lookupAuthorisedIPs, time.Now)
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
 	go s.serve()
-	go s.listen("")
-	go s.runFlusher()
+	go s.listen(ctx, "")
+	go s.runFlusher(ctx)
 	log.Printf("INFO: indicators: ready on UDP %s", addr)
 }
