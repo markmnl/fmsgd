@@ -64,6 +64,41 @@ func TestPreparedHashAndDurableRepresentation(t *testing.T) {
 			if _, err = UnmarshalPrepared(snapshot, got); err == nil {
 				t.Fatal("missing immutable content accepted")
 			}
+			// UnmarshalPreparedHeader decodes metadata without reading payload files.
+			metaOnly, err := UnmarshalPreparedHeader(snapshot)
+			if err != nil {
+				t.Fatalf("UnmarshalPreparedHeader failed with missing payload file: %v", err)
+			}
+			if !bytes.Equal(metaOnly.Encode(), h.Encode()) {
+				t.Fatal("UnmarshalPreparedHeader changed wire header")
+			}
 		})
+	}
+}
+
+func TestHeaderCloneDeepCopiesAddToFromAndStoredWire(t *testing.T) {
+	orig := &Header{
+		Version:    1,
+		Flags:      FlagHasPid | FlagHasAddTo,
+		Pid:        []byte{1, 2, 3},
+		From:       Address{User: "alice", Domain: "example.com"},
+		To:         []Address{{User: "bob", Domain: "example.com"}},
+		AddToFrom:  &Address{User: "alice", Domain: "example.com"},
+		AddTo:      []Address{{User: "carol", Domain: "example.org"}},
+		StoredWire: []byte(`{"Version":1}`),
+	}
+	cloned := orig.Clone()
+
+	if cloned.AddToFrom == orig.AddToFrom {
+		t.Fatal("Clone() aliased AddToFrom pointer")
+	}
+	cloned.AddToFrom.User = "mallory"
+	cloned.StoredWire[0] = 'X'
+
+	if orig.AddToFrom.User != "alice" {
+		t.Fatalf("mutating cloned AddToFrom mutated original: %q", orig.AddToFrom.User)
+	}
+	if orig.StoredWire[0] != '{' {
+		t.Fatalf("mutating cloned StoredWire mutated original: %q", orig.StoredWire)
 	}
 }

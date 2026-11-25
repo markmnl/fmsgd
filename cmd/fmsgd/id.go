@@ -4,9 +4,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"time"
 )
+
+var idHTTPClient = newIDHTTPClient()
+
+func newIDHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 32
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
+}
 
 type AddressDetail struct {
 	Address             string   `json:"address"`
@@ -33,14 +46,20 @@ type AddressDetail struct {
 // address supplied. If the address is not found returns nil, nil.
 func getAddressDetail(addr *FMsgAddress) (*AddressDetail, error) {
 	uri := IDURI + "/fmsgid/" + url.PathEscape(addr.ToString())
-	resp, err := http.Get(uri)
+	resp, err := idHTTPClient.Get(uri)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s returned %d", uri, resp.StatusCode)
 	}
 
 	var detail AddressDetail
@@ -78,11 +97,14 @@ func postMsgStat(addr *FMsgAddress, timestamp float64, size int64, isSending boo
 		return err
 	}
 
-	resp, err := http.Post(uri, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := idHTTPClient.Post(uri, "application/json", bytes.NewReader(jsonPayload))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("POST %s returned %d", uri, resp.StatusCode)

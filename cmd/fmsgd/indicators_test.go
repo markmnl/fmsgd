@@ -171,14 +171,14 @@ func TestPreparedHeaderParticipants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := preparedHeader(data)
+	got, err := fmsg.UnmarshalPreparedHeader(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s := strings.Join(addrStrings(indicatorParticipants(got)), ","); s != "@alice@a.test,@bob@b.test,@bob@b.test,@erin@e.test" {
 		t.Fatalf("participants = %s", s)
 	}
-	if _, err := preparedHeader([]byte(`{"Version":2,"Header":{}}`)); err == nil {
+	if _, err := fmsg.UnmarshalPreparedHeader([]byte(`{"Version":2,"Header":{}}`)); err == nil {
 		t.Fatal("unsupported prepared version accepted")
 	}
 }
@@ -323,6 +323,61 @@ func TestSourceLimiter(t *testing.T) {
 	}
 	if len(l.buckets) != 1 {
 		t.Fatalf("buckets = %d, want 1 after prune", len(l.buckets))
+	}
+}
+
+func TestSourceLimiterPruneGatingUnderFlood(t *testing.T) {
+	l := newSourceLimiter(50, 100, 2)
+	now := time.Unix(2000, 0)
+	if !l.allow("192.0.2.1", now) || !l.allow("192.0.2.2", now) {
+		t.Fatal("initial sources should be allowed")
+	}
+	initialPrune := l.lastPrune
+	// Flood with new sources within < 1s: must drop without re-pruning.
+	for i := 0; i < 50; i++ {
+		if l.allow(fmt.Sprintf("198.51.100.%d", i), now.Add(500*time.Millisecond)) {
+			t.Fatalf("source %d allowed while table full", i)
+		}
+		if !l.lastPrune.Equal(initialPrune) {
+			t.Fatalf("pruned within 1s gate: lastPrune=%v, want %v", l.lastPrune, initialPrune)
+		}
+	}
+	// After 1s, prune runs once and updates lastPrune.
+	t1 := now.Add(time.Second)
+	if l.allow("198.51.100.200", t1) {
+		t.Fatal("new source allowed while existing buckets not yet refilled")
+	}
+	if !l.lastPrune.Equal(t1) {
+		t.Fatalf("expected prune at %v, got lastPrune=%v", t1, l.lastPrune)
+	}
+	// Another flood right after t1 must not re-prune.
+	if l.allow("198.51.100.201", t1.Add(100*time.Millisecond)) {
+		t.Fatal("new source allowed while full")
+	}
+	if !l.lastPrune.Equal(t1) {
+		t.Fatalf("pruned again within 1s: lastPrune=%v, want %v", l.lastPrune, t1)
+	}
+}
+
+func TestIPCacheExpiryUsesTimeAfterLookup(t *testing.T) {
+	now := time.Unix(3000, 0)
+	calls := 0
+	c := newIPCache(func(d string) ([]net.IP, error) {
+		calls++
+		now = now.Add(30 * time.Second) // simulate slow DNS lookup
+		return []net.IP{net.ParseIP("192.0.2.1")}, nil
+	}, func() time.Time { return now })
+
+	if _, err := c.get("slow.test"); err != nil {
+		t.Fatal(err)
+	}
+	// 45s after lookup completed (75s after start) must still be cached (TTL=60s).
+	now = now.Add(45 * time.Second)
+	if _, err := c.get("slow.test"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("lookups = %d, want 1 (expiry should be based on post-lookup time)", calls)
 	}
 }
 

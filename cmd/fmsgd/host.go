@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,8 +17,10 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -257,13 +260,25 @@ func setIDURL() {
 	log.Printf("INFO: ID URL: %s", IDURI)
 }
 
-func calcNetIODuration(sizeInBytes int, bytesPerSecond float64) time.Duration {
+func calcNetIODuration(sizeInBytes int64, bytesPerSecond float64) time.Duration {
 	rate := float64(sizeInBytes) / bytesPerSecond
 	d := time.Duration(rate * float64(time.Second))
 	if d < MinNetIODeadline {
 		return MinNetIODeadline
 	}
 	return d
+}
+
+func totalWirePayloadSize(h *FMsgHeader) int64 {
+	total := int64(h.Size)
+	for _, att := range h.Attachments {
+		total += int64(att.Size)
+	}
+	return total
+}
+
+func addrEqualFold(a, b FMsgAddress) bool {
+	return strings.EqualFold(a.User, b.User) && strings.EqualFold(a.Domain, b.Domain)
 }
 
 func isValidUser(s string) bool {
@@ -339,30 +354,33 @@ func isValidAttachmentFilename(name string) bool {
 }
 
 func isMessageRetrievable(msg *FMsgHeader) bool {
-	if msg == nil {
-		return false
-	}
-	if msg.Filepath != "" {
-		st, err := os.Stat(msg.Filepath)
-		if err == nil && !st.IsDir() {
-			return true
+	visited := make(map[string]struct{})
+	for depth := 0; msg != nil && depth < maxThreadWalkDepth; depth++ {
+		if msg.Filepath != "" {
+			st, err := os.Stat(msg.Filepath)
+			if err == nil && !st.IsDir() {
+				return true
+			}
 		}
+		if len(msg.Pid) == 0 {
+			return false
+		}
+		pidKey := string(msg.Pid)
+		if _, seen := visited[pidKey]; seen {
+			return false
+		}
+		visited[pidKey] = struct{}{}
+		parentID, err := lookupMsgIdByHashFn(msg.Pid)
+		if err != nil || parentID == 0 {
+			return false
+		}
+		parentMsg, err := getMsgByIDFn(parentID)
+		if err != nil {
+			return false
+		}
+		msg = parentMsg
 	}
-	if len(msg.Pid) == 0 {
-		return false
-	}
-	parentID, err := lookupMsgIdByHashFn(msg.Pid)
-	if err != nil || parentID == 0 {
-		return false
-	}
-	parentMsg, err := getMsgByIDFn(parentID)
-	if err != nil {
-		return false
-	}
-	if parentMsg == nil {
-		return false
-	}
-	return isMessageRetrievable(parentMsg)
+	return false
 }
 
 // isOriginalParticipant reports whether addr is in the stored message's own
@@ -373,12 +391,11 @@ func isOriginalParticipant(msg *FMsgHeader, addr *FMsgAddress) bool {
 	if msg == nil || addr == nil {
 		return false
 	}
-	target := strings.ToLower(addr.ToString())
-	if strings.ToLower(msg.From.ToString()) == target {
+	if addrEqualFold(msg.From, *addr) {
 		return true
 	}
 	for i := range msg.To {
-		if strings.ToLower(msg.To[i].ToString()) == target {
+		if addrEqualFold(msg.To[i], *addr) {
 			return true
 		}
 	}
@@ -389,20 +406,19 @@ func isParentParticipant(parent *FMsgHeader, addr *FMsgAddress) bool {
 	if parent == nil || addr == nil {
 		return false
 	}
-	target := strings.ToLower(addr.ToString())
-	if strings.ToLower(parent.From.ToString()) == target {
+	if addrEqualFold(parent.From, *addr) {
 		return true
 	}
 	for i := range parent.To {
-		if strings.ToLower(parent.To[i].ToString()) == target {
+		if addrEqualFold(parent.To[i], *addr) {
 			return true
 		}
 	}
-	if parent.AddToFrom != nil && strings.ToLower(parent.AddToFrom.ToString()) == target {
+	if parent.AddToFrom != nil && addrEqualFold(*parent.AddToFrom, *addr) {
 		return true
 	}
 	for i := range parent.AddTo {
-		if strings.ToLower(parent.AddTo[i].ToString()) == target {
+		if addrEqualFold(parent.AddTo[i], *addr) {
 			return true
 		}
 	}
@@ -463,12 +479,15 @@ func parseAddress(b []byte) (*FMsgAddress, error) {
 
 // Reads byte slice prefixed with uint8 size from reader supplied
 func ReadUInt8Slice(r io.Reader) ([]byte, error) {
-	var size byte
-	err := binary.Read(r, binary.LittleEndian, &size)
-	if err != nil {
+	var size [1]byte
+	if _, err := io.ReadFull(r, size[:]); err != nil {
 		return nil, err
 	}
-	return io.ReadAll(io.LimitReader(r, int64(size)))
+	buf := make([]byte, size[0])
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func readAddress(r io.Reader) (*FMsgAddress, error) {
@@ -480,19 +499,18 @@ func readAddress(r io.Reader) (*FMsgAddress, error) {
 }
 
 func handleChallenge(c net.Conn, r *bufio.Reader) error {
-	hashSlice, err := io.ReadAll(io.LimitReader(r, 32))
-	if err != nil {
+	var hash [32]byte
+	if _, err := io.ReadFull(r, hash[:]); err != nil {
 		return err
 	}
-	hash := *(*[32]byte)(hashSlice)
-	log.Printf("INFO: CHALLENGE <-- %s", hex.EncodeToString(hashSlice))
+	log.Printf("INFO: CHALLENGE <-- %s", hex.EncodeToString(hash[:]))
 
 	// Verify the challenger's IP is the Host-B IP registered for this message
 	// (§10.5 step 2). An unrecognised hash OR a mismatched IP both → TERMINATE.
 	remoteIP, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 	header, exists := lookupOutgoing(hash, remoteIP)
 	if !exists {
-		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hashSlice), c.RemoteAddr().String())
+		return fmt.Errorf("challenge for unknown message: %s, from: %s", hex.EncodeToString(hash[:]), c.RemoteAddr().String())
 	}
 	msgHash, err := header.GetMessageHash()
 	if err != nil {
@@ -666,11 +684,15 @@ func handleAddToPath(c net.Conn, h *FMsgHeader) (*FMsgHeader, error) {
 	// Batch identity is the batch message hash — this add-to header combined
 	// with the stored parent's payload (SPEC §11) — so map the parent's data
 	// in and compute it before the duplicate check.
+	if len(h.Attachments) != len(parentMsg.Attachments) {
+		if err := sendCode(c, RejectCodeInvalid); err != nil {
+			return h, err
+		}
+		return h, fmt.Errorf("add-to: attachment count %d does not match parent msg %d (%d)", len(h.Attachments), parentID, len(parentMsg.Attachments))
+	}
 	h.Filepath = parentMsg.Filepath
 	for i := range h.Attachments {
-		if i < len(parentMsg.Attachments) {
-			h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
-		}
+		h.Attachments[i].Filepath = parentMsg.Attachments[i].Filepath
 	}
 	batchHash, err := h.GetMessageHash()
 	if err != nil {
@@ -808,6 +830,9 @@ func readToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 		}
 		key := strings.ToLower(addr.ToString())
 		if seen[key] {
+			if err := sendCode(c, RejectCodeInvalid); err != nil {
+				return err
+			}
 			return fmt.Errorf("duplicate recipient address: %s", addr.ToString())
 		}
 		seen[key] = true
@@ -836,12 +861,10 @@ func readAddToRecipients(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 		return fmt.Errorf("reading add-to-from address: %w", err)
 	}
 
-	addToFromKey := strings.ToLower(addToFrom.ToString())
-	fromKey := strings.ToLower(h.From.ToString())
-	inFromOrTo := fromKey == addToFromKey
+	inFromOrTo := addrEqualFold(h.From, *addToFrom)
 	if !inFromOrTo {
-		for _, toAddr := range h.To {
-			if strings.ToLower(toAddr.ToString()) == addToFromKey {
+		for i := range h.To {
+			if addrEqualFold(h.To[i], *addToFrom) {
 				inFromOrTo = true
 				break
 			}
@@ -911,40 +934,8 @@ func readAndValidateTimestamp(c net.Conn, r *bufio.Reader, h *FMsgHeader) error 
 	return nil
 }
 
-func readMessageType(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
-	if h.Flags&FlagCommonType != 0 {
-		typeID, err := r.ReadByte()
-		if err != nil {
-			return err
-		}
-		mtype, ok := fmsg.GetCommonMediaType(typeID)
-		if !ok {
-			if err := sendCode(c, RejectCodeInvalid); err != nil {
-				return err
-			}
-			return fmt.Errorf("unmapped common type ID: %d", typeID)
-		}
-		h.TypeID = typeID
-		h.Type = mtype
-		return nil
-	}
-
-	mime, err := ReadUInt8Slice(r)
-	if err != nil {
-		return err
-	}
-	if !isASCIIBytes(mime) {
-		if err := sendCode(c, RejectCodeInvalid); err != nil {
-			return err
-		}
-		return fmt.Errorf("message media type must be US-ASCII")
-	}
-	h.Type = string(mime)
-	return nil
-}
-
-func readAttachmentType(c net.Conn, r *bufio.Reader, flags uint8) (string, uint8, error) {
-	if flags&(1<<0) != 0 {
+func readMediaType(c net.Conn, r *bufio.Reader, isCommon bool, label string) (string, uint8, error) {
+	if isCommon {
 		typeID, err := r.ReadByte()
 		if err != nil {
 			return "", 0, err
@@ -954,7 +945,7 @@ func readAttachmentType(c net.Conn, r *bufio.Reader, flags uint8) (string, uint8
 			if err := sendCode(c, RejectCodeInvalid); err != nil {
 				return "", 0, err
 			}
-			return "", 0, fmt.Errorf("unmapped attachment common type ID: %d", typeID)
+			return "", 0, fmt.Errorf("unmapped %scommon type ID: %d", label, typeID)
 		}
 		return mtype, typeID, nil
 	}
@@ -967,9 +958,23 @@ func readAttachmentType(c net.Conn, r *bufio.Reader, flags uint8) (string, uint8
 		if err := sendCode(c, RejectCodeInvalid); err != nil {
 			return "", 0, err
 		}
-		return "", 0, fmt.Errorf("attachment media type must be US-ASCII")
+		return "", 0, fmt.Errorf("%smedia type must be US-ASCII", label)
 	}
 	return string(typeBytes), 0, nil
+}
+
+func readMessageType(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
+	mtype, typeID, err := readMediaType(c, r, h.Flags&FlagCommonType != 0, "message ")
+	if err != nil {
+		return err
+	}
+	h.TypeID = typeID
+	h.Type = mtype
+	return nil
+}
+
+func readAttachmentType(c net.Conn, r *bufio.Reader, flags uint8) (string, uint8, error) {
+	return readMediaType(c, r, flags&(1<<0) != 0, "attachment ")
 }
 
 func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
@@ -978,14 +983,14 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 		return err
 	}
 
-	totalSize := h.Size
+	totalSize := uint64(h.Size)
 	// When message is compressed, expanded size comes from the header field.
 	// When uncompressed, the wire size IS the expanded size.
-	var totalExpandedSize uint32
+	var totalExpandedSize uint64
 	if h.Flags&FlagDeflate != 0 {
-		totalExpandedSize = h.ExpandedSize
+		totalExpandedSize = uint64(h.ExpandedSize)
 	} else {
-		totalExpandedSize = h.Size
+		totalExpandedSize = uint64(h.Size)
 	}
 	filenameSeen := make(map[string]bool)
 	for i := uint8(0); i < attachCount; i++ {
@@ -1033,11 +1038,12 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 			if err := binary.Read(r, binary.LittleEndian, &attExpandedSize); err != nil {
 				return err
 			}
-			totalExpandedSize += attExpandedSize
+			totalExpandedSize += uint64(attExpandedSize)
 		} else {
 			// uncompressed: expanded size equals wire size
-			totalExpandedSize += attSize
+			totalExpandedSize += uint64(attSize)
 		}
+		totalSize += uint64(attSize)
 
 		h.Attachments = append(h.Attachments, FMsgAttachmentHeader{
 			Flags:        attFlags,
@@ -1047,17 +1053,16 @@ func readAttachmentHeaders(c net.Conn, r *bufio.Reader, h *FMsgHeader) error {
 			Size:         attSize,
 			ExpandedSize: attExpandedSize,
 		})
-		totalSize += attSize
 	}
 
-	if totalSize > MaxMessageSize {
+	if totalSize > uint64(MaxMessageSize) {
 		if err := sendCode(c, RejectCodeTooBig); err != nil {
 			return err
 		}
 		return fmt.Errorf("total message size %d exceeds max %d", totalSize, MaxMessageSize)
 	}
 
-	if totalExpandedSize > MaxExpandedSize {
+	if totalExpandedSize > uint64(MaxExpandedSize) {
 		if err := sendCode(c, RejectCodeTooBig); err != nil {
 			return err
 		}
@@ -1097,12 +1102,10 @@ func readHeader(c net.Conn) (*FMsgHeader, *bufio.Reader, error) {
 
 	// read pid if any
 	if flags&FlagHasPid != 0 {
-		pid, err := io.ReadAll(io.LimitReader(r, 32))
-		if err != nil {
+		h.Pid = make([]byte, 32)
+		if _, err := io.ReadFull(r, h.Pid); err != nil {
 			return h, r, err
 		}
-		h.Pid = make([]byte, 32)
-		copy(h.Pid, pid)
 	}
 
 	// read from address
@@ -1232,45 +1235,41 @@ func challenge(conn net.Conn, h *FMsgHeader, senderDomain string) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse remote address for challenge: %w", err)
 	}
-	conn2, err := tls.Dial("tcp", net.JoinHostPort(remoteHost, fmt.Sprintf("%d", RemotePort)), buildClientTLSConfig("fmsg."+senderDomain))
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn2, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(remoteHost, strconv.Itoa(RemotePort)), buildClientTLSConfig("fmsg."+senderDomain))
 	if err != nil {
 		return err
 	}
-	version := uint8(255)
-	if err := binary.Write(conn2, binary.LittleEndian, version); err != nil {
+	defer conn2.Close()
+
+	if err := conn2.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
 	hash := h.GetHeaderHash()
 	log.Printf("INFO: --> CHALLENGE\t%s\n", hex.EncodeToString(hash))
-	if _, err := conn2.Write(hash); err != nil {
+	var challengeBuf [33]byte
+	challengeBuf[0] = 255
+	copy(challengeBuf[1:], hash)
+	if _, err := conn2.Write(challengeBuf[:]); err != nil {
 		return err
 	}
 
 	// read challenge response
-	resp, err := io.ReadAll(io.LimitReader(conn2, 32))
-	if err != nil {
+	if err := conn2.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
-	if len(resp) != 32 {
-		return fmt.Errorf("challenge response size %d, expected 32", len(resp))
+	var resp [32]byte
+	if _, err := io.ReadFull(conn2, resp[:]); err != nil {
+		return err
 	}
-	copy(h.ChallengeHash[:], resp)
+	h.ChallengeHash = resp
 	h.ChallengeCompleted = true
-	log.Printf("INFO: <-- CHALLENGE RESP\t%s\n", hex.EncodeToString(resp))
-
-	// gracefully close 2nd connection
-	if err := conn2.Close(); err != nil {
-		return err
-	}
+	log.Printf("INFO: <-- CHALLENGE RESP\t%s\n", hex.EncodeToString(resp[:]))
 
 	return nil
 }
 
-func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress, msgHash []byte) (code uint8, err error) {
-	duplicate, err := hasAddrReceivedMsgHash(msgHash, addr)
-	if err != nil {
-		return RejectCodeUserUndisclosed, err
-	}
+func validateMsgRecvForAddr(h *FMsgHeader, addr *FMsgAddress, duplicate bool) (code uint8, err error) {
 	if duplicate {
 		return RejectCodeUserDuplicate, nil
 	}
@@ -1332,20 +1331,33 @@ func recvLimitExceeded(detail *AddressDetail, size int64) string {
 	return ""
 }
 
-// uniqueFilepath generates a unique file path in the given directory,
-// appending a counter suffix if the base name already exists.
-func uniqueFilepath(dir string, timestamp uint32, ext string) string {
-	base := fmt.Sprintf("%d", timestamp)
+// createUniqueFile atomically creates a new file in dir using O_CREATE|O_EXCL,
+// appending a numeric suffix if base+ext already exists.
+func createUniqueFile(dir, base, ext string) (*os.File, string, error) {
 	fp := filepath.Join(dir, base+ext)
-	if _, err := os.Stat(fp); os.IsNotExist(err) {
-		return fp
+	f, err := os.OpenFile(fp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
+	if err == nil {
+		return f, fp, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return nil, "", err
 	}
 	for i := 1; ; i++ {
 		fp = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, i, ext))
-		if _, err := os.Stat(fp); os.IsNotExist(err) {
-			return fp
+		f, err = os.OpenFile(fp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
+		if err == nil {
+			return f, fp, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
 		}
 	}
+}
+
+// uniqueFilepath atomically creates a unique file in the given directory,
+// appending a counter suffix if the base name already exists.
+func uniqueFilepath(dir string, timestamp uint32, ext string) (*os.File, string, error) {
+	return createUniqueFile(dir, strconv.FormatUint(uint64(timestamp), 10), ext)
 }
 
 // localRecipients returns this host's recipients in wire order: every _to_
@@ -1374,12 +1386,12 @@ func allLocalRecipientsHaveMessageHash(msgHash []byte, addrs []FMsgAddress) (boo
 	if len(addrs) == 0 {
 		return false, nil
 	}
+	received, err := receivedAddrsForMsgHash(msgHash, addrs)
+	if err != nil {
+		return false, err
+	}
 	for i := range addrs {
-		duplicate, err := hasAddrReceivedMsgHash(msgHash, &addrs[i])
-		if err != nil {
-			return false, err
-		}
-		if !duplicate {
+		if !received[strings.ToLower(addrs[i].ToString())] {
 			return false, nil
 		}
 	}
@@ -1484,13 +1496,11 @@ func cleanupFiles(paths []string) {
 	}
 }
 
-func copyMessagePayload(src *os.File, dstPath string, compressed bool, wireSize uint32) error {
+func copyMessagePayload(src *os.File, dst *os.File, compressed bool, wireSize, expandedSize uint32) error {
+	dstPath := dst.Name()
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	fd2, err := os.Create(dstPath)
-	if err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
 		return err
 	}
 
@@ -1499,58 +1509,84 @@ func copyMessagePayload(src *os.File, dstPath string, compressed bool, wireSize 
 		lr := io.LimitReader(src, int64(wireSize))
 		zr, err := zlib.NewReader(lr)
 		if err != nil {
-			fd2.Close()
+			_ = dst.Close()
 			_ = os.Remove(dstPath)
 			return err
 		}
-		_, copyErr = io.Copy(fd2, zr)
-		_ = zr.Close()
+		written, err := io.Copy(dst, io.LimitReader(zr, int64(expandedSize)+1))
+		zrCloseErr := zr.Close()
+		if err != nil {
+			copyErr = err
+		} else if written != int64(expandedSize) {
+			copyErr = fmt.Errorf("decompressed size %d does not match declared expanded size %d", written, expandedSize)
+		} else if zrCloseErr != nil {
+			copyErr = zrCloseErr
+		}
 	} else {
-		_, copyErr = io.CopyN(fd2, src, int64(wireSize))
+		_, copyErr = io.CopyN(dst, src, int64(wireSize))
 	}
-	if err := fd2.Close(); err != nil {
-		return err
-	}
-
+	closeErr := dst.Close()
 	if copyErr != nil {
 		_ = os.Remove(dstPath)
 		return copyErr
 	}
+	if closeErr != nil {
+		_ = os.Remove(dstPath)
+		return closeErr
+	}
 	return nil
 }
 
-func uniqueAttachmentPath(dir string, timestamp uint32, idx int, filename string) string {
+func uniqueAttachmentPath(dir string, timestamp uint32, idx int, filename string) (*os.File, string, error) {
 	ext := filepath.Ext(filename)
 	base := fmt.Sprintf("%d_att_%d", timestamp, idx)
-	p := filepath.Join(dir, base+ext)
-	if _, err := os.Stat(p); os.IsNotExist(err) {
-		return p
-	}
-	for n := 1; ; n++ {
-		p = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, n, ext))
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			return p
-		}
-	}
+	return createUniqueFile(dir, base, ext)
 }
 
 func persistAttachmentPayloads(h *FMsgHeader, dirpath string) error {
+	dstPaths := make([]string, len(h.Attachments))
 	for i := range h.Attachments {
 		a := &h.Attachments[i]
 		src, err := os.Open(a.Filepath)
 		if err != nil {
+			cleanupFiles(dstPaths[:i])
 			return err
 		}
-		dstPath := uniqueAttachmentPath(dirpath, uint32(h.Timestamp), i, a.Filename)
+		dstFile, dstPath, err := uniqueAttachmentPath(dirpath, uint32(h.Timestamp), i, a.Filename)
+		if err != nil {
+			src.Close()
+			cleanupFiles(dstPaths[:i])
+			return err
+		}
 		compressed := a.Flags&(1<<1) != 0
-		err = copyMessagePayload(src, dstPath, compressed, a.Size)
+		err = copyMessagePayload(src, dstFile, compressed, a.Size, a.ExpandedSize)
 		src.Close()
 		if err != nil {
+			cleanupFiles(dstPaths[:i])
 			return err
 		}
-		a.Filepath = dstPath
+		dstPaths[i] = dstPath
+	}
+	for i, p := range dstPaths {
+		h.Attachments[i].Filepath = p
 	}
 	return nil
+}
+
+func dedupeAddresses(lists ...[]FMsgAddress) []FMsgAddress {
+	seen := make(map[string]struct{})
+	var out []FMsgAddress
+	for _, list := range lists {
+		for _, addr := range list {
+			key := strings.ToLower(addr.ToString())
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, addr)
+		}
+	}
+	return out
 }
 
 // storeAcceptedMessage stores a received message once at least one local
@@ -1577,7 +1613,7 @@ func storeAcceptedMessage(h *FMsgHeader, codes []byte, acceptedTo []FMsgAddress,
 		return false
 	}
 
-	recordRecvUsage(h, append(acceptedTo, acceptedAddTo...), timeutil.TimestampNow().Float64())
+	recordRecvUsage(h, dedupeAddresses(acceptedTo, acceptedAddTo), timeutil.TimestampNow().Float64())
 	return true
 }
 
@@ -1649,9 +1685,16 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 	}
 	defer src.Close()
 
+	// Batch duplicate check across all local recipients in a single DB query.
+	receivedSet, err := receivedAddrsForMsgHash(dupHash, addrs)
+	if err != nil {
+		return err
+	}
+
 	// validate each recipient and copy message for accepted ones
 	acceptedTo := []FMsgAddress{}
 	acceptedAddTo := []FMsgAddress{}
+	addrCodes := make(map[string]uint8, len(addrs))
 	var primaryFilepath string
 	var wireDir string
 	wireStored := false
@@ -1661,13 +1704,27 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 		}
 	}()
 	for i, addr := range addrs {
-		code, err := validateMsgRecvForAddr(h, &addr, dupHash)
+		addrKey := strings.ToLower(addr.ToString())
+		if prevCode, seen := addrCodes[addrKey]; seen {
+			codes[i] = prevCode
+			if prevCode == RejectCodeAccept {
+				if i < numLocalTo {
+					acceptedTo = append(acceptedTo, addr)
+				} else {
+					acceptedAddTo = append(acceptedAddTo, addr)
+				}
+			}
+			continue
+		}
+
+		code, err := validateMsgRecvForAddr(h, &addr, receivedSet[addrKey])
 		if err != nil {
 			return err
 		}
 		if code != RejectCodeAccept {
 			log.Printf("WARN: Rejected message to: %s: %s (%d)", addr.ToString(), responseCodeName(code), code)
 			codes[i] = code
+			addrCodes[addrKey] = code
 			continue
 		}
 
@@ -1677,14 +1734,22 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 			return err
 		}
 
-		fp := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
-		if err := copyMessagePayload(src, fp, h.Flags&FlagDeflate != 0, h.Size); err != nil {
-			log.Printf("ERROR: copying downloaded message from: %s, to: %s", h.Filepath, fp)
+		dstFile, fp, err := uniqueFilepath(dirpath, uint32(h.Timestamp), ext)
+		if err != nil {
+			log.Printf("ERROR: creating destination file in %s: %s", dirpath, err)
 			codes[i] = RejectCodeUserUndisclosed
+			addrCodes[addrKey] = RejectCodeUserUndisclosed
+			continue
+		}
+		if err := copyMessagePayload(src, dstFile, h.Flags&FlagDeflate != 0, h.Size, h.ExpandedSize); err != nil {
+			log.Printf("ERROR: copying downloaded message from: %s, to: %s: %s", h.Filepath, fp, err)
+			codes[i] = RejectCodeUserUndisclosed
+			addrCodes[addrKey] = RejectCodeUserUndisclosed
 			continue
 		}
 
 		codes[i] = RejectCodeAccept
+		addrCodes[addrKey] = RejectCodeAccept
 		// Entries before numLocalTo came from _to_, the rest from _add to_. An
 		// address in both lists appears once in each range and is recorded in
 		// both, rather than being classified exclusively as add-to.
@@ -1706,13 +1771,16 @@ func downloadMessage(c net.Conn, r io.Reader, h *FMsgHeader, skipData bool) erro
 					return err
 				}
 			}
-			if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
-				log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
-				codes[i] = RejectCodeUserUndisclosed
-				primaryFilepath = ""
-				acceptedTo = acceptedTo[:0]
-				acceptedAddTo = acceptedAddTo[:0]
-				continue
+			if !skipData {
+				if err := persistAttachmentPayloads(h, filepath.Dir(primaryFilepath)); err != nil {
+					log.Printf("ERROR: copying attachment payloads for message storage: %s", err)
+					codes[i] = RejectCodeUserUndisclosed
+					addrCodes[addrKey] = RejectCodeUserUndisclosed
+					primaryFilepath = ""
+					acceptedTo = acceptedTo[:0]
+					acceptedAddTo = acceptedAddTo[:0]
+					continue
+				}
 			}
 		}
 	}
@@ -1753,8 +1821,12 @@ func resolvePostChallengeCode(initialCode uint8, challengeCompleted bool, allLoc
 }
 
 func abortConn(c net.Conn) {
-	if tcp, ok := c.(*net.TCPConn); ok {
-		tcp.SetLinger(0)
+	raw := c
+	if tc, ok := raw.(*tls.Conn); ok {
+		raw = tc.NetConn()
+	}
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
 	}
 	_ = c.Close()
 }
@@ -1795,6 +1867,7 @@ func handleConn(c net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("ERROR: Recovered in handleConn: %v", r)
+			abortConn(c)
 		}
 	}()
 
@@ -1913,7 +1986,7 @@ func handleConn(c net.Conn) {
 	}
 
 	// store message
-	deadlineBytes := int(header.Size)
+	deadlineBytes := totalWirePayloadSize(header)
 	if skipData {
 		deadlineBytes = 1
 	}
@@ -1933,6 +2006,8 @@ func handleConn(c net.Conn) {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	initOutgoing()
 
@@ -1951,11 +2026,13 @@ func main() {
 		listenAddress = arg
 	}
 
-	// initalize database
+	// initialize database
 	err := testDb()
 	if err != nil {
 		log.Fatalf("ERROR: connecting to database: %s\n", err)
 	}
+	defer closeDB()
+	defer closeSenderDB()
 
 	// set DataDir, Domain and IDURL from env
 	setDataDir()
@@ -1966,12 +2043,16 @@ func main() {
 	serverTLSConfig = buildServerTLSConfig()
 
 	// FMSG-006 indicators on UDP, same address and port as TCP
-	startIndicators(listenAddress, Port)
+	startIndicators(ctx, listenAddress, Port)
 
 	// start sender in background (small delay so listener is ready first)
 	go func() {
-		time.Sleep(1 * time.Second)
-		startSender()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		startSender(ctx)
 	}()
 
 	// start listening
@@ -1980,14 +2061,35 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
 	log.Printf("INFO: Ready to receive on %s\n", addr)
+
+	var acceptBackoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				log.Println("INFO: Shutting down")
+				return
+			}
 			log.Printf("ERROR: Accept connection from %s returned: %s\n", ln.Addr().String(), err)
-		} else {
-			go handleConn(conn)
+			if acceptBackoff == 0 {
+				acceptBackoff = 5 * time.Millisecond
+			} else {
+				acceptBackoff = min(acceptBackoff*2, time.Second)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(acceptBackoff):
+			}
+			continue
 		}
+		acceptBackoff = 0
+		go handleConn(conn)
 	}
 
 }

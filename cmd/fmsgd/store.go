@@ -2,22 +2,104 @@ package main
 
 import (
 	"database/sql"
-
 	"fmt"
-	"github.com/markmnl/fmsgd/pkg/fmsg"
 	"log"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/levenlabs/golib/timeutil"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 )
 
+const (
+	dbMaxOpenConns       = 48
+	dbMaxIdleConns       = 16
+	senderDBMaxOpenConns = 32
+	senderDBMaxIdleConns = 8
+)
+
+var (
+	dbMu       sync.Mutex
+	sharedDB   *sql.DB
+	senderDBMu sync.Mutex
+	senderDB   *sql.DB
+
+	// openDBPool opens a new database pool. Overridable in tests.
+	openDBPool = func() (*sql.DB, error) {
+		return sql.Open("postgres", "")
+	}
+)
+
+// getDB returns the process-wide shared *sql.DB connection pool used by inbound
+// handlers and indicators, initializing it lazily on first use.
+func getDB() (*sql.DB, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	if sharedDB != nil {
+		return sharedDB, nil
+	}
+	db, err := openDBPool()
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	sharedDB = db
+	return sharedDB, nil
+}
+
+// closeDB closes the shared *sql.DB connection pool if initialized.
+func closeDB() {
+	dbMu.Lock()
+	db := sharedDB
+	sharedDB = nil
+	dbMu.Unlock()
+	if db != nil {
+		_ = db.Close()
+	}
+}
+
+// getSenderDB returns a dedicated *sql.DB connection pool for the outbound
+// sender, isolated from getDB() so sender transactions held across network I/O
+// cannot starve inbound handlers or indicators.
+func getSenderDB() (*sql.DB, error) {
+	senderDBMu.Lock()
+	defer senderDBMu.Unlock()
+	if senderDB != nil {
+		return senderDB, nil
+	}
+	db, err := openDBPool()
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(senderDBMaxOpenConns)
+	db.SetMaxIdleConns(senderDBMaxIdleConns)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	senderDB = db
+	return senderDB, nil
+}
+
+// closeSenderDB closes the sender *sql.DB connection pool if initialized.
+func closeSenderDB() {
+	senderDBMu.Lock()
+	db := senderDB
+	senderDB = nil
+	senderDBMu.Unlock()
+	if db != nil {
+		_ = db.Close()
+	}
+}
+
 func testDb() error {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	err = db.Ping()
 	if err != nil {
 		return err
@@ -50,11 +132,10 @@ func testDb() error {
 // lookupMsgIdByHash returns the msg id for a message with the given SHA256 hash,
 // or 0 if no such message exists.
 func lookupMsgIdByHash(hash []byte) (int64, error) {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
 
 	var id int64
 	err = db.QueryRow("SELECT id FROM msg WHERE sha256 = $1", hash).Scan(&id)
@@ -74,11 +155,10 @@ func threadHasFromDomain(hash []byte, domain string) (bool, error) {
 		return false, nil
 	}
 
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return false, err
 	}
-	defer db.Close()
 
 	// from_addr is @user@domain; split_part(..., 3) is the domain.
 	// Depth cap and cycle guard limit pathological chains.
@@ -107,44 +187,61 @@ func threadHasFromDomain(hash []byte, domain string) (bool, error) {
 	return found, nil
 }
 
-// hasAddrReceivedMsgHash reports whether addr has already received a stored
-// message identified by hash.
-func hasAddrReceivedMsgHash(hash []byte, addr *FMsgAddress) (bool, error) {
-	if addr == nil || len(hash) == 0 {
-		return false, nil
+// receivedAddrsForMsgHash returns the set of lower-cased addresses from addrs
+// that have already received a stored message identified by hash.
+func receivedAddrsForMsgHash(hash []byte, addrs []FMsgAddress) (map[string]bool, error) {
+	result := make(map[string]bool)
+	if len(hash) == 0 || len(addrs) == 0 {
+		return result, nil
 	}
 
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	defer db.Close()
 
-	addrStr := strings.ToLower(addr.ToString())
+	lowerAddrs := make([]string, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for i := range addrs {
+		k := strings.ToLower(addrs[i].ToString())
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			lowerAddrs = append(lowerAddrs, k)
+		}
+	}
 
-	var exists bool
-	err = db.QueryRow(`
-		SELECT EXISTS (
-			SELECT 1
-			FROM msg m
-			JOIN msg_to mt ON mt.msg_id = m.id
-			WHERE m.sha256 = $1
-			  AND lower(mt.addr) = $2
-			  AND mt.time_delivered IS NOT NULL
-			UNION ALL
-			SELECT 1
-			FROM msg m
-			JOIN msg_add_to mat ON mat.msg_id = m.id
-			WHERE m.sha256 = $1
-			  AND lower(mat.addr) = $2
-			  AND mat.time_delivered IS NOT NULL
-		)
-	`, hash, addrStr).Scan(&exists)
+	rows, err := db.Query(`
+		SELECT DISTINCT lower(mt.addr)
+		FROM msg m
+		JOIN msg_to mt ON mt.msg_id = m.id
+		WHERE m.sha256 = $1
+		  AND lower(mt.addr) = ANY($2)
+		  AND mt.time_delivered IS NOT NULL
+		UNION
+		SELECT DISTINCT lower(mat.addr)
+		FROM msg m
+		JOIN msg_add_to mat ON mat.msg_id = m.id
+		WHERE m.sha256 = $1
+		  AND lower(mat.addr) = ANY($2)
+		  AND mat.time_delivered IS NOT NULL
+	`, hash, pq.Array(lowerAddrs))
 	if err != nil {
-		return false, err
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		result[addr] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
-	return exists, nil
+	return result, nil
 }
 
 type parentLinkStore interface {
@@ -254,11 +351,10 @@ func relationalParentHash(msg *FMsgHeader) []byte {
 // getMsgByID loads a message and all its recipients from the database by msg ID.
 // Returns the full FMsgHeader or nil if the message doesn't exist.
 func getMsgByID(msgID int64) (*FMsgHeader, error) {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -289,27 +385,20 @@ func getMsgByBatchHash(batchHash []byte) (*FMsgHeader, error) {
 	if len(batchHash) == 0 {
 		return nil, nil
 	}
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 
 	var prepared []byte
-	err = tx.QueryRow(`SELECT wire_message FROM msg_add_to_batch WHERE sha256 = $1`, batchHash).Scan(&prepared)
+	err = db.QueryRow(`SELECT wire_message FROM msg_add_to_batch WHERE sha256 = $1`, batchHash).Scan(&prepared)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return fmsg.UnmarshalPrepared(prepared, batchHash)
+	return fmsg.UnmarshalPreparedHeader(prepared)
 }
 
 // existingMsgIDForAddTo returns the id of an already-stored message row whose
@@ -338,11 +427,10 @@ func addToBatchRecorded(msgID int64, batchHash []byte) (bool, error) {
 	if len(batchHash) == 0 {
 		return false, nil
 	}
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return false, err
 	}
-	defer db.Close()
 
 	var exists bool
 	err = db.QueryRow(`SELECT EXISTS (
@@ -364,13 +452,26 @@ values ($1, $2, $3, NULL) returning id`, msgID, addToFrom, now).Scan(&batchID)
 }
 
 // attachAddToRecipients extends an already-stored message with the recipients
-// carried by an add-to delivery, marking those on our domain delivered. It is
-// the add-to counterpart of an INSERT: when a host already holds the shared
-// message, an add-to delivery must grow its recipient list rather than insert
-// a second row under the same unique canonical sha256 (SPEC §12). Each call is
-// one batch, recorded so its sender and timing are not lost.
-func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
+// carried by an add-to delivery. When localOutcome is non-nil (code 65 path),
+// each recipient's row state reflects its actual per-recipient outcome; when
+// nil (code 11 notification path), local recipients are marked delivered and
+// remote recipients are marked not-our-delivery. It is the add-to counterpart
+// of an INSERT: when a host already holds the shared message, an add-to
+// delivery must grow its recipient list rather than insert a second row under
+// the same unique canonical sha256 (SPEC §12). Each call is one batch,
+// recorded so its sender and timing are not lost.
+func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader, localOutcome map[string]uint8) error {
 	now := timeutil.TimestampNow().Float64()
+
+	rowOutcome := func(addr FMsgAddress) (delivered any, code any) {
+		if localOutcome != nil {
+			return inboundRecipientRow(addr, localOutcome, now)
+		}
+		if strings.EqualFold(addr.Domain, Domain) {
+			return now, nil
+		}
+		return nil, int16(localResponseCodeNotOurDelivery)
+	}
 
 	// This host is recording a batch it RECEIVED: delivering the batch to
 	// other domains is the batch sender's job, not ours (SPEC §10.2 — a host
@@ -378,13 +479,7 @@ func attachAddToRecipients(tx *sql.Tx, msgID int64, msg *FMsgHeader) error {
 	// domains are recorded with localResponseCodeNotOurDelivery so the
 	// sender's pending queries never treat them as our delivery work.
 	for _, addr := range msg.To {
-		var delivered any
-		var code any
-		if addr.Domain == Domain {
-			delivered = now
-		} else {
-			code = int16(localResponseCodeNotOurDelivery)
-		}
+		delivered, code := rowOutcome(addr)
 		if _, err := tx.Exec(`insert into msg_to (msg_id, addr, time_delivered, response_code)
 values ($1, $2, $3, $4)
 on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code); err != nil {
@@ -416,13 +511,7 @@ on conflict (msg_id, addr) do nothing`, msgID, addr.ToString(), delivered, code)
 	}
 
 	for _, addr := range msg.AddTo {
-		var delivered any
-		var code any
-		if addr.Domain == Domain {
-			delivered = now
-		} else {
-			code = int16(localResponseCodeNotOurDelivery)
-		}
+		delivered, code := rowOutcome(addr)
 		if _, err := tx.Exec(`insert into msg_add_to (msg_id, batch_id, addr, time_delivered, response_code)
 values ($1, $2, $3, $4, $5)
 on conflict (batch_id, addr) do nothing`, msgID, batchID, addr.ToString(), delivered, code); err != nil {
@@ -468,11 +557,10 @@ func inboundRecipientRow(addr FMsgAddress, localOutcome map[string]uint8, now fl
 // local recipient address to the per-recipient code this host responded.
 func storeMsgDetail(msg *FMsgHeader, localOutcome map[string]uint8) error {
 
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -492,7 +580,7 @@ func storeMsgDetail(msg *FMsgHeader, localOutcome map[string]uint8) error {
 	if existingID, err := existingMsgIDForAddTo(tx, msg, msgHash); err != nil {
 		return err
 	} else if existingID != 0 {
-		if err := attachAddToRecipients(tx, existingID, msg); err != nil {
+		if err := attachAddToRecipients(tx, existingID, msg, localOutcome); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -620,11 +708,10 @@ values ($1, $2, $3, $4, $5, $6, $7)`)
 // (spec code 11). Only the header is recorded so the header hash can be
 // faithfully computed for subsequent messages referencing this one via pid.
 func storeMsgHeaderOnly(msg *FMsgHeader) error {
-	db, err := sql.Open("postgres", "")
+	db, err := getDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -647,7 +734,7 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 	if existingID == 0 {
 		return fmt.Errorf("add-to header for unstored message %x", msgHash)
 	}
-	if err := attachAddToRecipients(tx, existingID, msg); err != nil {
+	if err := attachAddToRecipients(tx, existingID, msg, nil); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -658,25 +745,17 @@ func storeMsgHeaderOnly(msg *FMsgHeader) error {
 type msgFields struct {
 	parentPid  []byte
 	storedHash []byte
-	wire       *FMsgHeader
+	prepared   []byte
 	isTerminal bool
 }
 
 func loadMsgFields(tx *sql.Tx, msgID int64) (*msgFields, error) {
 	var m msgFields
-	var prepared []byte
-	if err := tx.QueryRow(`SELECT psha256,sha256,is_terminal,wire_message FROM msg WHERE id=$1 AND time_sent IS NOT NULL`, msgID).Scan(&m.parentPid, &m.storedHash, &m.isTerminal, &prepared); err != nil {
+	if err := tx.QueryRow(`SELECT psha256,sha256,is_terminal,wire_message FROM msg WHERE id=$1 AND time_sent IS NOT NULL`, msgID).Scan(&m.parentPid, &m.storedHash, &m.isTerminal, &m.prepared); err != nil {
 		return nil, err
 	}
 	if len(m.storedHash) != 32 {
 		return nil, fmt.Errorf("message %d has no finalized identity", msgID)
-	}
-	if len(prepared) > 0 {
-		var err error
-		m.wire, err = fmsg.UnmarshalPrepared(prepared, m.storedHash)
-		if err != nil {
-			return nil, fmt.Errorf("load prepared msg %d: %w", msgID, err)
-		}
 	}
 	return &m, nil
 }
@@ -802,10 +881,13 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 	}
 
 	var h *FMsgHeader
-	if m.wire != nil {
-		h = m.wire.Clone()
+	if len(m.prepared) > 0 {
+		h, err = fmsg.UnmarshalPreparedHeader(m.prepared)
+		if err != nil {
+			return nil, fmt.Errorf("load prepared msg %d: %w", msgID, err)
+		}
 	}
-	if m.wire == nil {
+	if h == nil {
 		// When the original arrived through add-to, its batch retains the
 		// exact wire payloads; the API files have already been expanded.
 		batches, err := loadAddToBatches(tx, msgID)
@@ -814,7 +896,7 @@ func loadMsg(tx *sql.Tx, msgID int64) (*FMsgHeader, error) {
 		}
 		for _, b := range batches {
 			if len(b.Prepared) > 0 {
-				h, err = fmsg.UnmarshalPrepared(b.Prepared, b.Hash)
+				h, err = fmsg.UnmarshalPreparedHeader(b.Prepared)
 				if err != nil {
 					return nil, err
 				}

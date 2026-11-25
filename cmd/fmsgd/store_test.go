@@ -2,8 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"io"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeParentLinkStore struct {
@@ -223,5 +230,217 @@ func TestInboundRecipientRow(t *testing.T) {
 	delivered, code = inboundRecipientRow(remote, outcome, now)
 	if delivered != nil || code != int16(localResponseCodeNotOurDelivery) {
 		t.Fatalf("remote: got (%v, %v), want (nil, %d)", delivered, code, localResponseCodeNotOurDelivery)
+	}
+}
+
+type fakeExecRecord struct {
+	query string
+	args  []driver.NamedValue
+}
+
+type fakeSQLConnector struct {
+	mu          sync.Mutex
+	execRecords []fakeExecRecord
+	queryRowVal int64
+}
+
+func (c *fakeSQLConnector) Connect(context.Context) (driver.Conn, error) {
+	return &fakeSQLConn{connector: c}, nil
+}
+
+func (c *fakeSQLConnector) Driver() driver.Driver { return fakeSQLDriver{} }
+
+type fakeSQLDriver struct{}
+
+func (fakeSQLDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("unexpected Open")
+}
+
+type fakeSQLConn struct {
+	connector *fakeSQLConnector
+}
+
+func (c *fakeSQLConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("Prepare not implemented")
+}
+
+func (c *fakeSQLConn) Close() error { return nil }
+
+func (c *fakeSQLConn) Begin() (driver.Tx, error) { return fakeSQLTx{}, nil }
+
+func (c *fakeSQLConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return fakeSQLTx{}, nil
+}
+
+func (c *fakeSQLConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	return &fakeSQLRows{val: c.connector.queryRowVal}, nil
+}
+
+func (c *fakeSQLConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.connector.mu.Lock()
+	copied := append([]driver.NamedValue(nil), args...)
+	c.connector.execRecords = append(c.connector.execRecords, fakeExecRecord{query: query, args: copied})
+	c.connector.mu.Unlock()
+	return driver.RowsAffected(1), nil
+}
+
+type fakeSQLTx struct{}
+
+func (fakeSQLTx) Commit() error   { return nil }
+func (fakeSQLTx) Rollback() error { return nil }
+
+type fakeSQLRows struct {
+	val  int64
+	done bool
+}
+
+func (r *fakeSQLRows) Columns() []string { return []string{"id"} }
+func (r *fakeSQLRows) Close() error      { return nil }
+func (r *fakeSQLRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.val
+	return nil
+}
+
+func TestSenderPoolSaturationDoesNotStarveInboundPool(t *testing.T) {
+	origOpen := openDBPool
+	closeDB()
+	closeSenderDB()
+	t.Cleanup(func() {
+		closeDB()
+		closeSenderDB()
+		openDBPool = origOpen
+	})
+
+	conn := &fakeSQLConnector{queryRowVal: 42}
+	openDBPool = func() (*sql.DB, error) {
+		return sql.OpenDB(conn), nil
+	}
+
+	sDB, err := getSenderDB()
+	if err != nil {
+		t.Fatalf("getSenderDB: %v", err)
+	}
+	inDB, err := getDB()
+	if err != nil {
+		t.Fatalf("getDB: %v", err)
+	}
+	if sDB == inDB {
+		t.Fatal("sender pool and inbound pool must be distinct *sql.DB instances")
+	}
+
+	// Fill every single connection in the sender pool with open transactions.
+	heldTxs := make([]*sql.Tx, 0, senderDBMaxOpenConns)
+	defer func() {
+		for _, tx := range heldTxs {
+			_ = tx.Rollback()
+		}
+	}()
+	for i := 0; i < senderDBMaxOpenConns; i++ {
+		tx, err := sDB.Begin()
+		if err != nil {
+			t.Fatalf("sender Begin #%d: %v", i, err)
+		}
+		heldTxs = append(heldTxs, tx)
+	}
+
+	// Queue additional Begin calls beyond senderDBMaxOpenConns to confirm the
+	// sender pool is genuinely saturated and blocking.
+	const extraWaiters = 4
+	extraDone := make(chan *sql.Tx, extraWaiters)
+	var wg sync.WaitGroup
+	for i := 0; i < extraWaiters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tx, err := sDB.Begin()
+			if err != nil {
+				t.Errorf("extra sender Begin: %v", err)
+				return
+			}
+			extraDone <- tx
+		}()
+	}
+
+	// Wait briefly until at least one extra waiter is blocked on the sender pool.
+	deadline := time.Now().Add(time.Second)
+	for sDB.Stats().WaitCount == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := sDB.Stats(); stats.InUse != senderDBMaxOpenConns || stats.WaitCount == 0 {
+		t.Fatalf("expected saturated sender pool (inUse=%d/%d, waitCount=%d)", stats.InUse, senderDBMaxOpenConns, stats.WaitCount)
+	}
+
+	// While the sender pool is completely saturated, an inbound getDB() query
+	// must complete immediately without blocking.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var got int64
+	if err := inDB.QueryRowContext(ctx, "SELECT id FROM msg WHERE sha256 = $1", []byte{1}).Scan(&got); err != nil {
+		t.Fatalf("inbound query blocked or failed while sender pool saturated: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("inbound query returned %d, want 42", got)
+	}
+	id, err := lookupMsgIdByHash([]byte{1, 2, 3})
+	if err != nil || id != 42 {
+		t.Fatalf("lookupMsgIdByHash = (%d, %v), want (42, nil)", id, err)
+	}
+
+	// Release held sender transactions and drain the queued waiters cleanly.
+	for _, tx := range heldTxs {
+		_ = tx.Rollback()
+	}
+	heldTxs = nil
+	wg.Wait()
+	close(extraDone)
+	for tx := range extraDone {
+		_ = tx.Rollback()
+	}
+}
+
+func TestUpdateRecipientSQL(t *testing.T) {
+	conn := &fakeSQLConnector{}
+	db := sql.OpenDB(conn)
+	t.Cleanup(func() { _ = db.Close() })
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	cases := []struct {
+		name      string
+		table     string
+		delivered bool
+		wantTable string
+		wantScope string
+		wantID    int64
+		wantSet   string
+	}{
+		{"msg_to delivered", "msg_to", true, "UPDATE msg_to SET", "WHERE msg_id = $3 AND addr = $4", 10, "time_delivered = $1, response_code = $2"},
+		{"msg_to failed", "msg_to", false, "UPDATE msg_to SET", "WHERE msg_id = $3 AND addr = $4", 10, "time_last_attempt = $1, response_code = $2"},
+		{"msg_add_to delivered", "msg_add_to", true, "UPDATE msg_add_to SET", "WHERE batch_id = $3 AND addr = $4", 20, "time_delivered = $1, response_code = $2"},
+		{"msg_add_to failed", "msg_add_to", false, "UPDATE msg_add_to SET", "WHERE batch_id = $3 AND addr = $4", 20, "time_last_attempt = $1, response_code = $2"},
+	}
+
+	for i, tc := range cases {
+		if err := updateRecipient(tx, tc.table, "@bob@example.com", 10, 20, 1234.5, 200, tc.delivered); err != nil {
+			t.Fatalf("%s: updateRecipient error: %v", tc.name, err)
+		}
+		rec := conn.execRecords[i]
+		if !strings.Contains(rec.query, tc.wantTable) || !strings.Contains(rec.query, tc.wantScope) || !strings.Contains(rec.query, tc.wantSet) {
+			t.Fatalf("%s: unexpected SQL:\n%s", tc.name, rec.query)
+		}
+		if !tc.delivered && !strings.Contains(rec.query, "attempt_count = attempt_count + 1") {
+			t.Fatalf("%s: missing attempt_count increment in SQL:\n%s", tc.name, rec.query)
+		}
+		if len(rec.args) != 4 || rec.args[2].Value != tc.wantID || rec.args[3].Value != "@bob@example.com" {
+			t.Fatalf("%s: unexpected args: %+v", tc.name, rec.args)
+		}
 	}
 }

@@ -3,9 +3,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -815,5 +821,340 @@ func TestHandleAddToParentNotStoredParticipantOnly(t *testing.T) {
 	}
 	if got := c.Buffer.Bytes(); len(got) != 1 || got[0] != RejectCodeParentNotFound {
 		t.Fatalf("wrote %v, want single code %d (parent not found)", got, RejectCodeParentNotFound)
+	}
+}
+
+func TestReadAttachmentHeadersRejectsUint32SizeOverflow(t *testing.T) {
+	origMax := MaxMessageSize
+	origExpanded := MaxExpandedSize
+	MaxMessageSize = 1024
+	MaxExpandedSize = 1024
+	t.Cleanup(func() {
+		MaxMessageSize = origMax
+		MaxExpandedSize = origExpanded
+	})
+
+	// Two attachments of size 0x80000001 each would wrap uint32 to 2 (<= 1024).
+	h := &FMsgHeader{Size: 0}
+	c := &testConn{}
+	b := []byte{2} // 2 attachments
+	for _, name := range []string{"a.bin", "b.bin"} {
+		b = append(b, 0)
+		b = append(b, encodeUInt8String(t, "application/octet-stream")...)
+		b = append(b, encodeUInt8String(t, name)...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], 0x80000001)
+		b = append(b, sz[:]...)
+	}
+
+	err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatal("expected error for uint32 size overflow")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeTooBig {
+		t.Fatalf("wrote %v, want single code %d (too big)", got, RejectCodeTooBig)
+	}
+}
+
+func TestReadAttachmentHeadersInvalidPrecedesTooBig(t *testing.T) {
+	t.Run("wire size exceeds max before later reserved attachment flag", func(t *testing.T) {
+		origMax := MaxMessageSize
+		origExpanded := MaxExpandedSize
+		MaxMessageSize = 100
+		MaxExpandedSize = 100
+		t.Cleanup(func() {
+			MaxMessageSize = origMax
+			MaxExpandedSize = origExpanded
+		})
+
+		h := &FMsgHeader{Size: 10}
+		c := &testConn{}
+		b := []byte{2} // 2 attachments
+
+		// Attachment 1: valid header, size 200 (> MaxMessageSize=100)
+		b = append(b, 0)
+		b = append(b, encodeUInt8String(t, "text/plain")...)
+		b = append(b, encodeUInt8String(t, "big.txt")...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], 200)
+		b = append(b, sz[:]...)
+
+		// Attachment 2: reserved flag bit 2 set -> SPEC §10.3 step 3 (code 1 invalid)
+		b = append(b, 1<<2)
+
+		err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+		if err == nil {
+			t.Fatal("expected error for reserved attachment flag bit")
+		}
+		if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+			t.Fatalf("wrote %v, want single code %d (invalid), not %d (too big)", got, RejectCodeInvalid, RejectCodeTooBig)
+		}
+	})
+
+	t.Run("expanded size exceeds max before later reserved attachment flag", func(t *testing.T) {
+		origMax := MaxMessageSize
+		origExpanded := MaxExpandedSize
+		MaxMessageSize = 1024
+		MaxExpandedSize = 100
+		t.Cleanup(func() {
+			MaxMessageSize = origMax
+			MaxExpandedSize = origExpanded
+		})
+
+		h := &FMsgHeader{Size: 0}
+		c := &testConn{}
+		b := []byte{2} // 2 attachments
+
+		// Attachment 1: compressed, expanded size 200 (> MaxExpandedSize=100)
+		b = append(b, 1<<1)
+		b = append(b, encodeUInt8String(t, "text/plain")...)
+		b = append(b, encodeUInt8String(t, "big.txt")...)
+		var sz [4]byte
+		binary.LittleEndian.PutUint32(sz[:], 50)
+		b = append(b, sz[:]...)
+		binary.LittleEndian.PutUint32(sz[:], 200)
+		b = append(b, sz[:]...)
+
+		// Attachment 2: reserved flag bit 2 set -> SPEC §10.3 step 3 (code 1 invalid)
+		b = append(b, 1<<2)
+
+		err := readAttachmentHeaders(c, bufio.NewReader(bytes.NewReader(b)), h)
+		if err == nil {
+			t.Fatal("expected error for reserved attachment flag bit")
+		}
+		if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+			t.Fatalf("wrote %v, want single code %d (invalid), not %d (too big)", got, RejectCodeInvalid, RejectCodeTooBig)
+		}
+	})
+}
+
+func TestHandleChallengeTruncatedNoPanic(t *testing.T) {
+	initOutgoing()
+	c := &testConn{}
+	// Only 5 bytes instead of 32: must return an error without panicking.
+	err := handleChallenge(c, bufio.NewReader(bytes.NewReader([]byte{1, 2, 3, 4, 5})))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("handleChallenge truncated err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestReadUInt8SliceTruncatedErrors(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(10)
+	buf.WriteString("short")
+	if _, err := ReadUInt8Slice(&buf); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadUInt8Slice truncated err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestReadToRecipientsDuplicateSendsRejectCodeInvalid(t *testing.T) {
+	b := []byte{2}
+	b = append(b, encodeUInt8String(t, "@alice@example.com")...)
+	b = append(b, encodeUInt8String(t, "@ALICE@example.com")...)
+
+	c := &testConn{}
+	h := &FMsgHeader{}
+	err := readToRecipients(c, bufio.NewReader(bytes.NewReader(b)), h)
+	if err == nil {
+		t.Fatal("expected duplicate recipient error")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("wrote %v, want single code %d (invalid)", got, RejectCodeInvalid)
+	}
+}
+
+func TestHandleAddToPathAttachmentCountMismatch(t *testing.T) {
+	stubStoredParent(t, storedParentForTest(t, 0))
+	h := addToForTest()
+	h.Attachments = []FMsgAttachmentHeader{{Filename: "extra.txt", Type: "text/plain", Size: 1}}
+	c := &testConn{}
+	if _, err := handleAddToPath(c, h); err == nil {
+		t.Fatal("expected error for add-to attachment count mismatch")
+	}
+	if got := c.Bytes(); len(got) != 1 || got[0] != RejectCodeInvalid {
+		t.Fatalf("wrote %v, want single code %d (invalid)", got, RejectCodeInvalid)
+	}
+}
+
+func TestIsMessageRetrievableCycleGuard(t *testing.T) {
+	origLookup, origGet := lookupMsgIdByHashFn, getMsgByIDFn
+	t.Cleanup(func() {
+		lookupMsgIdByHashFn, getMsgByIDFn = origLookup, origGet
+	})
+
+	pidA := bytes.Repeat([]byte{0xAA}, 32)
+	pidB := bytes.Repeat([]byte{0xBB}, 32)
+	msgA := &FMsgHeader{Pid: pidB}
+	msgB := &FMsgHeader{Pid: pidA}
+	lookupMsgIdByHashFn = func(hash []byte) (int64, error) {
+		if bytes.Equal(hash, pidB) {
+			return 2, nil
+		}
+		if bytes.Equal(hash, pidA) {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	getMsgByIDFn = func(id int64) (*FMsgHeader, error) {
+		if id == 1 {
+			return msgA, nil
+		}
+		if id == 2 {
+			return msgB, nil
+		}
+		return nil, nil
+	}
+
+	if isMessageRetrievable(msgA) {
+		t.Fatal("expected cyclic missing messages to be non-retrievable")
+	}
+}
+
+func TestCopyMessagePayloadRejectsZlibBomb(t *testing.T) {
+	dir := t.TempDir()
+	bomb := make([]byte, 1<<20)
+	srcPath := filepath.Join(dir, "bomb.z")
+	sf, err := os.Create(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zlib.NewWriter(sf)
+	if _, err := zw.Write(bomb); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wireSize, _ := sf.Seek(0, io.SeekCurrent)
+
+	dstFile, dstPath, err := uniqueFilepath(dir, 12345, ".txt")
+	if err != nil {
+		sf.Close()
+		t.Fatal(err)
+	}
+
+	err = copyMessagePayload(sf, dstFile, true, uint32(wireSize), 128)
+	sf.Close()
+	if err == nil {
+		t.Fatal("copyMessagePayload accepted zlib bomb")
+	}
+	if _, statErr := os.Stat(dstPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected failed dst file %s to be removed, stat err=%v", dstPath, statErr)
+	}
+}
+
+func TestUniqueFilepathAtomicCreation(t *testing.T) {
+	dir := t.TempDir()
+
+	// Concurrent creation with the same timestamp must produce distinct files.
+	const n = 16
+	paths := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f, p, err := uniqueFilepath(dir, 1700000000, ".txt")
+			if err != nil {
+				t.Errorf("uniqueFilepath error: %v", err)
+				return
+			}
+			_ = f.Close()
+			paths <- p
+		}()
+	}
+	wg.Wait()
+	close(paths)
+
+	seen := make(map[string]bool)
+	for p := range paths {
+		if seen[p] {
+			t.Fatalf("duplicate path created: %s", p)
+		}
+		seen[p] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("created %d unique files, want %d", len(seen), n)
+	}
+
+	// Non-existent directory must return an error immediately (not loop).
+	if _, _, err := uniqueFilepath(filepath.Join(dir, "does-not-exist"), 1, ".txt"); err == nil {
+		t.Fatal("expected error for missing directory")
+	}
+}
+
+func TestBuildDomainRecipsToIntersectAddToLocking(t *testing.T) {
+	bob := FMsgAddress{User: "bob", Domain: "remote.example"}
+	carol := FMsgAddress{User: "carol", Domain: "remote.example"}
+	h := &FMsgHeader{
+		Flags: FlagHasPid | FlagHasAddTo,
+		To:    []FMsgAddress{bob, {User: "other", Domain: "other.example"}},
+		AddTo: []FMsgAddress{bob, carol},
+	}
+
+	// Delivering msg_add_to where bob is in both To and AddTo:
+	// only the AddTo entry for bob should be marked isLocked.
+	recips := buildDomainRecips(h, "remote.example", "msg_add_to", []string{"@bob@remote.example", "@carol@remote.example"})
+	if len(recips) != 3 {
+		t.Fatalf("len(recips) = %d, want 3 (bob from To, bob & carol from AddTo)", len(recips))
+	}
+	if recips[0].addr != "@bob@remote.example" || recips[0].isLocked {
+		t.Fatalf("To entry recips[0] = %+v, want isLocked=false", recips[0])
+	}
+	if recips[1].addr != "@bob@remote.example" || !recips[1].isLocked {
+		t.Fatalf("AddTo entry recips[1] = %+v, want isLocked=true", recips[1])
+	}
+	if recips[2].addr != "@carol@remote.example" || !recips[2].isLocked {
+		t.Fatalf("AddTo entry recips[2] = %+v, want isLocked=true", recips[2])
+	}
+
+	// Delivering msg_to: only the To entry for bob should be marked isLocked.
+	recipsTo := buildDomainRecips(h, "remote.example", "msg_to", []string{"@bob@remote.example"})
+	if len(recipsTo) != 3 {
+		t.Fatalf("len(recipsTo) = %d, want 3", len(recipsTo))
+	}
+	if !recipsTo[0].isLocked || recipsTo[1].isLocked || recipsTo[2].isLocked {
+		t.Fatalf("msg_to locking mismatch: %+v", recipsTo)
+	}
+}
+
+func TestValidateDNSSECResults(t *testing.T) {
+	v4 := net.ParseIP("192.0.2.1")
+	v6 := net.ParseIP("2001:db8::1")
+
+	// Unsigned A + signed AAAA NODATA must fail (regression check).
+	_, err := validateDNSSECResults("fmsg.example.com",
+		dnssecQueryResult{ips: []net.IP{v4}, ad: false},
+		dnssecQueryResult{ips: nil, ad: true},
+	)
+	if err == nil {
+		t.Fatal("accepted unsigned A record because AAAA had signed NODATA")
+	}
+
+	// Signed A + unsigned AAAA must fail.
+	_, err = validateDNSSECResults("fmsg.example.com",
+		dnssecQueryResult{ips: []net.IP{v4}, ad: true},
+		dnssecQueryResult{ips: []net.IP{v6}, ad: false},
+	)
+	if err == nil {
+		t.Fatal("accepted unsigned AAAA record alongside signed A")
+	}
+
+	// Signed A + signed AAAA NODATA succeeds and returns verified A IP.
+	ips, err := validateDNSSECResults("fmsg.example.com",
+		dnssecQueryResult{ips: []net.IP{v4}, ad: true},
+		dnssecQueryResult{ips: nil, ad: true},
+	)
+	if err != nil || len(ips) != 1 || !ips[0].Equal(v4) {
+		t.Fatalf("signed A + signed NODATA AAAA = (%v, %v), want [%s]", ips, err, v4)
+	}
+
+	// Signed A + signed AAAA returns both verified IPs.
+	ips, err = validateDNSSECResults("fmsg.example.com",
+		dnssecQueryResult{ips: []net.IP{v4}, ad: true},
+		dnssecQueryResult{ips: []net.IP{v6}, ad: true},
+	)
+	if err != nil || len(ips) != 2 || !ips[0].Equal(v4) || !ips[1].Equal(v6) {
+		t.Fatalf("signed A + signed AAAA = (%v, %v), want [%s %s]", ips, err, v4, v6)
 	}
 }

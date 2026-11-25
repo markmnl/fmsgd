@@ -461,6 +461,34 @@ func TestHashPayloadDeflatedSizeMismatch(t *testing.T) {
 	}
 }
 
+func TestHashPayloadDeflatedRejectsZlibBomb(t *testing.T) {
+	// 1 MiB of zeros compresses to ~1 KiB; declare expandedSize = 100.
+	bomb := make([]byte, 1<<20)
+	f, err := os.CreateTemp(t.TempDir(), "fmsg-bomb-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zlib.NewWriter(f)
+	if _, err := zw.Write(bomb); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wireSize, _ := f.Seek(0, 1)
+	f.Close()
+
+	var dst bytes.Buffer
+	const declared uint32 = 100
+	err = fmsg.HashPayload(&dst, f.Name(), wireSize, true, declared)
+	if err == nil {
+		t.Fatal("HashPayload() accepted zlib bomb exceeding declared expanded size")
+	}
+	if dst.Len() > int(declared)+1 {
+		t.Fatalf("HashPayload() wrote %d bytes before stopping, want <= %d", dst.Len(), declared+1)
+	}
+}
+
 // ── Common media types ────────────────────────────────────────────────────────
 
 func TestGetCommonMediaType(t *testing.T) {

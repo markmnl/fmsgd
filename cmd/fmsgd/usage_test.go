@@ -128,3 +128,46 @@ func TestRecordRecvUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestGetAddressDetailStatusCodes(t *testing.T) {
+	status := http.StatusOK
+	body := `{"address":"@alice@example.com","acceptingNew":true}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	origURI := IDURI
+	IDURI = srv.URL
+	defer func() { IDURI = origURI }()
+
+	addr := &FMsgAddress{User: "alice", Domain: "example.com"}
+
+	// 200 OK decodes detail
+	detail, err := getAddressDetail(addr)
+	if err != nil || detail == nil || !detail.AcceptingNew {
+		t.Fatalf("200 OK: got (%+v, %v), want AcceptingNew=true", detail, err)
+	}
+
+	// 404 Not Found returns nil, nil
+	status = http.StatusNotFound
+	body = `{"error":"not found"}`
+	detail, err = getAddressDetail(addr)
+	if err != nil || detail != nil {
+		t.Fatalf("404: got (%+v, %v), want (nil, nil)", detail, err)
+	}
+
+	// 500/503 returns an error rather than decoding into a zero AddressDetail
+	for _, code := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		status = code
+		body = `{"error":"upstream failed"}`
+		detail, err = getAddressDetail(addr)
+		if err == nil {
+			t.Fatalf("status %d: expected error, got detail=%+v", code, detail)
+		}
+		if detail != nil {
+			t.Fatalf("status %d: expected nil detail on error, got %+v", code, detail)
+		}
+	}
+}

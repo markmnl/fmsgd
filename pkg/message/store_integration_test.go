@@ -236,3 +236,53 @@ func TestFinalizeDraftBatchesAndRollback(t *testing.T) {
 		t.Fatal("rollback stamped message", err)
 	}
 }
+
+func TestFinalizeBatchRejectsCorruptedPayload(t *testing.T) {
+	db, _ := testStore(t)
+	root := insertDraft(t, db, nil, "root payload for corruption check")
+	seal(t, db, root)
+
+	var prepared []byte
+	if err := db.QueryRow(`SELECT wire_message FROM msg WHERE id=$1`, root).Scan(&prepared); err != nil {
+		t.Fatal(err)
+	}
+	h, err := fmsg.UnmarshalPreparedHeader(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origBytes, err := os.ReadFile(h.Filepath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupted := append([]byte(nil), origBytes...)
+	corrupted[0] ^= 0xff
+	if err := os.WriteFile(h.Filepath, corrupted, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	var batch int64
+	if err := tx.QueryRow(`INSERT INTO msg_add_to_batch(msg_id,add_to_from,time_added) VALUES($1,'@alice@example.com',1235.5) RETURNING id`, root).Scan(&batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO msg_add_to(msg_id,batch_id,addr) VALUES($1,$2,'@carol@example.com')`, root, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := FinalizeBatch(context.Background(), SQLTx{tx}, root, batch); err == nil {
+		t.Fatal("FinalizeBatch accepted corrupted stored payload")
+	}
+
+	var batchHash []byte
+	if err := tx.QueryRow(`SELECT sha256 FROM msg_add_to_batch WHERE id=$1`, batch).Scan(&batchHash); err != nil {
+		t.Fatal(err)
+	}
+	if len(batchHash) != 0 {
+		t.Fatalf("corrupted batch was unexpectedly sealed with hash %x", batchHash)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -14,25 +15,45 @@ import (
 	"github.com/miekg/dns"
 )
 
+const (
+	// dnsLookupTimeout bounds a single per-nameserver DNSSEC UDP/TCP exchange.
+	dnsLookupTimeout = 5 * time.Second
+	// resolverLookupTimeout bounds the full non-DNSSEC net.Resolver lookup so
+	// Go's stub resolver retains headroom for retries and nameserver failover
+	// (resolv.conf defaults to 5s per attempt).
+	resolverLookupTimeout = 20 * time.Second
+)
+
+var (
+	dnsClient           = &dns.Client{Timeout: dnsLookupTimeout}
+	dnsTCPClient        = &dns.Client{Net: "tcp", Timeout: dnsLookupTimeout}
+	lookupIPWithContext = func(ctx context.Context, network, host string) ([]net.IP, error) {
+		return net.DefaultResolver.LookupIP(ctx, network, host)
+	}
+)
+
 func dnssecRequired() bool {
 	return os.Getenv("FMSG_REQUIRE_DNSSEC") == "true"
 }
 
-func resolverAuthenticatedData(name string, qtype uint16) (bool, error) {
-	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
-	if err != nil {
-		return false, err
-	}
+type dnssecQueryResult struct {
+	ips []net.IP
+	ad  bool
+	err error
+}
 
+func queryDNSSEC(cfg *dns.ClientConfig, name string, qtype uint16) dnssecQueryResult {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(name), qtype)
 	msg.SetEdns0(4096, true)
 
-	client := &dns.Client{Timeout: 5 * time.Second}
 	var lastErr error
 	for _, server := range cfg.Servers {
 		addr := net.JoinHostPort(server, cfg.Port)
-		resp, _, err := client.Exchange(msg, addr)
+		resp, _, err := dnsClient.Exchange(msg, addr)
+		if err == nil && resp != nil && resp.Truncated {
+			resp, _, err = dnsTCPClient.Exchange(msg, addr)
+		}
 		if err != nil {
 			lastErr = err
 			continue
@@ -45,35 +66,79 @@ func resolverAuthenticatedData(name string, qtype uint16) (bool, error) {
 			lastErr = fmt.Errorf("dns rcode %d from %s", resp.Rcode, addr)
 			continue
 		}
-		return resp.AuthenticatedData, nil
+		var ips []net.IP
+		for _, rr := range resp.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				if qtype == dns.TypeA && r.A != nil {
+					ips = append(ips, r.A)
+				}
+			case *dns.AAAA:
+				if qtype == dns.TypeAAAA && r.AAAA != nil {
+					ips = append(ips, r.AAAA)
+				}
+			}
+		}
+		return dnssecQueryResult{ips: ips, ad: resp.AuthenticatedData}
 	}
 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no DNS resolvers configured")
 	}
-	return false, lastErr
+	return dnssecQueryResult{err: lastErr}
+}
+
+func validateDNSSECResults(fmsgDomain string, resA, resAAAA dnssecQueryResult) ([]net.IP, error) {
+	if resA.err != nil && resAAAA.err != nil {
+		return nil, fmt.Errorf("dnssec validation failed for %s: A=%v AAAA=%v", fmsgDomain, resA.err, resAAAA.err)
+	}
+	if resA.err == nil && len(resA.ips) > 0 && !resA.ad {
+		return nil, fmt.Errorf("dnssec validation failed for %s: A response missing AD bit", fmsgDomain)
+	}
+	if resAAAA.err == nil && len(resAAAA.ips) > 0 && !resAAAA.ad {
+		return nil, fmt.Errorf("dnssec validation failed for %s: AAAA response missing AD bit", fmsgDomain)
+	}
+
+	var verified []net.IP
+	if resA.err == nil && resA.ad {
+		verified = append(verified, resA.ips...)
+	}
+	if resAAAA.err == nil && resAAAA.ad {
+		verified = append(verified, resAAAA.ips...)
+	}
+	if len(verified) == 0 {
+		if resA.err != nil {
+			return nil, fmt.Errorf("dnssec validation failed for %s: A=%v", fmsgDomain, resA.err)
+		}
+		if resAAAA.err != nil {
+			return nil, fmt.Errorf("dnssec validation failed for %s: AAAA=%v", fmsgDomain, resAAAA.err)
+		}
+		return nil, fmt.Errorf("no DNSSEC-verified A/AAAA records found for %s", fmsgDomain)
+	}
+	return verified, nil
 }
 
 // lookupAuthorisedIPs resolves fmsg.<domain> for A and AAAA records
 func lookupAuthorisedIPs(domain string) ([]net.IP, error) {
 	fmsgDomain := "fmsg." + domain
-	ips, err := net.LookupIP(fmsgDomain)
+	if dnssecRequired() {
+		cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		if err != nil {
+			return nil, fmt.Errorf("dnssec validation failed for %s: %w", fmsgDomain, err)
+		}
+		resA := queryDNSSEC(cfg, fmsgDomain, dns.TypeA)
+		resAAAA := queryDNSSEC(cfg, fmsgDomain, dns.TypeAAAA)
+		return validateDNSSECResults(fmsgDomain, resA, resAAAA)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), resolverLookupTimeout)
+	defer cancel()
+	ips, err := lookupIPWithContext(ctx, "ip", fmsgDomain)
 	if err != nil {
 		return nil, fmt.Errorf("DNS lookup for %s failed: %w", fmsgDomain, err)
 	}
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no A/AAAA records found for %s", fmsgDomain)
-	}
-
-	if dnssecRequired() {
-		adA, errA := resolverAuthenticatedData(fmsgDomain, dns.TypeA)
-		adAAAA, errAAAA := resolverAuthenticatedData(fmsgDomain, dns.TypeAAAA)
-		if !adA && !adAAAA {
-			if errA != nil && errAAAA != nil {
-				return nil, fmt.Errorf("dnssec validation failed for %s: A=%v AAAA=%v", fmsgDomain, errA, errAAAA)
-			}
-			return nil, fmt.Errorf("dnssec validation failed for %s: resolver did not set AD bit", fmsgDomain)
-		}
 	}
 
 	return ips, nil

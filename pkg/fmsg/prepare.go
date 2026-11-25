@@ -9,13 +9,18 @@ import (
 	"path/filepath"
 )
 
-// Clone returns a header with independent slices and no cached hashes.
+// Clone returns a header with independent slices/pointers and no cached hashes.
 func (h *Header) Clone() *Header {
 	c := *h
 	c.Pid = append([]byte(nil), h.Pid...)
 	c.To = append([]Address(nil), h.To...)
+	if h.AddToFrom != nil {
+		addr := *h.AddToFrom
+		c.AddToFrom = &addr
+	}
 	c.AddTo = append([]Address(nil), h.AddTo...)
 	c.Attachments = append([]AttachmentHeader(nil), h.Attachments...)
+	c.StoredWire = append([]byte(nil), h.StoredWire...)
 	c.HeaderHash, c.messageHash = nil, nil
 	return &c
 }
@@ -175,15 +180,17 @@ func preparePart(src string, size uint32, typ, dst string) (string, uint32, uint
 	if !info.Mode().IsRegular() || info.Size() != int64(size) {
 		return "", 0, 0, fmt.Errorf("payload length differs from metadata: %s", src)
 	}
-	expanded := uint32(0)
 	if ShouldCompress(typ, size) {
-		path, compressed, useful, err := TryCompress(src, size)
+		path, compressed, useful, err := tryCompressInDir(src, size, filepath.Dir(dst), true)
 		if err != nil {
 			return "", 0, 0, err
 		}
 		if useful {
-			defer os.Remove(path)
-			src, size, expanded = path, compressed, size
+			if err := os.Rename(path, dst); err != nil {
+				_ = os.Remove(path)
+				return "", 0, 0, err
+			}
+			return dst, compressed, size, nil
 		}
 	}
 	in, err := os.Open(src)
@@ -203,7 +210,7 @@ func preparePart(src string, size uint32, typ, dst string) (string, uint32, uint
 	if err == nil {
 		err = closeErr
 	}
-	return dst, size, expanded, err
+	return dst, size, 0, err
 }
 
 // MarshalPrepared stores an internal, versioned snapshot, including durable
@@ -215,9 +222,10 @@ func MarshalPrepared(h *Header) ([]byte, error) {
 	}{1, h.Clone()})
 }
 
-// UnmarshalPrepared verifies the snapshot against the persisted protocol hash.
-// A missing or corrupt payload is an error, never a reason to re-encode it.
-func UnmarshalPrepared(data, expected []byte) (*Header, error) {
+// UnmarshalPreparedHeader decodes a stored prepared message snapshot for its
+// header fields only without re-hashing payload files from disk. Use
+// UnmarshalPrepared when full payload integrity verification is required.
+func UnmarshalPreparedHeader(data []byte) (*Header, error) {
 	var s struct {
 		Version int
 		Header  *Header
@@ -228,7 +236,16 @@ func UnmarshalPrepared(data, expected []byte) (*Header, error) {
 	if s.Version != 1 || s.Header == nil {
 		return nil, fmt.Errorf("unsupported prepared message")
 	}
-	h := s.Header.Clone()
+	return s.Header.Clone(), nil
+}
+
+// UnmarshalPrepared verifies the snapshot against the persisted protocol hash.
+// A missing or corrupt payload is an error, never a reason to re-encode it.
+func UnmarshalPrepared(data, expected []byte) (*Header, error) {
+	h, err := UnmarshalPreparedHeader(data)
+	if err != nil {
+		return nil, err
+	}
 	hash, err := h.GetMessageHash()
 	if err != nil {
 		return nil, err
