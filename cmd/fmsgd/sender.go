@@ -50,6 +50,15 @@ func loadSenderEnvConfig() {
 	RetryMaxAge = env.GetFloatDefault("FMSG_RETRY_MAX_AGE", 86400)
 	PollInterval = env.GetIntDefault("FMSG_POLL_INTERVAL", 10)
 	MaxConcurrentSend = env.GetIntDefault("FMSG_MAX_CONCURRENT_SEND", 1024)
+	SenderDBMaxConns = max(2, env.GetIntDefault("FMSG_SENDER_DB_MAX_CONNS", 32))
+}
+
+// deliverySlots is how many deliveries may run at once. A delivery holds one
+// connection from the sender's database pool for its whole exchange, so the
+// pool bounds it as well as FMSG_MAX_CONCURRENT_SEND; one connection is kept
+// back for the query that finds pending work.
+func deliverySlots(maxConcurrentSend, senderDBMaxConns int) int {
+	return max(1, min(maxConcurrentSend, senderDBMaxConns-1))
 }
 
 // pendingTarget identifies a (message, domain) pair that needs delivery.
@@ -633,6 +642,7 @@ func deliverUnit(db *sql.DB, target pendingTarget, prepared, expectedHash []byte
 	targetIPs, err := lookupAuthorisedIPs(target.Domain)
 	if err != nil {
 		log.Printf("ERROR: sender: DNS lookup for fmsg.%s failed: %s", target.Domain, err)
+		outboundDomains.setReachable(target.Domain, false)
 		return
 	}
 
@@ -640,9 +650,11 @@ func deliverUnit(db *sql.DB, target pendingTarget, prepared, expectedHash []byte
 	conn := dialTargetIPs(targetIPs, RemotePort, tlsConf)
 	if conn == nil {
 		log.Printf("ERROR: sender: could not connect to any IP for fmsg.%s", target.Domain)
+		outboundDomains.setReachable(target.Domain, false)
 		return
 	}
 	defer conn.Close()
+	outboundDomains.setReachable(target.Domain, true)
 
 	// Register in outgoing map with Host B's IP before sending the header so
 	// any incoming challenge can be matched by hash AND IP (§10.2 step 2).
@@ -756,13 +768,55 @@ func deliverUnit(db *sql.DB, target pendingTarget, prepared, expectedHash []byte
 	commitOrLog(tx, &committed, target.MsgID)
 }
 
+// domainReachability remembers which domains the sender could not connect to
+// on its last attempt. A domain is forgotten (reachable again) as soon as a
+// connection to it succeeds, so the set stays as small as the number of peers
+// that are down right now.
+type domainReachability struct {
+	mu          sync.Mutex
+	unreachable map[string]struct{}
+}
+
+// outboundDomains is the sender's view of which peers it can currently reach.
+var outboundDomains = &domainReachability{unreachable: make(map[string]struct{})}
+
+func (d *domainReachability) setReachable(domain string, reachable bool) {
+	k := strings.ToLower(domain)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if reachable {
+		delete(d.unreachable, k)
+	} else {
+		d.unreachable[k] = struct{}{}
+	}
+}
+
+func (d *domainReachability) isUnreachable(domain string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, down := d.unreachable[strings.ToLower(domain)]
+	return down
+}
+
+// inFlightTracker deduplicates dispatch against deliveries already running,
+// and holds a domain the sender could not connect to down to one delivery at
+// a time. That one delivery is the probe: while it fails, the rest of the
+// domain's backlog waits for a later poll instead of each taking a delivery
+// slot for the length of a connect timeout, and when it connects the domain
+// gets its full share again.
 type inFlightTracker struct {
-	mu     sync.Mutex
-	active map[pendingTarget]struct{}
+	mu        sync.Mutex
+	active    map[pendingTarget]struct{}
+	perDomain map[string]int
+	domains   *domainReachability
 }
 
 func newInFlightTracker() *inFlightTracker {
-	return &inFlightTracker{active: make(map[pendingTarget]struct{})}
+	return &inFlightTracker{
+		active:    make(map[pendingTarget]struct{}),
+		perDomain: make(map[string]int),
+		domains:   outboundDomains,
+	}
 }
 
 func (f *inFlightTracker) acquire(t pendingTarget) bool {
@@ -772,15 +826,25 @@ func (f *inFlightTracker) acquire(t pendingTarget) bool {
 	if _, exists := f.active[k]; exists {
 		return false
 	}
+	if f.perDomain[k.Domain] > 0 && f.domains.isUnreachable(k.Domain) {
+		return false
+	}
 	f.active[k] = struct{}{}
+	f.perDomain[k.Domain]++
 	return true
 }
 
 func (f *inFlightTracker) release(t pendingTarget) {
 	k := pendingTarget{MsgID: t.MsgID, Domain: strings.ToLower(t.Domain)}
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.active[k]; !exists {
+		return
+	}
 	delete(f.active, k)
-	f.mu.Unlock()
+	if f.perDomain[k.Domain]--; f.perDomain[k.Domain] <= 0 {
+		delete(f.perDomain, k.Domain)
+	}
 }
 
 // processPendingMessages finds messages needing delivery and dispatches a
@@ -821,10 +885,11 @@ func processPendingMessages(ctx context.Context, sem chan struct{}, inFlight *in
 // listens for PostgreSQL notifications for immediate pickup of new messages.
 func startSender(ctx context.Context) {
 	loadSenderEnvConfig()
-	log.Printf("INFO: sender: started (poll=%ds, retry=%.0fs, max_concurrent=%d)",
-		PollInterval, RetryInterval, MaxConcurrentSend)
+	slots := deliverySlots(MaxConcurrentSend, SenderDBMaxConns)
+	log.Printf("INFO: sender: started (poll=%ds, retry=%.0fs, max_concurrent=%d, db_max_conns=%d, deliveries_at_once=%d)",
+		PollInterval, RetryInterval, MaxConcurrentSend, SenderDBMaxConns, slots)
 
-	sem := make(chan struct{}, MaxConcurrentSend)
+	sem := make(chan struct{}, slots)
 	inFlight := newInFlightTracker()
 
 	// set up PostgreSQL LISTEN for immediate notification
