@@ -333,13 +333,13 @@ func TestSenderPoolSaturationDoesNotStarveInboundPool(t *testing.T) {
 	}
 
 	// Fill every single connection in the sender pool with open transactions.
-	heldTxs := make([]*sql.Tx, 0, senderDBMaxOpenConns)
+	heldTxs := make([]*sql.Tx, 0, SenderDBMaxConns)
 	defer func() {
 		for _, tx := range heldTxs {
 			_ = tx.Rollback()
 		}
 	}()
-	for i := 0; i < senderDBMaxOpenConns; i++ {
+	for i := 0; i < SenderDBMaxConns; i++ {
 		tx, err := sDB.Begin()
 		if err != nil {
 			t.Fatalf("sender Begin #%d: %v", i, err)
@@ -347,7 +347,7 @@ func TestSenderPoolSaturationDoesNotStarveInboundPool(t *testing.T) {
 		heldTxs = append(heldTxs, tx)
 	}
 
-	// Queue additional Begin calls beyond senderDBMaxOpenConns to confirm the
+	// Queue additional Begin calls beyond SenderDBMaxConns to confirm the
 	// sender pool is genuinely saturated and blocking.
 	const extraWaiters = 4
 	extraDone := make(chan *sql.Tx, extraWaiters)
@@ -370,8 +370,8 @@ func TestSenderPoolSaturationDoesNotStarveInboundPool(t *testing.T) {
 	for sDB.Stats().WaitCount == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if stats := sDB.Stats(); stats.InUse != senderDBMaxOpenConns || stats.WaitCount == 0 {
-		t.Fatalf("expected saturated sender pool (inUse=%d/%d, waitCount=%d)", stats.InUse, senderDBMaxOpenConns, stats.WaitCount)
+	if stats := sDB.Stats(); stats.InUse != SenderDBMaxConns || stats.WaitCount == 0 {
+		t.Fatalf("expected saturated sender pool (inUse=%d/%d, waitCount=%d)", stats.InUse, SenderDBMaxConns, stats.WaitCount)
 	}
 
 	// While the sender pool is completely saturated, an inbound getDB() query

@@ -16,9 +16,13 @@ import (
 const (
 	dbMaxOpenConns       = 48
 	dbMaxIdleConns       = 16
-	senderDBMaxOpenConns = 32
 	senderDBMaxIdleConns = 8
 )
+
+// SenderDBMaxConns is the size of the sender's database pool
+// (FMSG_SENDER_DB_MAX_CONNS). A delivery holds one connection for its whole
+// exchange, so the pool bounds how many deliveries run at once.
+var SenderDBMaxConns = 32
 
 var (
 	dbMu       sync.Mutex
@@ -76,8 +80,8 @@ func getSenderDB() (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(senderDBMaxOpenConns)
-	db.SetMaxIdleConns(senderDBMaxIdleConns)
+	db.SetMaxOpenConns(SenderDBMaxConns)
+	db.SetMaxIdleConns(min(senderDBMaxIdleConns, SenderDBMaxConns))
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	senderDB = db
